@@ -1,0 +1,7 @@
+[
+  { "id": "action-0001", "kind": "click", "sourceEventIds": ["evt-001"] },
+  { "id": "action-0002", "kind": "click", "sourceEventIds": ["evt-002"] },
+  { "id": "action-0003", "kind": "click", "sourceEventIds": ["evt-003"] },
+  { "id": "action-0004", "kind": "click", "sourceEventIds": ["evt-004"] },
+  { "id": "action-0005", "kind": "click", "sourceEventIds": ["evt-005"] }
+]

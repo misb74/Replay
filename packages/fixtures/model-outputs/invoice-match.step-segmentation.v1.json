@@ -1,0 +1,23 @@
+{
+  "name": "Review an invoice against its purchase order",
+  "goal": "Compare the selected invoice total with its purchase order total, approve a match, and flag a mismatch for attention.",
+  "parameters": [],
+  "steps": [
+    {
+      "id": "step-001",
+      "intent": "Compare the selected invoice and purchase order totals",
+      "actionIds": ["action-0001", "action-0002", "action-0003"],
+      "expects": ["The comparison result states whether the totals match"],
+      "source": "recorded",
+      "timestampRefs": [{ "startMs": 200, "endMs": 2200 }]
+    },
+    {
+      "id": "step-002",
+      "intent": "Approve the invoice when the totals match",
+      "actionIds": ["action-0004", "action-0005"],
+      "expects": ["The review state shows Approved"],
+      "source": "recorded",
+      "timestampRefs": [{ "startMs": 3000, "endMs": 3900 }]
+    }
+  ]
+}

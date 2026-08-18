@@ -1,0 +1,10 @@
+{
+  "fixtureVersion": 1,
+  "sessionId": "invoice-match-demo",
+  "expectedGoalConcepts": ["compare selected invoice", "purchase order total", "approve match", "flag mismatch"],
+  "expectedParameterNames": [],
+  "expectedStepIntents": ["compare totals", "approve matching invoice"],
+  "expectedDecisionConditions": ["invoice total matches purchase order total"],
+  "minimumActionCoverage": 1,
+  "notes": "The recorded INV-1048 path ends Approved. Narration grounds the untaken INV-1049 Flag difference path and its Needs attention outcome."
+}

@@ -1,0 +1,35 @@
+{
+  "name": "replay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Turn a macOS screen recording into a reviewable, executable workflow.",
+  "type": "module",
+  "packageManager": "npm@11.6.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "test-app"
+  ],
+  "scripts": {
+    "build:packages": "npm run build -w @replay/ir && npm run build -w @replay/pipeline && npm run build -w @replay/compilers && npm run build -w @replay/runner",
+    "build:native": "swift build --package-path native/capture -c release",
+    "build": "npm run build:packages && npm run build:native && npm run build -w @replay/test-app && npm run build -w @replay/desktop",
+    "check": "npm run build:packages && npm run typecheck --workspaces --if-present && npm run test --workspaces --if-present && npm run test:e2e && npm run test:native",
+    "test": "npm run test --workspaces --if-present",
+    "test:watch": "vitest",
+    "test:e2e": "npm run test:e2e -w @replay/test-app && npm run test:e2e -w @replay/compilers",
+    "test:native": "./native/capture/scripts/test.sh",
+    "dev": "npm run build:packages && npm run dev -w @replay/desktop",
+    "dev:test-app": "npm run dev -w @replay/test-app",
+    "clean": "npm run clean --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

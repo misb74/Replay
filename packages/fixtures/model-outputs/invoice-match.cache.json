@@ -1,0 +1,56 @@
+{
+  "invoice-match-demo/step_segmentation/step-segmentation.v1": {
+    "name": "Review an invoice against its purchase order",
+    "goal": "Compare the selected invoice total with its purchase order total, approve a match, and flag a mismatch for attention.",
+    "parameters": [],
+    "steps": [
+      {
+        "id": "step-001",
+        "intent": "Compare the selected invoice and purchase order totals",
+        "actionIds": ["action-0001", "action-0002", "action-0003"],
+        "expects": ["The comparison result states whether the totals match"],
+        "source": "recorded",
+        "timestampRefs": [{ "startMs": 200, "endMs": 2200 }]
+      },
+      {
+        "id": "step-002",
+        "intent": "Approve the invoice when the totals match",
+        "actionIds": ["action-0004", "action-0005"],
+        "expects": ["The review state shows Approved"],
+        "source": "recorded",
+        "timestampRefs": [{ "startMs": 3000, "endMs": 3900 }]
+      }
+    ]
+  },
+  "invoice-match-demo/decision_extraction/decision-extraction.v1": {
+    "decisions": [
+      {
+        "id": "decision-001",
+        "afterStepId": "step-001",
+        "condition": "The invoice total matches the purchase order total shown on screen",
+        "confidence": "high",
+        "source": "narrated",
+        "evidence": [
+          {
+            "kind": "narration",
+            "description": "The user explicitly described the Approve invoice and Flag difference outcomes.",
+            "timestampMs": 1900,
+            "transcriptSegmentIds": ["transcript-002"]
+          },
+          {
+            "kind": "action",
+            "description": "The recorded matching path clicked Approve invoice and confirmed the Approved state.",
+            "timestampMs": 3000,
+            "transcriptSegmentIds": []
+          }
+        ],
+        "then": { "kind": "recorded_steps", "stepIds": ["step-002"] },
+        "else": {
+          "kind": "narrated_steps",
+          "description": "Click Flag difference and confirm the review state shows Needs attention."
+        }
+      }
+    ],
+    "questions": []
+  }
+}

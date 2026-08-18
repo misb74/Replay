@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "sessionId": "invoice-match-demo",
+  "status": "completed",
+  "partial": false,
+  "startedAt": "2026-08-16T18:00:00.000Z",
+  "stoppedAt": "2026-08-16T18:00:04.500Z",
+  "display": { "width": 1512, "height": 982, "scale": 2 },
+  "narration": true,
+  "appVersions": { "replay": "0.1.0", "captureSidecar": "0.1.0" },
+  "eventCount": 5,
+  "lastEventTimestampMs": 3900,
+  "durationMs": 4500
+}
