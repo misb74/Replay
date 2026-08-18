@@ -2,7 +2,7 @@
 
 Replay is a local-first macOS app that turns a screen recording of real work into a reviewable workflow. An approved workflow can be exported as an agent playbook, compiled into Playwright, or run under supervision on the Mac.
 
-The implementation follows the [approved product design](docs/superpowers/specs/2026-08-16-screen-to-workflow-design.md). See the [architecture map](docs/architecture.md) for the runtime components, data flows, and trust boundaries.
+The implementation follows the [approved product design](docs/superpowers/specs/2026-08-16-screen-to-workflow-design.md). See the [architecture map](docs/architecture.md) for the 30-second system view, tangible outputs, data layout, and trust boundaries.
 
 ## Development
 
