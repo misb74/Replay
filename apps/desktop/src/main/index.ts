@@ -85,7 +85,7 @@ function createWindow(): BrowserWindow {
     minWidth: 1040,
     minHeight: 700,
     titleBarStyle: "hiddenInset",
-    backgroundColor: "#f4f3ef",
+    backgroundColor: "#f8fafc",
     show: false,
     webPreferences: {
       preload: join(app.getAppPath(), "dist/preload/index.cjs"),

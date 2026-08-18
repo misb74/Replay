@@ -20,6 +20,24 @@ import { editWorkflow, isWorkflowReviewValid, type WorkflowEdit } from "./workfl
 
 const browserMock = createMockApi();
 
+/** The Ivy mark — the same white ivy line-art used across the Ivy suite (see the HR Agentic Blueprint app). */
+const IvyMark = ({ size = 22 }: { size?: number }) => (
+  <svg viewBox="0 0 64 64" fill="none" width={size} height={size} aria-hidden="true">
+    <g stroke="#fff" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 44C8 48 8 54 12 58C18 62 30 62 40 60C48 58 54 50 54 42L54 28" />
+      <ellipse cx="20" cy="36" rx="8" ry="9" />
+      <path d="M32 28C31 20 31 14 32 8" />
+      <path d="M40 25C40 17 40 11 41 6" />
+      <path d="M48 28C48 20 49 14 50 10" />
+    </g>
+  </svg>
+);
+
+/** Ivy lockup: rose tile with the mark, the Ivy wordmark, and the product name — matching the sibling Ivy apps. */
+const BrandLockup = ({ product = "Replay" }: { product?: string }) => (
+  <><span className="brand-tile"><IvyMark /></span><b>Ivy</b><small>{product}</small></>
+);
+
 export function App() {
   const api = window.replay ?? browserMock;
   const [permissions, setPermissions] = useState<PermissionStatus[]>([]);
@@ -179,7 +197,7 @@ function Sidebar(props: {
   const isRecording = props.recording?.state === "recording";
   return (
     <aside className="sidebar">
-      <div className="app-brand"><div className="brand-mark"><span /><span /></div><span>Replay</span></div>
+      <div className="app-brand"><BrandLockup /></div>
       <section className={`record-card ${isRecording ? "active" : ""}`}>
         <button className="record-button" onClick={() => void props.onRecord(microphone)}>
           <span className="record-dot" />
@@ -484,7 +502,7 @@ function Modal({ title, onClose, children }: { title: string; onClose: () => voi
 }
 
 function PermissionSetup({ api, permissions, error, onRefresh }: { api: ReplayDesktopApi; permissions: PermissionStatus[]; error: string | undefined; onRefresh: () => Promise<void> }) {
-  return <main className="permission-page"><div className="permission-brand"><div className="brand-mark"><span /><span /></div> Replay</div><section><p className="eyebrow">One-time setup</p><h1>Give Replay eyes and hands</h1><p className="permission-lead">These macOS permissions let Replay capture your work and run only the workflows you approve. Recordings stay on this Mac.</p>{error && <div className="error-banner"><span>Replay could not check permissions: {error}</span></div>}<div className="permission-list">{permissions.map((permission) => <article key={permission.name}><span className={`permission-state ${permission.state}`}>{permission.state === "granted" ? "✓" : permission.required ? "•" : "○"}</span><div><strong>{permissionTitle(permission.name)}</strong><p>{permission.explanation}</p></div><button disabled={permission.state === "granted"} onClick={async () => { if (permission.state === "notDetermined") await api.requestPermission(permission.name); else await api.openPermissionSettings(permission.name); await onRefresh(); }}>{permission.state === "granted" ? "Granted" : "Open settings"}</button></article>)}</div><button className="refresh-button" onClick={() => void onRefresh()}>Check permissions again</button></section></main>;
+  return <main className="permission-page"><div className="permission-brand"><BrandLockup /></div><section><p className="eyebrow">One-time setup</p><h1>Give Replay eyes and hands</h1><p className="permission-lead">These macOS permissions let Replay capture your work and run only the workflows you approve. Recordings stay on this Mac.</p>{error && <div className="error-banner"><span>Replay could not check permissions: {error}</span></div>}<div className="permission-list">{permissions.map((permission) => <article key={permission.name}><span className={`permission-state ${permission.state}`}>{permission.state === "granted" ? "✓" : permission.required ? "•" : "○"}</span><div><strong>{permissionTitle(permission.name)}</strong><p>{permission.explanation}</p></div><button disabled={permission.state === "granted"} onClick={async () => { if (permission.state === "notDetermined") await api.requestPermission(permission.name); else await api.openPermissionSettings(permission.name); await onRefresh(); }}>{permission.state === "granted" ? "Granted" : "Open settings"}</button></article>)}</div><button className="refresh-button" onClick={() => void onRefresh()}>Check permissions again</button></section></main>;
 }
 
 function RecordingClock({ startedAt }: { startedAt: string }) {
@@ -496,7 +514,7 @@ function RecordingClock({ startedAt }: { startedAt: string }) {
 function ProcessingBanner({ update }: { update: ProcessingUpdate }) { return <div className="processing-banner"><div className="spinner" /><div><strong>Turning your recording into a workflow</strong><span>{update.message}</span></div><div className="progress-track"><i style={{ width: `${update.progress * 100}%` }} /></div><b>{Math.round(update.progress * 100)}%</b></div>; }
 function CaptureReadyBanner({ session, onProcess, onDismiss }: { session: SessionSummary; onProcess: () => void; onDismiss: () => void }) { return <div className="capture-ready"><div><strong>Recording saved on this Mac</strong><span>Build a workflow by sending condensed actions and sampled frames to Claude. The full video stays local.</span></div><button className="capture-dismiss" aria-label="Keep recording without processing" onClick={onDismiss}>Not now</button><button onClick={onProcess}>Build workflow</button><small>{session.durationMs ? formatTime(session.durationMs) : "Saved"}</small></div>; }
 function ErrorBanner({ message, onClose }: { message: string; onClose: () => void }) { return <div className="error-banner"><span>Something went wrong: {message}</span><button onClick={onClose}>×</button></div>; }
-function LoadingScreen() { return <div className="loading-screen"><div className="brand-mark"><span /><span /></div><p>Opening Replay…</p></div>; }
+function LoadingScreen() { return <div className="loading-screen"><span className="brand-tile"><IvyMark /></span><p>Opening Replay…</p></div>; }
 function EmptyWorkspace({ onRecord }: { onRecord: () => void }) { return <div className="empty-workspace"><div className="empty-art"><span>●</span><i /><i /></div><h1>Teach Replay a piece of work</h1><p>Record yourself completing a task. Narrate the choices you make, then review what Replay understood.</p><button onClick={onRecord}>Record your first workflow</button></div>; }
 
 function formatTime(milliseconds: number): string { const total = Math.floor(milliseconds / 1_000); return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`; }
