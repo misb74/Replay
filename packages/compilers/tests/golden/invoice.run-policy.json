@@ -1,0 +1,15 @@
+{
+  "maxRetriesPerStep": 1,
+  "firstRunRequiresTest": true,
+  "secureFields": "human-only",
+  "onExpectationFailure": "retry-then-pause",
+  "askUserNodeIds": [],
+  "stopAndFlagNodeIds": [
+    "flag"
+  ],
+  "allowedModes": [
+    "test",
+    "supervised",
+    "autonomous"
+  ]
+}

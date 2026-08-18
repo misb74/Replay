@@ -1,0 +1,27 @@
+{
+  "target": "playwright",
+  "workflowId": "invoice-review",
+  "workflowRevision": 2,
+  "fallback": {
+    "semantic": "human-checkpoint",
+    "native": "human-checkpoint"
+  },
+  "degradedItems": [
+    {
+      "code": "semantic-expectation-degraded",
+      "message": "Expectation 'The invoice and purchase-order totals are visible' needs a human-checkpoint.",
+      "stepId": "review"
+    },
+    {
+      "code": "semantic-condition-degraded",
+      "message": "Decision 'the invoice total matches the purchase-order total' has no browser-observable deterministic check; generated code uses a human-checkpoint.",
+      "stepId": "review",
+      "decisionId": "match"
+    },
+    {
+      "code": "semantic-expectation-degraded",
+      "message": "Expectation 'The invoice status is Approved' needs a human-checkpoint.",
+      "stepId": "approve"
+    }
+  ]
+}

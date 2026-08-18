@@ -1,0 +1,23 @@
+{
+  "fixtureVersion": 1,
+  "sessionId": "invoice-match-demo",
+  "recordedInvoiceId": "INV-1048",
+  "setup": "Select the invoice before executing the pipeline-derived compare-and-decide workflow.",
+  "testApp": {
+    "invoiceButtonRole": "button",
+    "comparisonTestId": "comparison-result",
+    "reviewStateTestId": "review-state"
+  },
+  "cases": [
+    {
+      "invoiceId": "INV-1048",
+      "expectedReviewState": "Approved",
+      "actionLabel": "Approve invoice"
+    },
+    {
+      "invoiceId": "INV-1049",
+      "expectedReviewState": "Needs attention",
+      "actionLabel": "Flag difference"
+    }
+  ]
+}

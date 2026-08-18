@@ -1,0 +1,31 @@
+{
+  "decisions": [
+    {
+      "id": "decision-001",
+      "afterStepId": "step-001",
+      "condition": "The invoice total matches the purchase order total shown on screen",
+      "confidence": "high",
+      "source": "narrated",
+      "evidence": [
+        {
+          "kind": "narration",
+          "description": "The user explicitly described the Approve invoice and Flag difference outcomes.",
+          "timestampMs": 1900,
+          "transcriptSegmentIds": ["transcript-002"]
+        },
+        {
+          "kind": "action",
+          "description": "The recorded matching path clicked Approve invoice and confirmed the Approved state.",
+          "timestampMs": 3000,
+          "transcriptSegmentIds": []
+        }
+      ],
+      "then": { "kind": "recorded_steps", "stepIds": ["step-002"] },
+      "else": {
+        "kind": "narrated_steps",
+        "description": "Click Flag difference and confirm the review state shows Needs attention."
+      }
+    }
+  ],
+  "questions": []
+}

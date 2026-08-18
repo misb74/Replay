@@ -1,0 +1,29 @@
+:root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #202522; background: #f4f3ee; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 900px; min-height: 100vh; }
+button { font: inherit; }
+.topbar { height: 68px; padding: 0 42px; display: flex; align-items: center; justify-content: space-between; background: #153b2d; color: #f9fbf8; }
+.brand { display: flex; align-items: center; gap: 12px; font-family: Manrope, sans-serif; font-weight: 700; }
+.mark { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 9px; background: #d9f26a; color: #153b2d; }
+.environment { padding: 6px 12px; border: 1px solid #507061; border-radius: 99px; color: #c7d6ce; font-size: 13px; }
+.page-heading { max-width: 1180px; margin: 0 auto; padding: 52px 24px 32px; display: flex; justify-content: space-between; align-items: end; }
+.eyebrow { margin: 0 0 8px; color: #647168; font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+h1, h2 { margin: 0; font-family: Manrope, sans-serif; letter-spacing: -.03em; }
+h1 { font-size: 38px; } h2 { font-size: 22px; }
+.help { max-width: 450px; margin: 0; color: #657068; line-height: 1.6; }
+.workspace { max-width: 1180px; margin: 0 auto; padding: 0 24px 70px; display: grid; grid-template-columns: 360px 1fr; gap: 22px; }
+.queue, .invoice-card { border: 1px solid #deddd5; border-radius: 16px; background: #fff; box-shadow: 0 12px 32px rgba(34, 47, 40, .06); overflow: hidden; }
+.queue-title { padding: 22px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #e9e7e0; }
+.queue-title h2 { font-size: 17px; }.queue-title span { color: #7a837d; font-size: 13px; }
+.invoice-row { width: 100%; padding: 18px 20px; display: flex; align-items: center; justify-content: space-between; border: 0; border-bottom: 1px solid #eeece6; background: #fff; color: #202522; text-align: left; cursor: pointer; }
+.invoice-row:hover { background: #fafaf7; }.invoice-row.selected { background: #f0f6e5; box-shadow: inset 3px 0 #5b7f24; }
+.invoice-row strong, .invoice-row small { display: block; }.invoice-row small { margin-top: 4px; color: #788079; }
+.status { padding: 6px 9px; border-radius: 99px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.status-pending { background: #f2f0ea; color: #6f746e; }.status-approved { background: #def1dc; color: #28652f; }.status-flagged { background: #fee2d8; color: #9a412b; }
+.invoice-card { padding: 28px; }.card-heading { display: flex; align-items: start; justify-content: space-between; padding-bottom: 26px; border-bottom: 1px solid #ebe9e3; }
+.comparison { padding: 34px 0 24px; display: grid; grid-template-columns: 1fr 48px 1fr; align-items: center; gap: 10px; }
+.amount-panel { padding: 22px; border: 1px solid #e5e3dc; border-radius: 12px; background: #faf9f5; }.amount-panel span, .amount-panel strong { display: block; }.amount-panel span { color: #707a72; font-size: 13px; }.amount-panel strong { margin-top: 8px; font: 700 27px Manrope, sans-serif; }
+.compare-symbol { width: 34px; height: 34px; display: grid; place-items: center; justify-self: center; border-radius: 50%; background: #e7e9e4; color: #526057; font-weight: 700; }
+.result { padding: 16px 18px; display: flex; gap: 13px; border-radius: 10px; }.result.match { background: #edf6e8; color: #235c2b; }.result.mismatch { background: #fff0ea; color: #8b3524; }.result-icon { width: 25px; height: 25px; display: grid; place-items: center; border: 2px solid currentColor; border-radius: 50%; font-weight: 700; }.result p { margin: 4px 0 0; opacity: .78; font-size: 13px; }
+.metadata { margin: 26px 0; display: grid; grid-template-columns: 1fr 1fr; }.metadata div { padding: 0 16px; border-left: 2px solid #e6e6df; }.metadata dt { color: #7a827c; font-size: 12px; }.metadata dd { margin: 5px 0 0; font-weight: 600; }
+.actions { display: flex; justify-content: end; gap: 10px; padding-top: 22px; border-top: 1px solid #ebe9e3; }.actions button { padding: 11px 17px; border-radius: 9px; font-weight: 700; cursor: pointer; }.secondary { border: 1px solid #cfcfc8; background: white; color: #424a44; }.primary { border: 1px solid #153b2d; background: #153b2d; color: white; }

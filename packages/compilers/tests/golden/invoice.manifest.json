@@ -1,0 +1,14 @@
+{
+  "formatVersion": 1,
+  "target": "computer-use",
+  "workflowId": "invoice-review",
+  "workflowRevision": 2,
+  "entrypoints": {
+    "prompt": "system-prompt.md",
+    "workflow": "workflow.json",
+    "policy": "run-policy.json"
+  },
+  "assets": [
+    "assets/sessions%2Fdemo%2Fcrops%2Fapprove.png"
+  ]
+}

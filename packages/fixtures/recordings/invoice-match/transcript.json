@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "language": "en",
+  "segments": [
+    {
+      "id": "transcript-001",
+      "startMs": 100,
+      "endMs": 1300,
+      "text": "I start with the invoice already selected and compare its total with the purchase order total.",
+      "confidence": 0.99
+    },
+    {
+      "id": "transcript-002",
+      "startMs": 1400,
+      "endMs": 2700,
+      "text": "If the totals match, I click Approve invoice. If they differ, I click Flag difference.",
+      "confidence": 0.99
+    },
+    {
+      "id": "transcript-003",
+      "startMs": 2900,
+      "endMs": 4300,
+      "text": "INV-1048 matches and now shows Approved. On INV-1049, flagging the difference should show Needs attention.",
+      "confidence": 0.98
+    }
+  ]
+}
