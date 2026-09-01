@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Replay — Teach agents how the work really works</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main id="film" aria-label="Replay promotional film">
+      <div class="paper-grain"></div>
+      <svg class="contours" viewBox="0 0 1920 1080" aria-hidden="true">
+        <path d="M-120 210C190 65 380 72 598 196s370 130 610 0 485-160 832-18" />
+        <path d="M-90 280C180 150 380 150 570 255s372 120 610 2 500-140 840-14" />
+        <path d="M-140 868C155 735 382 730 610 852s394 114 620-8 480-142 810-20" />
+        <path d="M-80 935C180 825 390 810 620 922s385 108 608 4 480-132 782-30" />
+      </svg>
+
+      <div class="corner-brand" id="corner-brand">
+        <span class="brand-tile small">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="4.5">
+              <path d="M12 44C8 48 8 54 12 58C18 62 30 62 40 60C48 58 54 50 54 42L54 28" />
+              <ellipse cx="20" cy="36" rx="8" ry="9" />
+              <path d="M32 28C31 20 31 14 32 8M40 25C40 17 40 11 41 6M48 28C48 20 49 14 50 10" />
+            </g>
+          </svg>
+        </span>
+        <strong>Ivy</strong><i></i><span>Replay</span>
+      </div>
+
+      <section class="scene teach-scene" id="scene-teach">
+        <div class="opening-copy" id="opening-copy">
+          <p class="eyebrow">THE WORK BETWEEN THE STEPS</p>
+          <h1 id="opening-headline">The hardest work<br />isn&rsquo;t documented.</h1>
+          <p id="opening-subtitle">It lives in decisions.</p>
+        </div>
+
+        <div class="workstation" id="workstation">
+          <div class="window-chrome">
+            <div class="traffic"><i></i><i></i><i></i></div>
+            <div class="address">Monday client update</div>
+            <div class="chrome-tools"><span></span><span></span></div>
+          </div>
+          <div class="workspace">
+            <aside class="work-nav">
+              <div class="work-logo">N</div>
+              <span class="active">Overview</span>
+              <span>Projects</span>
+              <span>Customers</span>
+              <span>Updates</span>
+              <div class="nav-spacer"></div>
+              <small>Northstar team</small>
+            </aside>
+
+            <div class="project-board app-panel" id="project-board">
+              <header>
+                <div><small>PROJECT</small><h3>Spring launch</h3></div>
+                <b>Monday, 8:42 AM</b>
+              </header>
+              <div class="board-columns">
+                <div><label>SHIPPED <em>2</em></label><article class="done"><b>New onboarding flow</b><span>Released Friday</span><i>AM</i></article><article class="done"><b>Usage dashboard</b><span>Released Thursday</span><i>JM</i></article></div>
+                <div><label>IN PROGRESS <em>2</em></label><article><b>Billing migration</b><span>QA complete</span><i>SK</i></article><article class="risk" id="risk-card"><b>Mobile launch</b><span>Date moved to May 24</span><i>?</i></article></div>
+                <div><label>BLOCKED <em>1</em></label><article class="blocked" id="blocked-card"><b>Customer import</b><span>Waiting on sample data</span><i>—</i></article></div>
+              </div>
+            </div>
+
+            <div class="notes-panel app-panel" id="notes-panel">
+              <header><div class="app-dot blue">S</div><strong>Customer notes</strong><small>4 new</small></header>
+              <article><b>Arcadia</b><time>8:31</time><p>Import sample is ready. Sending today.</p></article>
+              <article class="highlight"><b>Juniper</b><time>Fri</time><p>Asked if the mobile launch date has changed.</p></article>
+              <article><b>Northwind</b><time>Fri</time><p>Onboarding looks great—team is live.</p></article>
+            </div>
+
+            <div class="mail-panel app-panel" id="mail-panel">
+              <header><div class="app-dot rose">M</div><strong>Client update</strong><small>DRAFT</small></header>
+              <div class="mail-meta"><span>To</span><b>team@northstar.example</b></div>
+              <div class="mail-meta"><span>Subject</span><b>Monday project update</b></div>
+              <div class="mail-body" id="mail-body"></div>
+              <button>Save draft</button>
+            </div>
+          </div>
+          <div class="cursor" id="demo-cursor"><i></i></div>
+        </div>
+
+        <div class="record-control" id="record-control">
+          <span class="record-live"><i></i> REPLAY IS RECORDING</span>
+          <time id="record-time">00:00</time>
+          <div class="waveform" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          </div>
+          <button>Stop</button>
+        </div>
+
+        <div class="narration-bubble" id="narration-bubble">
+          <span>NARRATION</span>
+          <p id="narration-text"></p>
+        </div>
+
+        <div class="observed-actions" id="observed-actions">
+          <span id="action-1"><i>1</i> Check what shipped</span>
+          <span id="action-2"><i>2</i> Find launch blockers</span>
+          <span id="action-3"><i>3</i> Draft the client update</span>
+        </div>
+      </section>
+
+      <section class="scene build-scene" id="scene-build">
+        <div class="scene-heading">
+          <p class="eyebrow">FROM DEMONSTRATION TO SPECIFICATION</p>
+          <h2>Replay learns what the work means.</h2>
+        </div>
+
+        <div class="evidence-stream evidence-screen" id="evidence-screen">
+          <div class="stream-icon">▣</div><div><b>Screen</b><span>What changed</span></div>
+        </div>
+        <div class="evidence-stream evidence-actions" id="evidence-actions">
+          <div class="stream-icon">↗</div><div><b>Actions</b><span>What you did</span></div>
+        </div>
+        <div class="evidence-stream evidence-voice" id="evidence-voice">
+          <div class="stream-icon">≋</div><div><b>Narration</b><span>Why it mattered</span></div>
+        </div>
+
+        <svg class="stream-lines" viewBox="0 0 1920 1080" aria-hidden="true">
+          <path id="line-screen" d="M440 470 C720 470, 690 548, 902 548" />
+          <path id="line-actions" d="M440 600 C720 600, 690 560, 902 560" />
+          <path id="line-voice" d="M440 730 C720 730, 700 572, 902 572" />
+        </svg>
+
+        <div class="build-card" id="build-card">
+          <div class="build-brand"><span class="brand-tile tiny">R</span><div><b>Building your workflow</b><small id="build-stage">Preparing local evidence</small></div><em id="build-percent">12%</em></div>
+          <div class="build-progress"><i id="build-progress-fill"></i></div>
+          <div class="build-stages">
+            <span id="build-step-1"><i>✓</i> Evidence</span>
+            <span id="build-step-2"><i>2</i> Steps</span>
+            <span id="build-step-3"><i>3</i> Decisions</span>
+            <span id="build-step-4"><i>4</i> Checks</span>
+          </div>
+        </div>
+
+        <div class="local-note" id="local-note"><i></i> Raw video stays on this Mac</div>
+      </section>
+
+      <section class="scene review-scene" id="scene-review">
+        <div class="scene-heading review-heading">
+          <p class="eyebrow">HUMAN REVIEW IS THE PRODUCT</p>
+          <h2>Correct what the agent cannot know.</h2>
+        </div>
+
+        <div class="replay-app" id="replay-app">
+          <aside class="replay-sidebar">
+            <div class="app-brand">
+              <span class="brand-tile"><svg viewBox="0 0 64 64"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="4.5"><path d="M12 44C8 48 8 54 12 58C18 62 30 62 40 60C48 58 54 50 54 42L54 28"/><ellipse cx="20" cy="36" rx="8" ry="9"/><path d="M32 28C31 20 31 14 32 8M40 25C40 17 40 11 41 6M48 28C48 20 49 14 50 10"/></g></svg></span>
+              <b>Ivy</b><i></i><span>Replay</span>
+            </div>
+            <button class="record-mini"><i></i> Record a workflow</button>
+            <label>WORKFLOWS <em>1</em></label>
+            <div class="workflow-nav-item"><i>◌</i><div><b>Monday client update</b><span id="workflow-nav-state">4 steps · draft</span></div></div>
+            <small class="local-sidebar"><i></i> Raw recording stays on this Mac</small>
+          </aside>
+
+          <div class="replay-main">
+            <header class="replay-header">
+              <div><h3>Monday client update</h3><p>Draft a safe, accurate client update from the latest project evidence.</p></div>
+              <span class="draft-pill" id="status-pill">DRAFT</span>
+              <button class="export-button">Export</button>
+              <button class="approve-button" id="approve-button">Approve workflow</button>
+            </header>
+            <div class="replay-content">
+              <div class="evidence-pane-mock">
+                <div class="source-preview">
+                  <div class="mini-board"><i></i><i></i><i class="rose"></i><i></i><i class="amber"></i></div>
+                  <span>RECORDED SOURCE · 00:18</span>
+                  <div class="play-dot">▶</div>
+                </div>
+                <div class="timeline-mock"><i></i><b class="t1">1</b><b class="t2">2</b><b class="t3">3</b><b class="t4">4</b></div>
+                <p><strong>Evidence linked.</strong> Select a step to return to the exact moment it was demonstrated.</p>
+              </div>
+              <div class="workflow-editor">
+                <div class="editor-tabs"><b>Steps <em>4</em></b><span>Inputs <em>1</em></span><span class="questions-tab" id="questions-tab">Questions <em>1</em></span></div>
+                <div class="step-list-mock">
+                  <article class="workflow-step complete"><i>1</i><div><small>RECORDED</small><b>Collect work completed since Friday</b><span>Success: shipped items and owners are visible</span></div><em>✓</em></article>
+                  <article class="workflow-step selected" id="decision-step"><i>2</i><div><small>RECORDED + NARRATED</small><b>Check blockers and changed dates</b><span>Success: every blocker has an owner and reason</span><section class="decision-panel"><label>DECISION</label><strong>Does a blocker have no owner?</strong><p><i>YES</i> Stop and ask me</p><p><i>NO</i> Continue the workflow</p><p class="decision-rule" id="reviewed-rule"><i>RULE</i> A launch blocker is anything that could delay the committed launch date.</p></section></div><em>⌁</em></article>
+                  <article class="workflow-step"><i>3</i><div><small>RECORDED</small><b>Draft the client update</b><span>Success: shipped work, changes and blockers are included</span></div><em>✓</em></article>
+                  <article class="workflow-step" id="safe-step"><i>4</i><div><small>REVIEWED</small><b>Save the email as a draft</b><span>Success: the message is ready but has not been sent</span></div><em>✓</em></article>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="question-modal" id="question-modal">
+          <div class="question-icon">?</div>
+          <small>ONE DETAIL NEEDS YOUR JUDGMENT</small>
+          <h3>What counts as a launch blocker?</h3>
+          <div class="answer-field" id="answer-field"></div>
+          <button id="save-answer">Save answer</button>
+        </div>
+
+        <div class="approved-toast" id="approved-toast"><i>✓</i><div><b>Approved revision 2</b><span>Content-hashed and ready to test</span></div></div>
+      </section>
+
+      <section class="scene outputs-scene" id="scene-outputs">
+        <div class="scene-heading centered">
+          <p class="eyebrow">ONE REVIEWED SOURCE OF TRUTH</p>
+          <h2>Use it with the agent you choose.</h2>
+        </div>
+        <div class="output-cards">
+          <article id="output-playbook"><i class="output-symbol">Aa</i><small>PLAYBOOK</small><h3>Agent-ready instructions</h3><p>Goals, inputs, decisions and success checks.</p><footer><span>SKILL.md</span><b>✓ Approved</b></footer></article>
+          <article id="output-script"><i class="output-symbol">&lt;/&gt;</i><small>BROWSER WORKFLOW</small><h3>Deterministic automation</h3><p>Playwright actions with clear checks and fallbacks.</p><footer><span>workflow.ts</span><b>✓ Approved</b></footer></article>
+          <article id="output-runner"><i class="output-symbol">▶</i><small>GUARDED RUNNER</small><h3>Safe computer use</h3><p>Human pauses, secure input and evidence by default.</p><footer><span>run-policy.json</span><b>✓ Approved</b></footer></article>
+        </div>
+        <p class="outputs-caption" id="outputs-caption">Replay is the teaching and specification layer—not another agent builder.</p>
+      </section>
+
+      <section class="scene run-scene" id="scene-run">
+        <div class="next-monday" id="next-monday"><span>ONE WEEK LATER</span><strong>Same work. New evidence.</strong></div>
+        <div class="run-desktop" id="run-desktop">
+          <div class="window-chrome"><div class="traffic"><i></i><i></i><i></i></div><div class="address">Monday client update · new week</div></div>
+          <div class="workspace run-workspace">
+            <aside class="work-nav"><div class="work-logo">N</div><span>Overview</span><span class="active">Projects</span><span>Customers</span><span>Updates</span></aside>
+            <div class="project-board app-panel"><header><div><small>PROJECT</small><h3>Spring launch</h3></div><b>Monday, 8:00 AM</b></header><div class="board-columns"><div><label>SHIPPED <em>3</em></label><article class="done"><b>Mobile onboarding</b><span>Released Friday</span><i>AM</i></article><article class="done"><b>Billing migration</b><span>Released Friday</span><i>SK</i></article></div><div><label>IN PROGRESS <em>1</em></label><article><b>Team permissions</b><span>QA in progress</span><i>JM</i></article></div><div><label>BLOCKED <em>1</em></label><article class="blocked"><b>Enterprise import</b><span>Waiting on schema</span><i>RT</i></article></div></div></div>
+            <div class="mail-panel app-panel run-mail"><header><div class="app-dot rose">M</div><strong>Monday client update</strong><small>DRAFT</small></header><div class="mail-meta"><span>To</span><b>team@northstar.example</b></div><div class="mail-body"><p>Hi team,</p><p>Here is this week&rsquo;s project update.</p><p><strong>Shipped</strong><br />Mobile onboarding and billing migration.</p><p><strong>Needs attention</strong><br />Enterprise import is waiting on the customer schema. Owner: Rita.</p></div><button>Saved as draft</button></div>
+          </div>
+        </div>
+
+        <div class="run-panel" id="run-panel">
+          <header><div class="run-mark">R</div><div><small>SUPERVISED RUN</small><b>Monday client update</b></div><span id="run-status">RUNNING</span></header>
+          <div class="run-progress"><i id="run-progress-fill"></i></div>
+          <ul>
+            <li id="run-step-1"><i>1</i><span>Collect completed work</span><em></em></li>
+            <li id="run-step-2"><i>2</i><span>Check blockers and owners</span><em></em></li>
+            <li id="run-step-3"><i>3</i><span>Draft the client update</span><em></em></li>
+            <li id="run-step-4"><i>4</i><span>Save—never send</span><em></em></li>
+          </ul>
+          <footer id="run-evidence"><span>Evidence captured</span><b>0 screenshots</b></footer>
+        </div>
+
+        <div class="result-card" id="result-card">
+          <div class="result-check">✓</div>
+          <div><small>RESULT VERIFIED</small><h3>Client update ready for review</h3><p>4 steps completed · 1 decision checked · message not sent</p></div>
+          <span>View proof →</span>
+        </div>
+      </section>
+
+      <section class="scene end-scene" id="scene-end">
+        <div class="end-lockup" id="end-lockup">
+          <span class="brand-tile hero">
+            <svg viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="4.5"><path d="M12 44C8 48 8 54 12 58C18 62 30 62 40 60C48 58 54 50 54 42L54 28"/><ellipse cx="20" cy="36" rx="8" ry="9"/><path d="M32 28C31 20 31 14 32 8M40 25C40 17 40 11 41 6M48 28C48 20 49 14 50 10"/></g></svg>
+          </span>
+          <div class="end-brand"><b>Ivy</b><i></i><span>Replay</span></div>
+          <h1>Show the work.<br />Teach the agent.<br /><em>Trust the result.</em></h1>
+          <p>The teaching layer for agents.</p>
+          <div class="end-rule"><i></i></div>
+        </div>
+      </section>
+    </main>
+    <script src="./timeline.js"></script>
+  </body>
+</html>

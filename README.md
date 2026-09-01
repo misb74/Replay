@@ -1,12 +1,46 @@
 # Replay
 
-Replay is a local-first macOS app that turns a screen recording of real work into a reviewable workflow. An approved workflow can be exported as an agent playbook, compiled into Playwright, or run under supervision on the Mac.
+Replay turns a demonstration of real work into a workflow that a person can inspect, correct, approve, export, and run again.
 
-The implementation follows the [approved product design](docs/superpowers/specs/2026-08-16-screen-to-workflow-design.md). See the [architecture map](docs/architecture.md) for the 30-second system view, tangible outputs, data layout, and trust boundaries.
+It is designed for the messy middle of agent building: the judgment between clicks that is obvious to an expert but missing from a process document. Replay records the work, links each proposed step back to evidence, surfaces uncertainty, and makes a reviewed workflow revision the source of truth.
+
+> **Project status:** Replay is an early-stage macOS prototype. It can control real applications. Use test or supervised mode, review every generated workflow, and keep the emergency stop available. It is not yet a signed end-user release.
+
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
+![Replay: show the work, teach the agent, trust the result](marketing/promo-video/output/replay-promo-poster.jpg)
+
+[Watch the 74-second Replay product film](marketing/promo-video/output/replay-promo-1080p.mp4).
+
+## What Replay does
+
+1. **Capture:** record a task on the primary Mac display, with optional narration.
+2. **Understand:** turn the evidence into steps, targets, checks, inputs, and decision branches.
+3. **Review:** edit the draft and answer open questions. Unresolved low-confidence questions block approval.
+4. **Approve:** create a content-hashed revision that cannot silently change underneath a run.
+5. **Reuse:** export the approved workflow or run it in test, supervised, or revision-trusted autonomous mode.
+6. **Prove:** keep run outcomes, decisions, action receipts, and screenshots as evidence.
+
+Replay currently produces:
+
+- a readable agent playbook in `SKILL.md`;
+- a Playwright workflow and compile report;
+- a portable computer-use bundle with its policy and safe target crops;
+- guarded execution on the Mac, with a structured run log and evidence screenshots.
+
+See the [architecture map](docs/architecture.md) for the end-to-end flow, concrete file outputs, process boundaries, and trust model. The implementation follows the [screen-to-workflow product design](docs/superpowers/specs/2026-08-16-screen-to-workflow-design.md).
 
 ## Development
 
-Requirements: Node.js 20 or newer, npm, Swift 6, and macOS 14 or newer. Recording the real desktop requires Screen Recording, Accessibility, and Input Monitoring permission; narration also requires Microphone permission.
+Replay currently requires:
+
+- macOS 14 or newer;
+- Node.js 20.19 or newer in the Node 20 line, or Node.js 22.12 or newer, and npm;
+- Swift 6;
+- Screen Recording, Accessibility, and Input Monitoring permission for real capture;
+- Microphone permission only when narration is enabled.
+
+Install and verify the project:
 
 ```sh
 npm install
@@ -17,26 +51,32 @@ npm run dev
 
 Run the deterministic invoice demo separately with `npm run dev:test-app`.
 
-`npm run check` builds the shared packages, type-checks every workspace, runs the complete offline suite, executes both full Replay invoice branches in Chromium, runs a generated Playwright export, and runs the Swift sidecar suite. `npm run build` also produces the release capture sidecar and production desktop/test-app assets.
+`npm run check` builds the shared packages, type-checks every workspace, runs the offline test suites, executes both full Replay invoice branches in Chromium, runs a generated Playwright export, and runs the Swift sidecar suite. `npm run build` also produces the release capture sidecar and the production desktop and test-app assets.
 
-## Claude and narration
+## Model and privacy boundary
 
-Copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY` there, or export it in the shell, before choosing **Build workflow** or using visual verification in a run. The development launcher loads the root `.env` automatically. The recording is not uploaded automatically. Replay first asks for explicit confirmation, keeps the full video local, and sends only redacted condensed actions, sampled frames, and narration text to Claude. Sampling includes observed visual changes; safe element crops remain local as layered target evidence, and secure elements never receive crop references.
+Copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY`, or export it in the shell, before building or running a workflow. The development launcher loads the root `.env` automatically. `.env` files and Replay's local data directories are ignored by Git.
 
-Narration transcription is local and pluggable in this repository. Set `REPLAY_TRANSCRIBE_COMMAND` to an absolute executable that accepts `--input <audio.m4a> --output-json -` and returns the timestamped transcript shape used in `packages/fixtures/recordings/invoice-match/transcript.json`. A previously generated `transcript.json` beside a session is also accepted. Without either option, non-narrated recordings work normally and narrated recordings remain safely stored until a transcriber is configured.
+Replay does not upload the raw screen recording or raw audio. When the user starts **Build workflow**, the configured model can receive redacted condensed actions, narration text, selected full-screen frames, the frame plan, and workflow context. The selected frames are ordinary screenshots and are not visually redacted. During a run, fresh screenshots and task text can also be sent for verification, decisions, re-grounding, or a bounded action proposal. Secure-field event text is redacted before it is saved, and secure targets never receive reusable crop references.
 
-For Apple Silicon development, `scripts/transcribe-whisper.mjs` is the included offline adapter. It defaults to Homebrew's `ffmpeg`, `whisper-cli`, and whisper-cpp base model paths; `.env.example` lists absolute-path overrides for other local installations. The adapter suppresses tool output so narration is not copied into logs, writes transcript files with owner-only permissions, and removes its temporary WAV and Whisper output after success, failure, or cancellation.
+Narration transcription is local and pluggable. Set `REPLAY_TRANSCRIBE_COMMAND` to an absolute executable that accepts `--input <audio.m4a> --output-json -` and returns the timestamped transcript shape in `packages/fixtures/recordings/invoice-match/transcript.json`. A pre-generated `transcript.json` beside a session is also accepted. Without either option, non-narrated recordings work normally and narrated recordings remain stored until a transcriber is configured.
 
-The emergency stop shortcut is **Command–Shift–Escape**. It is handled both by Electron and by the native safety latch. Moving the mouse during a run pauses it before more native actions can proceed.
+For Apple Silicon development, `scripts/transcribe-whisper.mjs` is the included offline adapter. It defaults to Homebrew paths for `ffmpeg`, `whisper-cli`, and the whisper.cpp base model. `.env.example` documents overrides. The adapter suppresses tool output, uses owner-only files, and removes temporary transcription data after success, failure, or cancellation.
 
-Environment variable examples are documented in `.env.example`; the app deliberately does not copy secrets into local workflow files.
+## Safety and local data
 
-## Local data
+The emergency stop shortcut is **Command–Shift–Escape**. Moving the mouse during a run also pauses native actions. Test mode pauses before each step; supervised mode pauses at decision and handoff points; autonomous mode is unavailable until the exact approved revision completes a clean test run.
 
-Replay stores captures, workflow versions, exports, and run logs under the app's local application-data directory. Secrets are represented only by vault references; secure-field keystrokes are redacted before event serialization.
+Replay stores captures, immutable workflow revisions, exports, and run logs below the app's local application-data directory. Secrets are represented by vault references rather than copied into workflow files. The normal UI never collects vault values, and the runner does not use or log them. Runtime answers are recorded, so they should not contain passwords or other secrets.
 
-Each edit creates a new immutable workflow revision. Approval and clean-test trust apply only to the exact revision reviewed. Open low-confidence questions block approval. A correction made during a test run is saved as a new draft and removes autonomous trust. Run history includes per-step screenshots, decisions, and runtime answers and is available from the workflow’s **Runs** tab.
+Every edit creates a new draft revision. Approval and clean-test trust apply only to the exact revision reviewed. A correction during a test run creates another draft and invalidates autonomous trust.
 
-## Hardware release check
+The automated suite cannot grant macOS privacy permissions. Before distributing a signed build, complete the [native clean-account checklist](native/capture/README.md) for real display, microphone, event-tap, Accessibility, emergency-stop, and interrupted-video behaviour.
 
-The automated suite cannot grant macOS privacy permissions. Before distributing a signed build, follow the clean-account checklist in `native/capture/README.md` to verify real display, microphone, event-tap, Accessibility, emergency-stop, and interrupted-video behavior.
+## Contributing
+
+Replay welcomes careful, evidence-backed contributions. Start with [CONTRIBUTING.md](CONTRIBUTING.md), follow the [Code of Conduct](CODE_OF_CONDUCT.md), and report security issues through the private process in [SECURITY.md](SECURITY.md).
+
+## License
+
+The repository's source and media are available under the [Apache License 2.0](LICENSE). The license does not grant permission to use Replay or Ivy trademarks except as needed to describe the project.

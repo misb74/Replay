@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security or privacy vulnerability
+    url: https://github.com/misb74/Replay/security/advisories/new
+    about: Report sensitive security and privacy problems privately.
+  - name: Support guidance
+    url: https://github.com/misb74/Replay/blob/main/SUPPORT.md
+    about: Learn where to ask for help and how to remove private data first.

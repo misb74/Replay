@@ -20,7 +20,7 @@ import { editWorkflow, isWorkflowReviewValid, type WorkflowEdit } from "./workfl
 
 const browserMock = createMockApi();
 
-/** The Ivy mark — the same white ivy line-art used across the Ivy suite (see the HR Agentic Blueprint app). */
+/** The Ivy mark used by Replay. */
 const IvyMark = ({ size = 22 }: { size?: number }) => (
   <svg viewBox="0 0 64 64" fill="none" width={size} height={size} aria-hidden="true">
     <g stroke="#fff" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round">
@@ -216,7 +216,7 @@ function Sidebar(props: {
           </button>
         ))}
       </nav>
-      <div className="sidebar-footer"><span className="local-indicator" /> Everything stays on this Mac</div>
+      <div className="sidebar-footer"><span className="local-indicator" /> Raw recording stays on this Mac</div>
     </aside>
   );
 }
