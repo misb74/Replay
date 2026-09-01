@@ -1,4 +1,4 @@
-/* Ivy design tokens — mirrors the Ivy HR Agentic Blueprint app (slate neutrals, rose accent, Inter).
+/* Replay design tokens: slate neutrals, rose accent, and Inter.
    No web-font import: the Electron CSP is style-src 'self', so Inter renders when installed and falls back to the system stack. */
 :root {
   font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;

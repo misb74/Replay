@@ -1,0 +1,57 @@
+name: Bug report
+description: Tell us about reproducible behaviour that is not working as expected.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Replay. Do not include secrets, personal data, recordings, screenshots, workflow artefacts, or logs that contain private information. Report security or privacy vulnerabilities through the private Security form instead.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected instead.
+      placeholder: Replay did …; I expected …
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can we reproduce it safely?
+      description: Use synthetic data and the smallest reliable set of steps.
+      placeholder: |
+        1. Start Replay with …
+        2. Choose …
+        3. See …
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Replay version or commit
+      placeholder: v0.1.0 or commit hash
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac model
+      placeholder: macOS 15.6, Apple silicon
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: Checks already tried
+      description: Include any relevant test command and its result, with sensitive values removed.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed credentials, personal information, and confidential work data from this report.
+          required: true
+        - label: This is not a security or privacy vulnerability that should be reported privately.
+          required: true

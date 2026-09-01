@@ -3,10 +3,19 @@
   "version": "0.1.0",
   "private": true,
   "description": "Turn a macOS screen recording into a reviewable, executable workflow.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/misb74/Replay.git"
+  },
+  "bugs": {
+    "url": "https://github.com/misb74/Replay/issues"
+  },
+  "homepage": "https://github.com/misb74/Replay#readme",
   "type": "module",
   "packageManager": "npm@11.6.1",
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "workspaces": [
     "apps/*",
