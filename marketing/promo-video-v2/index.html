@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Replay — The reason is on the record</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main id="film" aria-label="Replay film: the reason is on the record">
+      <!-- ============ WORLD: everything the camera moves through ============ -->
+      <div id="world">
+        <div class="dotgrid"></div>
+        <div class="baseline" id="baseline"></div>
+        <div class="scanlight" id="scanlight"></div>
+
+        <!-- Recording strip: 100px of world per second of recording, origin at x=0 -->
+        <section class="strip strip-rec" id="strip-rec">
+          <div class="strip-label"><i></i><span>SOURCE RECORDING</span><b id="strip-rec-length">00:00</b></div>
+          <div class="thumbs" id="rec-thumbs"></div>
+          <div class="ruler" id="rec-ruler"></div>
+          <div class="ruler-fill" id="rec-ruler-fill"></div>
+          <div class="events" id="rec-events"></div>
+          <div class="playhead" id="rec-playhead"><em id="rec-playhead-time">00:00.0</em><i></i></div>
+          <div class="step-marks" id="rec-marks">
+            <span style="left:300px"><b>1</b></span>
+            <span style="left:800px"><b>2</b></span>
+            <span style="left:1600px"><b>3</b></span>
+          </div>
+        </section>
+
+        <!-- Step cards develop above the recording -->
+        <svg class="evidence-lines" viewBox="0 0 2200 900" width="2200" height="900" aria-hidden="true">
+          <path id="ev-line-1" d="M340 560 L300 662" />
+          <path id="ev-line-2" d="M960 560 L800 662" />
+          <path id="ev-line-3" d="M1640 560 L1600 662" />
+        </svg>
+
+        <article class="card step-card" id="card-1" style="left:60px">
+          <header><i>1</i><span class="tc">0:03</span><em class="kind">RECORDED</em></header>
+          <h3>Open the invoice from the review queue</h3>
+          <p class="evidence-row"><span>Clicked invoice INV-1048</span><b>INV-1048 row in Review queue</b></p>
+          <p class="success"><small>SUCCESS LOOKS LIKE</small>The selected invoice details and purchase order total are visible</p>
+        </article>
+
+        <article class="card step-card" id="card-2" style="left:690px">
+          <header><i>2</i><span class="tc">0:08</span><em class="kind narrated">NARRATED</em></header>
+          <h3>Compare the invoice total with the purchase order total</h3>
+          <p class="success"><small>SUCCESS LOOKS LIKE</small>Both totals are visible and the comparison result can be determined</p>
+          <div class="decision">
+            <header><span>◆ DECISION POINT</span><b class="confidence" id="decision-confidence">NEEDS REVIEW</b></header>
+            <strong>The invoice total exactly matches the purchase order total</strong>
+            <p><i>IF YES</i>Approve the invoice</p>
+            <p><i>IF NO</i>Flag the difference for follow-up</p>
+            <p class="rule" id="decision-rule"><i>RULE</i><span id="decision-rule-text"></span></p>
+          </div>
+        </article>
+
+        <article class="card step-card" id="card-3" style="left:1360px">
+          <header><i>3</i><span class="tc">0:16</span><em class="kind">RECORDED</em></header>
+          <h3>Apply the correct review outcome</h3>
+          <p class="evidence-row"><span>Clicked Approve invoice on the recorded path</span><b>Approve invoice button</b></p>
+          <p class="success"><small>SUCCESS LOOKS LIKE</small>The invoice shows Approved or Needs attention</p>
+        </article>
+
+        <!-- The question Replay asks where the recording was silent -->
+        <article class="card question-card" id="question-card">
+          <header><i>?</i><span>ONE DETAIL NEEDS YOUR JUDGMENT</span><b>LOW CONFIDENCE</b></header>
+          <h3>Should a difference under $1.00 still count as a match?</h3>
+          <div class="answer"><span id="answer-text"></span><i class="caret" id="answer-caret"></i></div>
+          <footer><span>The recording showed one exact match. It never showed a small difference.</span><button id="answer-save">Save answer</button></footer>
+        </article>
+
+        <!-- Approval: the cards fold into one content-hashed revision -->
+        <div class="revision-bar" id="revision-bar">
+          <div class="rev-left"><span class="rev-file">workflow.v0002.json</span><span class="rev-hash">sha256 <b id="rev-hash"></b></span></div>
+          <div class="rev-right"><span class="rev-meta">3 steps · 1 decision · 0 open questions</span><b class="stamp" id="rev-stamp">APPROVED</b></div>
+        </div>
+
+        <!-- Compile: one revision, three prints -->
+        <svg class="fan-lines" viewBox="0 0 2400 900" width="2400" height="900" style="left:2200px;top:0" aria-hidden="true">
+          <path id="fan-1" d="M60 430 C 200 430, 220 300, 320 300" />
+          <path id="fan-2" d="M60 430 C 200 430, 220 430, 1020 430" />
+          <path id="fan-3" d="M60 430 C 200 430, 220 560, 1720 560" />
+        </svg>
+        <div class="rev-node" id="rev-node"><b>REV 2</b><span>approved</span></div>
+
+        <article class="card print-card" id="print-1" style="left:2520px">
+          <header><span class="print-kind">PLAYBOOK</span><b>SKILL.md</b></header>
+          <pre class="doc"><b># Review an invoice against its PO</b>
+<span>Goal:</span> compare the invoice total with the
+linked purchase order, then approve an
+exact match or flag it for follow-up.
+
+<span>1.</span> Open the invoice from the review queue
+<span>2.</span> Compare the invoice total with the PO
+   <em>◆ exact match?  yes → approve · no → flag</em>
+<span>3.</span> Apply the correct review outcome
+
+<span>Rule:</span> any difference, however small,
+is flagged for follow-up.</pre>
+          <footer><span>for people and agents</span><b>✓ rev 2</b></footer>
+        </article>
+
+        <article class="card print-card" id="print-2" style="left:3220px">
+          <header><span class="print-kind">BROWSER WORKFLOW</span><b>workflow.ts</b></header>
+          <pre class="code"><i>// step 1 · evidence 0:03</i>
+<span>await</span> page.getByRole(<em>"link"</em>, { name: <em>"INV-1048"</em> }).click();
+<span>await</span> expect(page.getByText(<em>"Invoice total"</em>)).toBeVisible();
+
+<i>// step 2 · decision on fresh evidence</i>
+<span>const</span> match = invoiceTotal === poTotal;
+
+<i>// step 3 · reviewed rule: any difference is flagged</i>
+<span>if</span> (match) <span>await</span> approve.click();
+<span>else</span>       <span>await</span> flagForFollowUp.click();</pre>
+          <footer><span>compile-report.json</span><b>✓ rev 2</b></footer>
+        </article>
+
+        <article class="card print-card" id="print-3" style="left:3920px">
+          <header><span class="print-kind">COMPUTER-USE BUNDLE</span><b>review-invoice/</b></header>
+          <ul class="tree">
+            <li><i>▤</i>system-prompt.md<span>goal, steps, rules</span></li>
+            <li><i>{ }</i>workflow.json<span>the approved revision</span></li>
+            <li class="hl"><i>⚑</i>run-policy.json<span>pause at decisions and handoffs</span></li>
+            <li><i>#</i>manifest.json<span>content hash · rev 2</span></li>
+            <li><i>▣</i>assets/<span>safe target crops · no secure fields</span></li>
+          </ul>
+          <footer><span>for any computer-use agent</span><b>✓ rev 2</b></footer>
+        </article>
+
+        <!-- Run strip: fresh frames appear as the run leaves receipts -->
+        <section class="strip strip-run" id="strip-run">
+          <div class="strip-label run"><i></i><span>SUPERVISED RUN · REV 2</span><b id="strip-run-length">00:00</b></div>
+          <div class="thumbs" id="run-thumbs"></div>
+          <div class="ruler" id="run-ruler"></div>
+          <div class="ruler-fill" id="run-ruler-fill"></div>
+          <div class="receipts" id="run-receipts"></div>
+          <div class="playhead run" id="run-playhead"><em id="run-playhead-time">00:00.0</em><i></i></div>
+        </section>
+
+        <div class="reveal-labels" id="reveal-labels">
+          <span style="left:1050px">RECORD</span>
+          <span style="left:1050px;top:20px">UNDERSTAND · REVIEW · APPROVE</span>
+          <span style="left:3200px">EXPORT</span>
+          <span style="left:5800px">RUN · PROVE</span>
+        </div>
+      </div>
+
+      <!-- ============ HUD: fixed to the lens ============ -->
+      <div id="hud">
+        <div class="cold" id="cold">
+          <div class="cold-dot" id="cold-dot"></div>
+          <div class="cold-counter" id="cold-counter">00:00:00.00</div>
+          <h1 class="hook" id="hook-1">Every click has a reason.</h1>
+          <h1 class="hook" id="hook-2">Nobody writes it down.</h1>
+        </div>
+
+        <div class="rec-pill" id="rec-pill">
+          <span class="rec-dot"><i></i></span>
+          <b id="rec-pill-state">REPLAY IS RECORDING</b>
+          <em id="rec-pill-time">00:00</em>
+          <div class="wave" id="rec-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        </div>
+
+        <div class="monitor" id="monitor">
+          <div class="monitor-chrome"><div class="traffic"><i></i><i></i><i></i></div><div class="url" id="monitor-url">finance.northwind.example/invoices</div></div>
+          <div class="app" id="app-main" data-view="queue" data-hover="none" data-outcome="none">
+            <aside class="app-side">
+              <div class="app-logo">N</div>
+              <span>Dashboard</span><span class="active">Invoices</span><span>Vendors</span>
+              <small>Northwind Finance</small>
+            </aside>
+            <div class="app-page">
+              <div class="app-queue">
+                <small>INVOICE REVIEW</small><h2>Review queue</h2>
+                <ul>
+                  <li class="done"><b>INV-1046</b><span>Acme Supply</span><i>$412.00</i><em>Approved</em></li>
+                  <li class="done"><b>INV-1047</b><span>Bright Paper Co.</span><i>$2,150.00</i><em>Approved</em></li>
+                  <li class="pending target"><b class="q-id">INV-1048</b><span class="q-vendor">Harbor Logistics</span><i class="q-total">$1,284.40</i><em>Pending</em></li>
+                  <li class="pending"><b>INV-1049</b><span>Tidewater Print</span><i>$96.50</i><em>Pending</em></li>
+                  <li class="pending"><b>INV-1050</b><span>Meridian Freight</span><i>$3,020.00</i><em>Pending</em></li>
+                </ul>
+              </div>
+              <div class="app-detail">
+                <small>INVOICE REVIEW</small><h2 class="inv-id">INV-1048</h2><p class="inv-vendor">Harbor Logistics · net 14</p>
+                <div class="totals">
+                  <div class="total invoice"><small>Invoice total</small><b class="inv-total">$1,284.40</b></div>
+                  <span class="arrow">→</span>
+                  <div class="total po"><small class="po-id">PO-8821</small><b class="po-total">$1,284.40</b></div>
+                </div>
+                <div class="actions"><button class="approve">Approve invoice</button><button class="flag">Flag for follow-up</button></div>
+                <div class="outcome"><span class="badge"></span></div>
+              </div>
+            </div>
+          </div>
+          <div class="cursor human" id="cursor-human"><i></i></div>
+          <div class="cursor agent" id="cursor-agent"><i></i><span id="agent-label">REPLAY</span></div>
+          <div class="fresh-check" id="fresh-check"><small>FRESH EVIDENCE</small><b>$980.00 ≠ $995.00</b><span>difference $15.00 → NO branch</span></div>
+        </div>
+
+        <div class="caption" id="caption"><span id="caption-text"></span></div>
+        <div class="kicker" id="kicker"></div>
+
+        <div class="gate" id="gate">
+          <div class="gate-col stays">
+            <small>STAYS ON THIS MAC</small>
+            <div class="gate-item" id="gate-video"><i>▶</i>video.mp4<span>raw screen recording</span></div>
+            <div class="gate-item" id="gate-audio"><i>≋</i>audio.m4a<span>raw narration</span></div>
+            <div class="gate-item" id="gate-events"><i>⌘</i>events.jsonl<span>secure fields redacted before save</span></div>
+          </div>
+          <div class="gate-line"><b>MODEL BOUNDARY</b><span>opens only when you press Build</span></div>
+          <div class="gate-col crosses">
+            <small>SENT TO THE MODEL</small>
+            <div class="gate-item mover" id="gate-actions"><i>↗</i>condensed actions<span>redacted</span></div>
+            <div class="gate-item mover" id="gate-narr"><i>“</i>narration text<span>not the audio</span></div>
+            <div class="gate-item mover" id="gate-frames"><i>▣</i>4 selected frames<span>ordinary screenshots</span></div>
+            <div class="gate-item mover" id="gate-plan"><i>⋯</i>frame plan<span>what changed, when</span></div>
+          </div>
+        </div>
+
+        <button class="approve-btn" id="approve-btn">Approve workflow</button>
+        <div class="rev-chip" id="rev-chip"><i>✓</i><b>REV 2</b><span>approved · sha256 <em id="rev-chip-hash"></em></span></div>
+
+        <div class="run-hud" id="run-hud">
+          <header><span class="run-mode" id="run-mode">SUPERVISED</span><b>Review an invoice against its PO</b><em id="run-status">RUNNING</em></header>
+          <ol>
+            <li id="run-step-1"><i>1</i><span>Open the invoice from the review queue</span><b></b></li>
+            <li id="run-step-2"><i>2</i><span>Compare totals · decide on fresh evidence</span><b></b></li>
+            <li id="run-step-3"><i>3</i><span>Apply the correct review outcome</span><b></b></li>
+          </ol>
+          <footer><span><kbd>⌘</kbd><kbd>⇧</kbd><kbd>⎋</kbd> stops everything</span><span>moving the mouse pauses</span><span id="run-shots">0 screenshots</span></footer>
+        </div>
+
+        <div class="result" id="result">
+          <div class="result-check">✓</div>
+          <div><small>RESULT VERIFIED · REV 2</small><h3>INV-1052 flagged for follow-up</h3><p>3 steps · decision took the NO branch on fresh evidence · 4 screenshots · run.json</p></div>
+          <span class="trust"><b>Clean test of this exact revision → trust.json</b><em>autonomy for rev 2 only · a correction returns it to draft</em></span>
+        </div>
+
+        <div class="closing" id="closing">
+          <h1 class="closing-line" id="closing-line">Now the reason<br />is on the record.</h1>
+          <div class="lockup" id="lockup">
+            <span class="brand-tile">
+              <svg viewBox="0 0 64 64" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="4.5"><path d="M12 44C8 48 8 54 12 58C18 62 30 62 40 60C48 58 54 50 54 42L54 28"/><ellipse cx="20" cy="36" rx="8" ry="9"/><path d="M32 28C31 20 31 14 32 8M40 25C40 17 40 11 41 6M48 28C48 20 49 14 50 10"/></g></svg>
+            </span>
+            <div class="brand-words"><b>Ivy</b><i></i><span>Replay</span></div>
+            <h2 class="thesis"><span id="thesis-1">Show the work.</span><span id="thesis-2">Teach the agent.</span><span id="thesis-3"><em>Trust the result.</em></span></h2>
+            <div class="thesis-rule"><i id="thesis-rule-fill"></i></div>
+            <p class="tag" id="closing-tag">The teaching layer for agents</p>
+          </div>
+        </div>
+
+        <div class="vignette"></div>
+        <div class="grain" id="grain"></div>
+        <div class="fade" id="fade"></div>
+      </div>
+    </main>
+    <script src="./timeline.js"></script>
+  </body>
+</html>
