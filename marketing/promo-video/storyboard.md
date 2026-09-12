@@ -4,7 +4,7 @@
 
 **A person demonstrates the judgment behind a weekly client update. Replay turns that demonstration into a reviewed, testable specification that can be exported or run safely.**
 
-The film borrows the reference video's effective product-demo grammar—one credible story, restrained copy, floating interfaces, a time jump, and a single closing thesis—without copying Claude's branding, assets, soundtrack, wording, or exact scenes.
+The film uses a classic product-demo grammar: one credible story, restrained copy, floating interfaces, a time jump, and a single closing thesis.
 
 ## Timeline
 

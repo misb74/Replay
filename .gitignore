@@ -16,7 +16,3 @@ workflows/
 runs/
 native/capture/.build/
 apps/desktop/release/
-
-# Superseded local promo drafts and render intermediates.
-/promo/
-/docs/superpowers/specs/2026-08-25-replay-promo-film-design.md

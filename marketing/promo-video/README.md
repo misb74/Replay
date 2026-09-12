@@ -23,4 +23,4 @@ ffmpeg -y \
   marketing/promo-video/output/replay-promo-1080p.mp4
 ```
 
-The soundtrack is original and generated locally by `soundtrack.mjs`. No stock footage, third-party music, external fonts, or Claude creative assets are included.
+The soundtrack is original and generated locally by `soundtrack.mjs`. No stock footage, third-party music, or external fonts are included.

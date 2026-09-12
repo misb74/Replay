@@ -162,7 +162,7 @@ The automated suite can't grant macOS privacy permissions. Before distributing a
 | [`packages/runner`](packages/runner) | IR-constrained execution, operator gates, verification, run logs |
 | [`packages/fixtures`](packages/fixtures) | Synthetic recordings, cached model responses, evaluation labels |
 | [`test-app`](test-app) | Deterministic invoice app for end-to-end and compiler tests |
-| [`docs`](docs) | [Architecture map](docs/architecture.md) and the [product design spec](docs/superpowers/specs/2026-08-16-screen-to-workflow-design.md) |
+| [`docs`](docs) | [Architecture map](docs/architecture.md) and the [product design spec](docs/design/screen-to-workflow.md) |
 | [`marketing`](marketing) | Source for the Replay films |
 
 ## Contributing
