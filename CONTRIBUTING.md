@@ -11,7 +11,7 @@ Thanks for helping improve Replay. Contributions of code, documentation, tests, 
 
 ## Set up the project
 
-Replay development requires macOS 14 or newer, Node.js `^20.19.0 || >=22.12.0`, npm, and Swift 6.
+Replay development requires macOS 14 or newer, Node.js `^22.12.0 || ^24.0.0 || >=26.0.0`, npm, and Swift 6.
 
 ```sh
 git clone https://github.com/misb74/Replay.git
