@@ -1,82 +1,176 @@
+<div align="center">
+
 # Replay
 
-Replay turns a demonstration of real work into a workflow that a person can inspect, correct, approve, export, and run again.
+**Show the work. Teach the agent. Trust the result.**
 
-It is designed for the messy middle of agent building: the judgment between clicks that is obvious to an expert but missing from a process document. Replay records the work, links each proposed step back to evidence, surfaces uncertainty, and makes a reviewed workflow revision the source of truth.
+Replay turns a demonstration of real work on your Mac into a workflow you can inspect, correct, approve, export, and run again, with every step linked back to the evidence it came from.
 
-> **Project status:** Replay is an early-stage macOS prototype. It can control real applications. Use test or supervised mode, review every generated workflow, and keep the emergency stop available. It is not yet a signed end-user release.
+[![CI](https://github.com/misb74/Replay/actions/workflows/ci.yml/badge.svg)](https://github.com/misb74/Replay/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE) ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple) ![Node.js](https://img.shields.io/badge/node-%5E20.19%20%7C%7C%20%3E%3D22.12-339933?logo=node.js&logoColor=white) ![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white) ![Status: early prototype](https://img.shields.io/badge/status-early%20prototype-orange)
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[**Watch the film**](#-the-film) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Architecture](docs/architecture.md) · [Contributing](CONTRIBUTING.md)
 
-![Replay: show the work, teach the agent, trust the result](marketing/promo-video/output/replay-promo-poster.jpg)
+<a href="marketing/promo-video-v2/output/replay-film-1080p.mp4">
+  <img src="docs/media/replay-film-preview.webp" alt="Highlights from the Replay film: an expert records an invoice review, Replay turns it into evidence-linked steps, asks about an ambiguous rule, locks the approved revision with a content hash, exports it three ways, and runs it under supervision." width="100%">
+</a>
 
-[Watch the 74-second Replay product film](marketing/promo-video/output/replay-promo-1080p.mp4).
+</div>
 
-## What Replay does
+> [!WARNING]
+> Replay is an early-stage macOS prototype that **can control real applications**. Use test or supervised mode, review every generated workflow, and keep the emergency stop (**⌘⇧⎋**) within reach. It is not yet a signed end-user release.
 
-1. **Capture:** record a task on the primary Mac display, with optional narration.
-2. **Understand:** turn the evidence into steps, targets, checks, inputs, and decision branches.
-3. **Review:** edit the draft and answer open questions. Unresolved low-confidence questions block approval.
-4. **Approve:** create a content-hashed revision that cannot silently change underneath a run.
-5. **Reuse:** export the approved workflow or run it in test, supervised, or revision-trusted autonomous mode.
-6. **Prove:** keep run outcomes, decisions, action receipts, and screenshots as evidence.
+## Why Replay
 
-Replay currently produces:
+The hardest part of automating real work isn't the clicks. It's the judgment between them: the rule an expert applies without thinking, which never makes it into a process document.
 
-- a readable agent playbook in `SKILL.md`;
-- a Playwright workflow and compile report;
-- a portable computer-use bundle with its policy and safe target crops;
-- guarded execution on the Mac, with a structured run log and evidence screenshots.
+Replay captures that judgment. You do the task once and narrate if you like. Replay proposes a workflow in which every step points to the moment it was observed, surfaces what it's unsure about, and asks you to settle the ambiguity before anything runs. The reviewed, content-hashed revision becomes the source of truth for people, browser scripts, and computer-use agents alike.
 
-See the [architecture map](docs/architecture.md) for the end-to-end flow, concrete file outputs, process boundaries, and trust model. The implementation follows the [screen-to-workflow product design](docs/superpowers/specs/2026-08-16-screen-to-workflow-design.md).
+<p align="center">
+  <img src="docs/media/replay-review.png" alt="Replay's review screen: a draft invoice-review workflow with its source recording on the left, and on the right three evidence-linked steps with a narrated decision point." width="100%">
+  <br>
+  <sub>Reviewing a captured workflow. Each step jumps to the moment in the recording it came from, and decision points show where the expert's judgment lives.</sub>
+</p>
 
-## Development
+## How it works
 
-Replay currently requires:
-
-- macOS 14 or newer;
-- Node.js 20.19 or newer in the Node 20 line, or Node.js 22.12 or newer, and npm;
-- Swift 6;
-- Screen Recording, Accessibility, and Input Monitoring permission for real capture;
-- Microphone permission only when narration is enabled.
-
-Install and verify the project:
-
-```sh
-npm install
-npm run check
-npm run build
-npm run dev
+```mermaid
+flowchart LR
+    A["🎬 Capture<br/>screen, input events,<br/>optional narration"] --> B["🧠 Understand<br/>steps, targets, checks,<br/>decision branches"]
+    B --> C["✍️ Review<br/>edit the draft,<br/>answer open questions"]
+    C --> D["🔒 Approve<br/>content-hashed,<br/>immutable revision"]
+    D --> E["📦 Export<br/>SKILL.md · Playwright ·<br/>computer-use bundle"]
+    D --> F["▶️ Run<br/>test · supervised ·<br/>autonomous"]
+    F --> G["🧾 Prove<br/>run log, receipts,<br/>screenshots"]
+    G -.->|a correction creates a new draft| C
 ```
 
-Run the deterministic invoice demo separately with `npm run dev:test-app`.
+| Stage | What happens |
+| --- | --- |
+| **Capture** | Record a task on the primary Mac display with the native Swift sidecar, optionally with narration. |
+| **Understand** | Redacted, condensed events, narration, and selected frames become steps, targets, success checks, inputs, and decision branches. |
+| **Review** | Edit the draft and resolve open questions. Unresolved low-confidence questions block approval. |
+| **Approve** | Stamp a content-hashed revision that can't silently change underneath a run. |
+| **Reuse** | Export the approved revision, or run it on the Mac in test, supervised, or revision-trusted autonomous mode. |
+| **Prove** | Keep run outcomes, decisions, action receipts, and screenshots as evidence. |
 
-`npm run check` builds the shared packages, type-checks every workspace, runs the offline test suites, executes both full Replay invoice branches in Chromium, runs a generated Playwright export, and runs the Swift sidecar suite. `npm run build` also produces the release capture sidecar and the production desktop and test-app assets.
+## What you get
 
-## Model and privacy boundary
+One approved revision compiles to every target, so the playbook, the script, and the agent bundle can never drift apart.
 
-Copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY`, or export it in the shell, before building or running a workflow. The development launcher loads the root `.env` automatically. `.env` files and Replay's local data directories are ignored by Git.
+| Output | Files | For |
+| --- | --- | --- |
+| **Playbook** | `SKILL.md` | A readable procedure for a person or an agent |
+| **Playwright workflow** | `workflow.ts`, `compile-report.json` | Deterministic browser automation, with an explicit report of fallbacks |
+| **Computer-use bundle** | `system-prompt.md`, `workflow.json`, `run-policy.json`, `manifest.json`, `assets/` | A portable, policy-bounded task for a computer-use runtime |
+| **Guarded live run** | `run.json`, `screenshots/` | Completed work on the Mac, with a structured account of what happened and why |
+| **Revision trust** | `trust.json` | Unlocks autonomous mode for the exact revision that passed a clean test |
 
-Replay does not upload the raw screen recording or raw audio. When the user starts **Build workflow**, the configured model can receive redacted condensed actions, narration text, selected full-screen frames, the frame plan, and workflow context. The selected frames are ordinary screenshots and are not visually redacted. During a run, fresh screenshots and task text can also be sent for verification, decisions, re-grounding, or a bounded action proposal. Secure-field event text is redacted before it is saved, and secure targets never receive reusable crop references.
+See the [architecture map](docs/architecture.md) for the full output layout, process boundaries, and trust model.
 
-Narration transcription is local and pluggable. Set `REPLAY_TRANSCRIBE_COMMAND` to an absolute executable that accepts `--input <audio.m4a> --output-json -` and returns the timestamped transcript shape in `packages/fixtures/recordings/invoice-match/transcript.json`. A pre-generated `transcript.json` beside a session is also accepted. Without either option, non-narrated recordings work normally and narrated recordings remain stored until a transcriber is configured.
+## 🎬 The film
 
-For Apple Silicon development, `scripts/transcribe-whisper.mjs` is the included offline adapter. It defaults to Homebrew paths for `ffmpeg`, `whisper-cli`, and the whisper.cpp base model. `.env.example` documents overrides. The adapter suppresses tool output, uses owner-only files, and removes temporary transcription data after success, failure, or cancellation.
+[![Replay film poster](marketing/promo-video-v2/output/replay-film-poster.jpg)](marketing/promo-video-v2/output/replay-film-1080p.mp4)
 
-## Safety and local data
+**[Download the 82-second film (1080p MP4)](marketing/promo-video-v2/output/replay-film-1080p.mp4)**. One continuous camera move follows the repository's own invoice demo from recording to approval, export, and a supervised run that takes the branch the recording never showed.
 
-The emergency stop shortcut is **Command–Shift–Escape**. Moving the mouse during a run also pauses native actions. Test mode pauses before each step; supervised mode pauses at decision and handoff points; autonomous mode is unavailable until the exact approved revision completes a clean test run.
+The film is a deterministic HTML timeline with an original, locally synthesised score. No stock footage, third-party music, or downloaded fonts. Its source, storyboard, and render instructions are in [`marketing/promo-video-v2`](marketing/promo-video-v2/README.md).
 
-Replay stores captures, immutable workflow revisions, exports, and run logs below the app's local application-data directory. Secrets are represented by vault references rather than copied into workflow files. The normal UI never collects vault values, and the runner does not use or log them. Runtime answers are recorded, so they should not contain passwords or other secrets.
+## Quick start
 
-Every edit creates a new draft revision. Approval and clean-test trust apply only to the exact revision reviewed. A correction during a test run creates another draft and invalidates autonomous trust.
+**Requirements**
 
-The automated suite cannot grant macOS privacy permissions. Before distributing a signed build, complete the [native clean-account checklist](native/capture/README.md) for real display, microphone, event-tap, Accessibility, emergency-stop, and interrupted-video behaviour.
+- macOS 14 or newer
+- Node.js `^20.19.0 || >=22.12.0` and npm
+- Swift 6
+- Screen Recording, Accessibility, and Input Monitoring permission for real capture; Microphone permission only when narration is enabled
+
+**Install, verify, and launch**
+
+```sh
+git clone https://github.com/misb74/Replay.git
+cd Replay
+npm install
+npm run check   # build packages, type-check, unit + e2e tests, Swift sidecar suite
+npm run dev     # launch the desktop app
+```
+
+Then set up a model key for workflow builds:
+
+```sh
+cp .env.example .env   # set ANTHROPIC_API_KEY
+```
+
+**Try it without recording anything**
+
+- `npm run dev:test-app` starts the deterministic invoice app used by the end-to-end tests. Record yourself reviewing an invoice against its purchase order.
+- `npm run dev:renderer -w @replay/desktop` opens the review UI in a browser with a built-in demo workflow and no native permissions.
+
+| Command | What it does |
+| --- | --- |
+| `npm run check` | Builds the shared packages, type-checks every workspace, runs the offline test suites, executes both full invoice branches in Chromium, runs a generated Playwright export, and runs the Swift sidecar suite |
+| `npm run build` | Also produces the release capture sidecar and the production desktop and test-app assets |
+| `npm run dev` | Builds the packages and launches the Electron app with the development renderer |
+| `npm run dev:test-app` | Serves the deterministic invoice demo app |
+
+## Privacy and safety
+
+**What stays on your Mac.** Raw screen video, raw audio, the full event log, target crops, workflow revisions, exports, and run logs.
+
+**What can reach the model, and only after you press Build or Run.** Redacted condensed actions, narration text, the frame plan, selected full-screen frames, and workflow context. During a run, fresh screenshots and step text are sent for verification, decisions, re-grounding, or a bounded action proposal. Selected frames and run screenshots are ordinary screenshots and are **not** visually redacted. The [privacy boundary](docs/architecture.md#privacy-boundary) documents exactly what crosses in each direction.
+
+**Guardrails during a run**
+
+<img src="docs/media/replay-run-modes.png" alt="The Run this workflow dialog: an invoice_number input, with Test run selected, Supervised available, and Autonomous disabled until a clean test run passes." width="420" align="right">
+
+- **⌘⇧⎋** trips the native emergency stop, even mid-action. Moving the mouse pauses native actions.
+- **Test mode** pauses before each step. **Supervised mode** pauses at decision and handoff points.
+- **Autonomous mode** stays locked until the exact approved revision completes a clean test run. Any edit or correction creates a new draft, and old trust no longer applies.
+- Secure-field input is redacted before it is saved, and secure targets never get reusable crops. Secrets are vault references, never copied into workflow files.
+- Earlier successful actions are never replayed when a later check fails, and each decision uses fresh screen evidence.
+
+<details>
+<summary><b>Local narration transcription</b></summary>
+
+<br>
+
+Transcription is local and pluggable. Set `REPLAY_TRANSCRIBE_COMMAND` to an absolute executable that accepts `--input <audio.m4a> --output-json -` and returns the timestamped transcript shape in [`packages/fixtures/recordings/invoice-match/transcript.json`](packages/fixtures/recordings/invoice-match/transcript.json). A pre-generated `transcript.json` beside a session is also accepted. Without either, non-narrated recordings work normally, and narrated recordings are stored until a transcriber is configured.
+
+On Apple Silicon, [`scripts/transcribe-whisper.mjs`](scripts/transcribe-whisper.mjs) is the included offline adapter. It defaults to Homebrew paths for `ffmpeg`, `whisper-cli`, and the whisper.cpp base model, and [`.env.example`](.env.example) documents the overrides. The adapter suppresses tool output, uses owner-only files, and removes temporary transcription data after success, failure, or cancellation.
+
+</details>
+
+<details>
+<summary><b>Where Replay stores data</b></summary>
+
+<br>
+
+Replay stores captures, immutable workflow revisions, exports, and run logs under `~/Library/Application Support/Replay/ReplayData/`, written with owner-only file modes. `.env` files and Replay's local data directories are ignored by Git. Runtime answers are recorded, so they should never contain passwords or other secrets.
+
+The automated suite can't grant macOS privacy permissions. Before distributing a signed build, complete the [native clean-account checklist](native/capture/README.md) for display, microphone, event-tap, Accessibility, emergency-stop, and interrupted-video behaviour.
+
+</details>
+
+## Repository layout
+
+| Path | What lives there |
+| --- | --- |
+| [`apps/desktop`](apps/desktop) | Electron main process, isolated preload bridge, React review UI |
+| [`native/capture`](native/capture) | Swift recorder, macOS permissions, accessibility actions, safety interlocks |
+| [`packages/pipeline`](packages/pipeline) | Event redaction and condensation, frame planning, model prompts, draft assembly |
+| [`packages/ir`](packages/ir) | Canonical workflow types, JSON Schema validation, migrations |
+| [`packages/compilers`](packages/compilers) | Playbook, Playwright, and computer-use exports |
+| [`packages/runner`](packages/runner) | IR-constrained execution, operator gates, verification, run logs |
+| [`packages/fixtures`](packages/fixtures) | Synthetic recordings, cached model responses, evaluation labels |
+| [`test-app`](test-app) | Deterministic invoice app for end-to-end and compiler tests |
+| [`docs`](docs) | [Architecture map](docs/architecture.md) and the [product design spec](docs/superpowers/specs/2026-08-16-screen-to-workflow-design.md) |
+| [`marketing`](marketing) | Source for the Replay films |
 
 ## Contributing
 
-Replay welcomes careful, evidence-backed contributions. Start with [CONTRIBUTING.md](CONTRIBUTING.md), follow the [Code of Conduct](CODE_OF_CONDUCT.md), and report security issues through the private process in [SECURITY.md](SECURITY.md).
+Replay welcomes careful, evidence-backed contributions: code, tests, docs, bug reports, and product feedback. Start with [CONTRIBUTING.md](CONTRIBUTING.md) and follow the [Code of Conduct](CODE_OF_CONDUCT.md). For help, see [SUPPORT.md](SUPPORT.md).
+
+Replay handles sensitive screen and input data, so **never post real recordings, screenshots, workflow files, or logs** in issues. Report security or privacy problems privately through [SECURITY.md](SECURITY.md).
 
 ## License
 
-The repository's source and media are available under the [Apache License 2.0](LICENSE). The license does not grant permission to use Replay or Ivy trademarks except as needed to describe the project.
+Source and media are available under the [Apache License 2.0](LICENSE). The license doesn't grant permission to use the Replay or Ivy trademarks, except as needed to describe the project.
