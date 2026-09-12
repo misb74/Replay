@@ -14,24 +14,24 @@
     "clean": "rimraf dist"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.117.1",
-    "@anthropic-ai/claude-agent-sdk": "^0.3.233",
+    "@anthropic-ai/sdk": "^0.124.0",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.267",
     "@replay/compilers": "*",
     "@replay/ir": "*",
     "@replay/pipeline": "*",
     "@replay/runner": "*",
     "ffmpeg-static": "^5.3.0",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   },
   "devDependencies": {
-    "@types/node": "^26.4.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "@vitejs/plugin-react": "^6.0.5",
+    "@types/node": "^26.5.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
     "concurrently": "^10.0.5",
     "cross-env": "^10.1.0",
-    "electron": "^44.0.0",
+    "electron": "^44.3.0",
     "rimraf": "^6.1.2",
     "typescript": "^7.0.2",
     "vite": "^8.2.2",
