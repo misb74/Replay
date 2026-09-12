@@ -6,7 +6,7 @@
 
 Replay turns a demonstration of real work on your Mac into a workflow you can inspect, correct, approve, export, and run again, with every step linked back to the evidence it came from.
 
-[![CI](https://github.com/misb74/Replay/actions/workflows/ci.yml/badge.svg)](https://github.com/misb74/Replay/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE) ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple) ![Node.js](https://img.shields.io/badge/node-%5E20.19%20%7C%7C%20%3E%3D22.12-339933?logo=node.js&logoColor=white) ![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white) ![Status: early prototype](https://img.shields.io/badge/status-early%20prototype-orange)
+[![CI](https://github.com/misb74/Replay/actions/workflows/ci.yml/badge.svg)](https://github.com/misb74/Replay/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE) ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple) ![Node.js](https://img.shields.io/badge/node-%5E22.12%20%7C%7C%20%5E24%20%7C%7C%20%3E%3D26-339933?logo=node.js&logoColor=white) ![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white) ![Status: early prototype](https://img.shields.io/badge/status-early%20prototype-orange)
 
 [**Watch the film**](#-the-film) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Architecture](docs/architecture.md) · [Contributing](CONTRIBUTING.md)
 
@@ -80,7 +80,7 @@ The film is a deterministic HTML timeline with an original, locally synthesised 
 **Requirements**
 
 - macOS 14 or newer
-- Node.js `^20.19.0 || >=22.12.0` and npm
+- Node.js `^22.12.0 || ^24.0.0 || >=26.0.0` and npm
 - Swift 6
 - Screen Recording, Accessibility, and Input Monitoring permission for real capture; Microphone permission only when narration is enabled
 
