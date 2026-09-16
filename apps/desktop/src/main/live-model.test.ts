@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyLiveModelError, LiveModelError } from "./live-model.js";
+import { classifyLiveModelError, LiveModelError, parseLiveCheckResult } from "./live-model.js";
 
 describe("classifyLiveModelError", () => {
   it("separates retryable failures from permanent ones", () => {
@@ -40,5 +40,34 @@ describe("classifyLiveModelError", () => {
     expect(classifyLiveModelError(undefined)).toBe("failed");
     expect(classifyLiveModelError("boom")).toBe("failed");
     expect(classifyLiveModelError({ status: "429" })).toBe("failed");
+  });
+});
+
+describe("parseLiveCheckResult", () => {
+  it("answers ask: false when the text block is not valid JSON", () => {
+    const message = { stop_reason: "end_turn", content: [{ type: "text", text: "not json" }] };
+    expect(parseLiveCheckResult(message)).toEqual({ ask: false });
+  });
+
+  it("answers ask: false when the text was truncated mid-object", () => {
+    // The realistic way to get unparseable JSON: max_tokens cuts the reply
+    // off before the closing brace.
+    const message = { stop_reason: "end_turn", content: [{ type: "text", text: '{"ask": true, "quest' }] };
+    expect(parseLiveCheckResult(message)).toEqual({ ask: false });
+  });
+
+  it("answers ask: false on a refusal, without looking at the content", () => {
+    const message = { stop_reason: "refusal", content: [{ type: "text", text: '{"ask": true, "question": "Why?"}' }] };
+    expect(parseLiveCheckResult(message)).toEqual({ ask: false });
+  });
+
+  it("answers ask: true with the trimmed question for a valid reply", () => {
+    const message = { stop_reason: "end_turn", content: [{ type: "text", text: '{"ask": true, "question": "Why?"}' }] };
+    expect(parseLiveCheckResult(message)).toEqual({ ask: true, question: "Why?" });
+  });
+
+  it("answers ask: false when the question is empty", () => {
+    const message = { stop_reason: "end_turn", content: [{ type: "text", text: '{"ask": true, "question": ""}' }] };
+    expect(parseLiveCheckResult(message)).toEqual({ ask: false });
   });
 });

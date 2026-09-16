@@ -92,6 +92,43 @@ const CHECK_SCHEMA = {
   required: ["ask", "question"],
 } as const;
 
+/**
+ * The minimal shape of a `check()` response that `parseLiveCheckResult`
+ * needs, kept separate from `Anthropic.Message` so it can be constructed and
+ * tested without a network or a full message fixture.
+ */
+export interface LiveCheckMessage {
+  stop_reason: string | null;
+  content: readonly { type: string; text?: string }[];
+}
+
+/**
+ * Turns a `check()` response into a `LiveCheckResult`. A reply the transport
+ * cannot use — a refusal, a missing text block, or text that is not valid
+ * JSON in the expected shape (for example because `max_tokens` cut it off
+ * mid-object) — is not a transport failure, so this never throws; it answers
+ * `{ ask: false }` instead.
+ */
+export function parseLiveCheckResult(message: LiveCheckMessage): LiveCheckResult {
+  if (message.stop_reason === "refusal") return { ask: false };
+  const block = message.content.find((item) => item.type === "text");
+  const text = block?.type === "text" ? block.text : undefined;
+  if (text === undefined) return { ask: false };
+  // A reply the transport cannot use is not a transport failure: parsing and
+  // the shape check get their own try/catch so a malformed or truncated
+  // response (unlike a genuine network/auth/rate-limit error) answers
+  // `{ ask: false }` rather than surfacing as a LiveModelError.
+  try {
+    const parsed = JSON.parse(text) as { ask?: unknown; question?: unknown };
+    if (parsed.ask !== true || typeof parsed.question !== "string" || parsed.question.trim() === "") {
+      return { ask: false };
+    }
+    return { ask: true, question: parsed.question.trim() };
+  } catch {
+    return { ask: false };
+  }
+}
+
 export function createClaudeLiveTransport(options: ClaudeLiveTransportOptions): LiveModelTransport {
   const client = new Anthropic({ apiKey: options.apiKey, maxRetries: 1 });
 
@@ -161,7 +198,7 @@ export function createClaudeLiveTransport(options: ClaudeLiveTransportOptions): 
         const message = await client.messages.create(
           {
             model: options.model,
-            max_tokens: 512,
+            max_tokens: 2048,
             output_config: {
               effort: "low",
               format: { type: "json_schema", schema: CHECK_SCHEMA },
@@ -174,14 +211,7 @@ export function createClaudeLiveTransport(options: ClaudeLiveTransportOptions): 
           },
           { signal: request.signal },
         );
-        if (message.stop_reason === "refusal") return { ask: false };
-        const block = message.content.find((item) => item.type === "text");
-        if (block?.type !== "text") return { ask: false };
-        const parsed = JSON.parse(block.text) as { ask?: unknown; question?: unknown };
-        if (parsed.ask !== true || typeof parsed.question !== "string" || parsed.question.trim() === "") {
-          return { ask: false };
-        }
-        return { ask: true, question: parsed.question.trim() };
+        return parseLiveCheckResult(message);
       } catch (cause) {
         throw new LiveModelError(classifyLiveModelError(cause));
       }
