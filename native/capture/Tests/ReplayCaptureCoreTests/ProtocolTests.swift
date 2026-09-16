@@ -93,3 +93,36 @@ import Testing
     #expect(!json.contains("secret-value"))
     #expect(json.contains("secure_field_requires_human_input"))
 }
+
+@Test func recordCommandCarriesExcludedProcessIds() throws {
+    let command = SidecarCommandEnvelope(
+        requestId: "request-exclusions",
+        command: .record(.init(
+            sessionId: "session-1",
+            sessionDirectory: "/tmp/session-1",
+            includeAudio: false,
+            display: .init(width: 100, height: 50, scale: 1),
+            excludeProcessIds: [4321]
+        ))
+    )
+
+    let decoded = try JSONDecoder.replay.decode(
+        SidecarCommandEnvelope.self,
+        from: JSONEncoder.replay.encode(command)
+    )
+
+    #expect(decoded == command)
+}
+
+@Test func screenshotCommandDefaultsToNoExclusions() throws {
+    let decoded = try JSONDecoder.replay.decode(
+        SidecarCommandEnvelope.self,
+        from: Data(#"{"protocolVersion":1,"requestId":"1","command":"act_screenshot","payload":{"outputPath":"/tmp/a.png"}}"#.utf8)
+    )
+
+    guard case let .actScreenshot(command) = decoded.command else {
+        Issue.record("Expected a screenshot command")
+        return
+    }
+    #expect(command.excludeProcessIds.isEmpty)
+}

@@ -449,6 +449,24 @@ import Testing
     #expect(unsubscribe.result?.guardrailsActive == false)
 }
 
+@Test func screenshotForwardsExcludedProcessIds() async throws {
+    let actions = FakeActions()
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: actions
+    )
+
+    let response = await service.handle(.init(
+        requestId: "request-1",
+        command: .actScreenshot(.init(outputPath: "/tmp/shot.png", excludeProcessIds: [99]))
+    ))
+
+    #expect(response.ok)
+    #expect(await actions.lastScreenshotExclusions == [99])
+}
+
 @Test func guardrailCannotBeLostWhileSubscriptionIsStarting() async {
     let safety = FakeSafetyMonitor(eventOnStart: .init(type: .killSwitch, timestampMs: 0))
     let received = SafetyEventCollector()
@@ -573,13 +591,15 @@ private actor FakeActions: ActionPerforming {
     private var scrolls = 0
     private var drags = 0
     private var navigations = 0
+    private(set) var lastScreenshotExclusions: [Int32] = []
 
     init(focusedSecure: Bool = false) {
         self.focusedSecure = focusedSecure
     }
 
-    func screenshot(to outputURL: URL, displayId: UInt32?) async throws -> ScreenshotResult {
-        ScreenshotResult(path: outputURL.path, width: 100, height: 50, scale: 2)
+    func screenshot(to outputURL: URL, displayId: UInt32?, excludeProcessIds: [Int32]) async throws -> ScreenshotResult {
+        lastScreenshotExclusions = excludeProcessIds
+        return ScreenshotResult(path: outputURL.path, width: 100, height: 50, scale: 2)
     }
 
     func click(_ command: ActClickCommand) async throws {

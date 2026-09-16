@@ -4,15 +4,18 @@ public struct RecordingStartConfiguration: Equatable, Sendable {
     public var videoURL: URL
     public var audioURL: URL?
     public var displayId: UInt32?
+    public var excludeProcessIds: [Int32]
 
     public init(
         videoURL: URL,
         audioURL: URL?,
-        displayId: UInt32?
+        displayId: UInt32?,
+        excludeProcessIds: [Int32] = []
     ) {
         self.videoURL = videoURL
         self.audioURL = audioURL
         self.displayId = displayId
+        self.excludeProcessIds = excludeProcessIds
     }
 }
 
@@ -42,7 +45,7 @@ public protocol InputMonitoring: AnyObject, Sendable {
 }
 
 public protocol ActionPerforming: AnyObject, Sendable {
-    func screenshot(to outputURL: URL, displayId: UInt32?) async throws -> ScreenshotResult
+    func screenshot(to outputURL: URL, displayId: UInt32?, excludeProcessIds: [Int32]) async throws -> ScreenshotResult
     func click(_ command: ActClickCommand) async throws
     func isFocusedElementSecure() async throws -> Bool
     func typeText(_ text: String, target: ElementSelector?) async throws
@@ -63,8 +66,12 @@ public protocol SafetyMonitoring: AnyObject, Sendable {
 }
 
 public extension ActionPerforming {
+    func screenshot(to outputURL: URL, displayId: UInt32?) async throws -> ScreenshotResult {
+        try await screenshot(to: outputURL, displayId: displayId, excludeProcessIds: [])
+    }
+
     func screenshot(to outputURL: URL) async throws -> ScreenshotResult {
-        try await screenshot(to: outputURL, displayId: nil)
+        try await screenshot(to: outputURL, displayId: nil, excludeProcessIds: [])
     }
 
     func typeText(_ text: String) async throws {
@@ -164,7 +171,8 @@ public actor SidecarService {
                 try await requirePermission(.screenRecording)
                 let screenshot = try await actions.screenshot(
                     to: URL(fileURLWithPath: command.outputPath),
-                    displayId: command.displayId
+                    displayId: command.displayId,
+                    excludeProcessIds: command.excludeProcessIds
                 )
                 result = SidecarResponseResult(type: .screenshot, screenshot: screenshot)
             case let .actClick(command):
@@ -331,7 +339,8 @@ public actor SidecarService {
                 audioURL: command.includeAudio
                     ? directory.appendingPathComponent(SessionWriter.audioFileName)
                     : nil,
-                displayId: command.display.displayId
+                displayId: command.display.displayId,
+                excludeProcessIds: command.excludeProcessIds
             ))
             try await inputMonitor.start(
                 sessionId: command.sessionId,

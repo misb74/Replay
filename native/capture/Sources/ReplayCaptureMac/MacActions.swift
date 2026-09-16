@@ -14,7 +14,8 @@ public final class MacActionPerformer: ActionPerforming, Sendable {
 
     public func screenshot(
         to outputURL: URL,
-        displayId: UInt32?
+        displayId: UInt32?,
+        excludeProcessIds: [Int32]
     ) async throws -> ScreenshotResult {
         guard #available(macOS 14.0, *) else {
             throw SidecarOperationError.captureFailed
@@ -40,7 +41,7 @@ public final class MacActionPerformer: ActionPerforming, Sendable {
 
             let filter = SCContentFilter(
                 display: selected,
-                excludingApplications: [],
+                excludingApplications: excludedApplications(in: content, processIds: excludeProcessIds),
                 exceptingWindows: []
             )
             let configuration = SCStreamConfiguration()
@@ -484,4 +485,18 @@ func screenshotCoordinateScale(
         return fallback.isFinite && fallback > 0 ? fallback : 1
     }
     return (horizontal + vertical) / 2
+}
+
+/// Resolves the process identifiers a caller wants left out of a capture to
+/// the running applications ScreenCaptureKit needs for its exclusion filter.
+/// An identifier with no matching application (for example, a stale pid) is
+/// simply ignored rather than treated as an error.
+@available(macOS 14.0, *)
+func excludedApplications(
+    in content: SCShareableContent,
+    processIds: [Int32]
+) -> [SCRunningApplication] {
+    guard !processIds.isEmpty else { return [] }
+    let wanted = Set(processIds)
+    return content.applications.filter { wanted.contains($0.processID) }
 }

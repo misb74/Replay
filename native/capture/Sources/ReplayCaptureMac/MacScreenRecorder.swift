@@ -136,7 +136,7 @@ public final class MacScreenRecorder: NSObject, RecordingControlling, SCStreamDe
         )
         let filter = SCContentFilter(
             display: display,
-            excludingApplications: [],
+            excludingApplications: excludedApplications(in: content, processIds: configuration.excludeProcessIds),
             exceptingWindows: []
         )
         let streamConfiguration = SCStreamConfiguration()

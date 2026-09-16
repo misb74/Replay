@@ -14,19 +14,22 @@ public struct RecordCommand: Codable, Equatable, Sendable {
     public var includeAudio: Bool
     public var display: DisplayInfo
     public var appVersions: [String: String]
+    public var excludeProcessIds: [Int32]
 
     public init(
         sessionId: String,
         sessionDirectory: String,
         includeAudio: Bool,
         display: DisplayInfo,
-        appVersions: [String: String] = [:]
+        appVersions: [String: String] = [:],
+        excludeProcessIds: [Int32] = []
     ) {
         self.sessionId = sessionId
         self.sessionDirectory = sessionDirectory
         self.includeAudio = includeAudio
         self.display = display
         self.appVersions = appVersions
+        self.excludeProcessIds = excludeProcessIds
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -35,6 +38,7 @@ public struct RecordCommand: Codable, Equatable, Sendable {
         case includeAudio
         case display
         case appVersions
+        case excludeProcessIds
     }
 
     public init(from decoder: Decoder) throws {
@@ -44,6 +48,7 @@ public struct RecordCommand: Codable, Equatable, Sendable {
         includeAudio = try container.decodeIfPresent(Bool.self, forKey: .includeAudio) ?? false
         display = try container.decode(DisplayInfo.self, forKey: .display)
         appVersions = try container.decodeIfPresent([String: String].self, forKey: .appVersions) ?? [:]
+        excludeProcessIds = try container.decodeIfPresent([Int32].self, forKey: .excludeProcessIds) ?? []
     }
 }
 
@@ -114,10 +119,25 @@ public struct ElementSelector: Codable, Equatable, Sendable {
 public struct ActScreenshotCommand: Codable, Equatable, Sendable {
     public var outputPath: String
     public var displayId: UInt32?
+    public var excludeProcessIds: [Int32]
 
-    public init(outputPath: String, displayId: UInt32? = nil) {
+    public init(outputPath: String, displayId: UInt32? = nil, excludeProcessIds: [Int32] = []) {
         self.outputPath = outputPath
         self.displayId = displayId
+        self.excludeProcessIds = excludeProcessIds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case outputPath
+        case displayId
+        case excludeProcessIds
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        outputPath = try container.decode(String.self, forKey: .outputPath)
+        displayId = try container.decodeIfPresent(UInt32.self, forKey: .displayId)
+        excludeProcessIds = try container.decodeIfPresent([Int32].self, forKey: .excludeProcessIds) ?? []
     }
 }
 
