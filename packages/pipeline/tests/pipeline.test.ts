@@ -383,6 +383,40 @@ describe("understanding pipeline", () => {
     })).rejects.toBeInstanceOf(PipelineConfigurationError);
     expect(model.requests).toHaveLength(0);
   });
+
+  it("accepts a two-speaker transcript end to end", async () => {
+    const model = new FixtureModelAdapter(
+      fixtureJson("model-outputs/invoice-match.cache.json") as Record<string, unknown>,
+    );
+    const transcript = fixtureJson(
+      "recordings/invoice-match/transcript.json",
+    ) as TimestampedTranscript;
+    transcript.segments = transcript.segments.map((segment, index) => ({
+      ...segment,
+      speaker: index % 2 === 0 ? "user" : "assistant",
+    }));
+    const pipeline = new UnderstandingPipeline({
+      model,
+      frameProvider,
+      ir: createReplayIrAdapter(),
+    });
+
+    const result = await pipeline.run({
+      sessionId: "invoice-match-demo",
+      eventsJsonl: fixtureText("recordings/invoice-match/events.jsonl"),
+      video: { path: "video.mp4", durationMs: 4_500 },
+      narration: { transcript },
+    });
+
+    expect(result.transcript?.segments.map((segment) => segment.speaker)).toEqual([
+      "user",
+      "assistant",
+      "user",
+    ]);
+    expect(validateWorkflow(result.workflow)).toEqual({ ok: true, value: result.workflow });
+    expect(result.modelResults.segmentation.cached).toBe(true);
+    expect(result.modelResults.decisions.cached).toBe(true);
+  });
 });
 
 function runInvoicePipeline(
