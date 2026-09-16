@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { access } from "node:fs/promises";
 
 export interface SidecarResult {
-  type: "recording_started" | "recording_stopped" | "status" | "permissions" | "screenshot" | "action_completed" | "heartbeat" | "guardrails_subscribed" | "guardrails_unsubscribed";
+  type: "recording_started" | "recording_stopped" | "status" | "permissions" | "screenshot" | "action_completed" | "heartbeat" | "guardrails_subscribed" | "guardrails_unsubscribed" | "speech_queued" | "speech_stopped" | "live_paused" | "live_resumed";
   state?: "idle" | "recording";
   sessionId?: string;
   eventCount?: number;
@@ -30,6 +30,33 @@ export interface SidecarEvent {
   event: "user_activity" | "kill_switch";
   timestampMs?: number;
   position?: { x: number; y: number };
+}
+
+export interface SidecarLiveTranscriptEvent {
+  protocolVersion: number;
+  event: "live_transcript";
+  sessionId: string;
+  segmentId: string;
+  text: string;
+  isFinal: boolean;
+  startMs: number;
+  endMs: number;
+}
+
+export interface SidecarLiveSpeechEvent {
+  protocolVersion: number;
+  event: "live_speech";
+  sessionId: string;
+  utteranceId: string;
+  phase: "started" | "finished" | "cancelled";
+}
+
+export interface SidecarLiveStateEvent {
+  protocolVersion: number;
+  event: "live_state";
+  sessionId: string;
+  state: "preparing_model" | "listening" | "paused" | "failed";
+  reason?: string;
 }
 
 interface PendingRequest {
@@ -131,7 +158,7 @@ export class SidecarClient {
     return result;
   }
 
-  on(event: "user_activity" | "kill_switch" | "exit", listener: (...arguments_: unknown[]) => void): () => void {
+  on(event: "user_activity" | "kill_switch" | "exit" | "live_transcript" | "live_speech" | "live_state", listener: (...arguments_: unknown[]) => void): () => void {
     this.#events.on(event, listener);
     return () => this.#events.off(event, listener);
   }
@@ -155,6 +182,10 @@ export class SidecarClient {
     if (value.event === "user_activity" || value.event === "user_mouse_moved" || value.event === "kill_switch") {
       const event = value.event === "user_mouse_moved" ? "user_activity" : value.event;
       this.#events.emit(event, { ...value, event } as unknown as SidecarEvent);
+      return;
+    }
+    if (value.event === "live_transcript" || value.event === "live_speech" || value.event === "live_state") {
+      this.#events.emit(value.event, value as unknown as SidecarLiveTranscriptEvent | SidecarLiveSpeechEvent | SidecarLiveStateEvent);
       return;
     }
     if (typeof value.requestId !== "string" || typeof value.ok !== "boolean") return;

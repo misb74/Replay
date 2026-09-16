@@ -19,6 +19,15 @@ class FakeTransport implements SidecarTransport {
   exit(code: number | null) { this.exitListeners.forEach((listener) => listener(code, null)); }
 }
 
+function createTestClient() {
+  const transport = new FakeTransport();
+  const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+  const emitLine = (line: string) => {
+    transport.lineListeners.forEach((listener) => listener(line));
+  };
+  return { client, emitLine };
+}
+
 describe("SidecarClient", () => {
   afterEach(() => vi.useRealTimers());
 
@@ -112,6 +121,36 @@ describe("SidecarClient", () => {
     client.on("user_activity", () => { activity = true; });
     transport.respond({ protocolVersion: 1, event: "user_mouse_moved", timestampMs: 12 });
     expect(activity).toBe(true);
+    client.close();
+  });
+
+  it("routes live events to their listeners and never to pending requests", async () => {
+    const { client, emitLine } = createTestClient();
+    await client.start();
+    const transcripts: unknown[] = [];
+    const states: unknown[] = [];
+    client.on("live_transcript", (event) => transcripts.push(event));
+    client.on("live_state", (event) => states.push(event));
+
+    emitLine(JSON.stringify({
+      protocolVersion: 1,
+      event: "live_transcript",
+      sessionId: "session-1",
+      segmentId: "segment-1",
+      text: "Any difference is flagged",
+      isFinal: true,
+      startMs: 1200,
+      endMs: 2400,
+    }));
+    emitLine(JSON.stringify({
+      protocolVersion: 1,
+      event: "live_state",
+      sessionId: "session-1",
+      state: "listening",
+    }));
+
+    expect(transcripts).toEqual([expect.objectContaining({ text: "Any difference is flagged", isFinal: true })]);
+    expect(states).toEqual([expect.objectContaining({ state: "listening" })]);
     client.close();
   });
 });
