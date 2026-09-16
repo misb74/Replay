@@ -36,7 +36,6 @@ const VERBS_BY_KIND: Readonly<Record<string, string>> = {
 export class LiveEventsTail {
   #offset = 0;
   #carry = "";
-  #recentDescriptions: string[] = [];
 
   constructor(private readonly path: string) {}
 
@@ -63,20 +62,23 @@ export class LiveEventsTail {
       // no newline yet is a line still being written. Hold it back until a
       // later read completes it, rather than risk parsing a half event.
       this.#carry = lines.pop() ?? "";
-      const actions = lines
+      return lines
         .map((line) => toAction(line))
         .filter((action): action is ObservedAction => action !== undefined);
-      for (const action of actions) this.#recentDescriptions.push(action.description);
-      return actions;
     } finally {
       await handle.close();
     }
   }
+}
 
-  /** The `limit` most recently observed action descriptions, oldest first. */
-  describeRecent(limit: number): string[] {
-    return this.#recentDescriptions.slice(-limit);
-  }
+/**
+ * The descriptions of the last `limit` actions, oldest first. Pure and
+ * history-free: callers that need a rolling window (such as the conversation
+ * service) keep their own list of observed actions across reads and pass it
+ * in here, rather than the tail keeping a second, unbounded copy.
+ */
+export function describeActions(actions: readonly ObservedAction[], limit: number): string[] {
+  return actions.slice(-limit).map((action) => action.description);
 }
 
 function toAction(line: string): ObservedAction | undefined {

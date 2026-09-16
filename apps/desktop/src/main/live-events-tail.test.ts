@@ -2,7 +2,7 @@ import { mkdtemp, writeFile, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { LiveEventsTail } from "./live-events-tail.js";
+import { LiveEventsTail, describeActions } from "./live-events-tail.js";
 
 const clickLine = (id: string, label: string, role = "AXButton") => JSON.stringify({
   schemaVersion: 1,
@@ -70,18 +70,23 @@ describe("LiveEventsTail", () => {
     expect(await tail.read()).toEqual([]);
   });
 
-  it("describes the most recently observed actions across reads, oldest first", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "replay-tail-recent-"));
+  it("describeActions returns only the last `limit` descriptions, in order, or all of them if there are fewer", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "replay-tail-describe-"));
     const path = join(directory, "events.jsonl");
     await writeFile(path, clickLine("event-1", "Approve invoice"));
     const tail = new LiveEventsTail(path);
-    await tail.read();
+    const observed = [...(await tail.read())];
     await appendFile(path, clickLine("event-2", "Flag for follow-up"));
-    await tail.read();
+    observed.push(...(await tail.read()));
     await appendFile(path, clickLine("event-3", "Add note"));
-    await tail.read();
+    observed.push(...(await tail.read()));
 
-    expect(tail.describeRecent(2)).toEqual([
+    expect(describeActions(observed, 2)).toEqual([
+      'clicked "Flag for follow-up" in Northstar Ledger — Invoice review',
+      'clicked "Add note" in Northstar Ledger — Invoice review',
+    ]);
+    expect(describeActions(observed, 10)).toEqual([
+      'clicked "Approve invoice" in Northstar Ledger — Invoice review',
       'clicked "Flag for follow-up" in Northstar Ledger — Invoice review',
       'clicked "Add note" in Northstar Ledger — Invoice review',
     ]);
