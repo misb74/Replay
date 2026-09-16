@@ -88,6 +88,7 @@ public enum SidecarOperationError: Error, Equatable {
     case noVideoFrames
     case captureFailed
     case ioFailed
+    case unsupported(String)
 }
 
 private actor ActiveRecordingSession {
@@ -268,6 +269,8 @@ public actor SidecarService {
                     guardrailsActive: false,
                     guardrailsTripped: false
                 )
+            case .liveSpeak, .liveStopSpeaking, .liveSetPaused:
+                throw SidecarOperationError.unsupported("Live audio is not available.")
             }
             return .success(requestId: envelope.requestId, result: result)
         } catch let error as SidecarOperationError {
@@ -308,6 +311,9 @@ public actor SidecarService {
     private func startRecording(_ command: RecordCommand) async throws -> SidecarResponseResult {
         guard active == nil else {
             throw SidecarOperationError.invalidState("A recording is already active.")
+        }
+        if command.live != nil {
+            throw SidecarOperationError.unsupported("Live audio is not available.")
         }
         try await requirePermission(.screenRecording)
         try await requirePermission(.accessibility)
@@ -562,6 +568,8 @@ public actor SidecarService {
             return .failure(requestId: requestId, code: .captureFailed, message: "Capture could not continue.")
         case .ioFailed:
             return .failure(requestId: requestId, code: .ioFailed, message: "A session file could not be written.")
+        case let .unsupported(message):
+            return .failure(requestId: requestId, code: .unsupported, message: message)
         }
     }
 }

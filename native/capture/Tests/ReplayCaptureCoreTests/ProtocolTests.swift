@@ -126,3 +126,80 @@ import Testing
     }
     #expect(command.excludeProcessIds.isEmpty)
 }
+
+@Test func liveCommandsRoundTrip() throws {
+    let commands: [SidecarCommand] = [
+        .liveSpeak(.init(utteranceId: "utterance-1", text: "Both totals match.")),
+        .liveStopSpeaking(.init()),
+        .liveSetPaused(.init(paused: true)),
+    ]
+
+    for command in commands {
+        let envelope = SidecarCommandEnvelope(requestId: "request-1", command: command)
+        let decoded = try JSONDecoder.replay.decode(
+            SidecarCommandEnvelope.self,
+            from: JSONEncoder.replay.encode(envelope)
+        )
+        #expect(decoded == envelope)
+    }
+}
+
+@Test func recordCommandCarriesLiveConfiguration() throws {
+    let envelope = SidecarCommandEnvelope(
+        requestId: "request-live",
+        command: .record(.init(
+            sessionId: "session-1",
+            sessionDirectory: "/tmp/session-1",
+            includeAudio: true,
+            display: .init(width: 100, height: 50, scale: 1),
+            live: .init(locale: "en-GB")
+        ))
+    )
+
+    let decoded = try JSONDecoder.replay.decode(
+        SidecarCommandEnvelope.self,
+        from: JSONEncoder.replay.encode(envelope)
+    )
+
+    #expect(decoded == envelope)
+    guard case let .record(command) = decoded.command else {
+        Issue.record("Expected a record command")
+        return
+    }
+    #expect(command.live?.locale == "en-GB")
+}
+
+@Test func liveEventsHaveNoRequestId() throws {
+    let transcript = SidecarLiveEventEnvelope(
+        event: .transcript,
+        sessionId: "session-1",
+        segmentId: "segment-1",
+        text: "Any difference is flagged",
+        isFinal: true,
+        startMs: 1_200,
+        endMs: 2_400
+    )
+    let object = try #require(
+        JSONSerialization.jsonObject(with: JSONEncoder.replay.encode(transcript)) as? [String: Any]
+    )
+
+    #expect(object["event"] as? String == "live_transcript")
+    #expect(object["requestId"] == nil)
+    #expect(object["isFinal"] as? Bool == true)
+}
+
+@Test func liveStateEventCarriesAReason() throws {
+    let envelope = SidecarLiveEventEnvelope(
+        event: .state,
+        sessionId: "session-1",
+        state: .failed,
+        reason: "microphone_unavailable"
+    )
+    let object = try #require(
+        JSONSerialization.jsonObject(with: JSONEncoder.replay.encode(envelope)) as? [String: Any]
+    )
+
+    #expect(object["event"] as? String == "live_state")
+    #expect(object["state"] as? String == "failed")
+    #expect(object["reason"] as? String == "microphone_unavailable")
+}
