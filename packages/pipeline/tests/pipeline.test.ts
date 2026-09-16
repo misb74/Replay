@@ -384,17 +384,38 @@ describe("understanding pipeline", () => {
     expect(model.requests).toHaveLength(0);
   });
 
-  it("accepts a two-speaker transcript end to end", async () => {
+  it("sends both speakers to the model and builds a valid workflow from a two-speaker transcript", async () => {
     const model = new FixtureModelAdapter(
       fixtureJson("model-outputs/invoice-match.cache.json") as Record<string, unknown>,
     );
     const transcript = fixtureJson(
       "recordings/invoice-match/transcript.json",
     ) as TimestampedTranscript;
-    transcript.segments = transcript.segments.map((segment, index) => ({
-      ...segment,
-      speaker: index % 2 === 0 ? "user" : "assistant",
-    }));
+    // The cached decision-extraction fixture cites transcript-002 as narration
+    // evidence ("The user explicitly described the Approve invoice and Flag
+    // difference outcomes"), so every original segment keeps its id and text
+    // and stays speaker: "user". The tutor's turns are new, uncited segments
+    // inserted between them, each a question the following user segment answers.
+    const citedSegment = transcript.segments[1]!;
+    transcript.segments = [
+      { ...transcript.segments[0]!, speaker: "user" },
+      {
+        id: "tutor-totals-question",
+        startMs: 1_310,
+        endMs: 1_390,
+        text: "Do the invoice and purchase order totals match?",
+        speaker: "assistant",
+      },
+      { ...citedSegment, speaker: "user" },
+      {
+        id: "tutor-mismatch-question",
+        startMs: 2_750,
+        endMs: 2_890,
+        text: "What should happen if a later invoice does not match?",
+        speaker: "assistant",
+      },
+      { ...transcript.segments[2]!, speaker: "user" },
+    ];
     const pipeline = new UnderstandingPipeline({
       model,
       frameProvider,
@@ -408,11 +429,26 @@ describe("understanding pipeline", () => {
       narration: { transcript },
     });
 
-    expect(result.transcript?.segments.map((segment) => segment.speaker)).toEqual([
-      "user",
-      "assistant",
-      "user",
-    ]);
+    // FixtureModelAdapter ignores request.context and returns canned output
+    // keyed only by cacheKey, so a valid workflow alone cannot show the
+    // speaker reached the model rather than being silently dropped. Inspect
+    // what was actually sent for both stages instead.
+    expect(model.requests).toHaveLength(2);
+    for (const request of model.requests) {
+      const segments = (request.context as { transcript?: TimestampedTranscript }).transcript
+        ?.segments ?? [];
+      const assistantSegment = segments.find((segment) => segment.id === "tutor-totals-question");
+      expect(assistantSegment).toMatchObject({
+        speaker: "assistant",
+        text: "Do the invoice and purchase order totals match?",
+      });
+      const userSegment = segments.find((segment) => segment.id === citedSegment.id);
+      expect(userSegment).toMatchObject({
+        speaker: "user",
+        text: citedSegment.text,
+      });
+    }
+
     expect(validateWorkflow(result.workflow)).toEqual({ ok: true, value: result.workflow });
     expect(result.modelResults.segmentation.cached).toBe(true);
     expect(result.modelResults.decisions.cached).toBe(true);
