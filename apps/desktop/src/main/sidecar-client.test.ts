@@ -125,32 +125,63 @@ describe("SidecarClient", () => {
   });
 
   it("routes live events to their listeners and never to pending requests", async () => {
-    const { client, emitLine } = createTestClient();
-    await client.start();
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
     const transcripts: unknown[] = [];
+    const speeches: unknown[] = [];
     const states: unknown[] = [];
     client.on("live_transcript", (event) => transcripts.push(event));
+    client.on("live_speech", (event) => speeches.push(event));
     client.on("live_state", (event) => states.push(event));
 
-    emitLine(JSON.stringify({
-      protocolVersion: 1,
-      event: "live_transcript",
-      sessionId: "session-1",
-      segmentId: "segment-1",
-      text: "Any difference is flagged",
-      isFinal: true,
-      startMs: 1200,
-      endMs: 2400,
-    }));
-    emitLine(JSON.stringify({
-      protocolVersion: 1,
-      event: "live_state",
-      sessionId: "session-1",
-      state: "listening",
-    }));
+    // Open a pending request
+    const statusPromise = client.request("status");
+    const statusRequest = JSON.parse(transport.written[0]!) as { requestId: string };
 
+    // Emit all three live events while request is pending
+    transport.lineListeners.forEach((listener) =>
+      listener(JSON.stringify({
+        protocolVersion: 1,
+        event: "live_transcript",
+        sessionId: "session-1",
+        segmentId: "segment-1",
+        text: "Any difference is flagged",
+        isFinal: true,
+        startMs: 1200,
+        endMs: 2400,
+      }))
+    );
+    transport.lineListeners.forEach((listener) =>
+      listener(JSON.stringify({
+        protocolVersion: 1,
+        event: "live_speech",
+        sessionId: "session-1",
+        utteranceId: "utterance-1",
+        phase: "started",
+      }))
+    );
+    transport.lineListeners.forEach((listener) =>
+      listener(JSON.stringify({
+        protocolVersion: 1,
+        event: "live_state",
+        sessionId: "session-1",
+        state: "listening",
+      }))
+    );
+
+    // Assert live events reached their listeners
     expect(transcripts).toEqual([expect.objectContaining({ text: "Any difference is flagged", isFinal: true })]);
+    expect(speeches).toEqual([expect.objectContaining({ phase: "started" })]);
     expect(states).toEqual([expect.objectContaining({ state: "listening" })]);
+
+    // Assert request is still pending (live events did not resolve it)
+    await expect(Promise.race([statusPromise, Promise.resolve("pending")])).resolves.toBe("pending");
+
+    // Answer the request
+    transport.respond({ protocolVersion: 1, requestId: statusRequest.requestId, ok: true, result: { type: "status", state: "idle" } });
+
+    // Assert request now resolves
+    await expect(statusPromise).resolves.toMatchObject({ type: "status", state: "idle" });
     client.close();
   });
 });
