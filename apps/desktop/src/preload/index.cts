@@ -2,6 +2,8 @@ const electron = require("electron") as typeof import("electron");
 const { contextBridge, ipcRenderer } = electron;
 import type {
   CompileRequest,
+  LiveAvailability,
+  LiveUpdate,
   PermissionName,
   ProcessSessionIpcResult,
   ProcessingUpdate,
@@ -31,6 +33,10 @@ const channels = {
   respondToRun: "runner:respond",
   stopRun: "runner:stop",
   runUpdate: "runner:update",
+  liveAvailability: "live:availability",
+  setLivePaused: "live:set-paused",
+  endLive: "live:end",
+  liveUpdate: "live:update",
 } as const;
 
 function subscribe<T>(channel: string, listener: (value: T) => void): () => void {
@@ -52,7 +58,7 @@ const api = {
   requestPermission: (name: PermissionName) => ipcRenderer.invoke(channels.requestPermission, name),
   openPermissionSettings: (name: PermissionName) => ipcRenderer.invoke(channels.openPermissionSettings, name),
   listSessions: () => ipcRenderer.invoke(channels.listSessions),
-  startRecording: (options: { microphone: boolean; displayId?: string }) => ipcRenderer.invoke(channels.startRecording, options),
+  startRecording: (options: { microphone: boolean; live?: boolean; displayId?: string }) => ipcRenderer.invoke(channels.startRecording, options),
   stopRecording: () => ipcRenderer.invoke(channels.stopRecording),
   processSession,
   listWorkflows: () => ipcRenderer.invoke(channels.listWorkflows),
@@ -64,8 +70,12 @@ const api = {
   listRuns: (workflowId: string) => ipcRenderer.invoke(channels.listRuns, workflowId),
   respondToRun: (runId: string, response: RunResponse) => ipcRenderer.invoke(channels.respondToRun, runId, response),
   stopRun: (runId: string) => ipcRenderer.invoke(channels.stopRun, runId),
+  getLiveAvailability: (): Promise<LiveAvailability> => ipcRenderer.invoke(channels.liveAvailability),
+  setLivePaused: (paused: boolean): Promise<void> => ipcRenderer.invoke(channels.setLivePaused, paused),
+  endLive: (): Promise<void> => ipcRenderer.invoke(channels.endLive),
   onProcessingUpdate: (listener: (update: ProcessingUpdate) => void) => subscribe(channels.processingUpdate, listener),
   onRunUpdate: (listener: (update: RunUpdate) => void) => subscribe(channels.runUpdate, listener),
+  onLiveUpdate: (listener: (update: LiveUpdate) => void) => subscribe(channels.liveUpdate, listener),
 } satisfies ReplayDesktopApi;
 
 contextBridge.exposeInMainWorld("replay", api);

@@ -1,6 +1,8 @@
 import type {
   CompileRequest,
   CompileResultView,
+  LiveAvailability,
+  LiveUpdate,
   PermissionName,
   PermissionStatus,
   ProcessingUpdate,
@@ -153,8 +155,12 @@ export function createMockApi(): ReplayDesktopApi {
     async stopRun(runId) {
       runListeners.forEach((listener) => listener({ runId, workflowId: workflow.id, status: "aborted", message: "Run stopped by the operator" }));
     },
+    async getLiveAvailability(): Promise<LiveAvailability> { return { available: false, reason: "Live is unavailable in the browser preview" }; },
+    async setLivePaused(): Promise<void> {},
+    async endLive(): Promise<void> {},
     onProcessingUpdate(listener) { processingListeners.add(listener); return () => processingListeners.delete(listener); },
     onRunUpdate(listener) { runListeners.add(listener); return () => runListeners.delete(listener); },
+    onLiveUpdate(_listener: (update: LiveUpdate) => void) { return () => {}; },
   };
 }
 

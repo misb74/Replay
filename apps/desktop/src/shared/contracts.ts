@@ -156,12 +156,31 @@ export interface CompileResultView {
   warnings: Array<{ stepId?: string; message: string }>;
 }
 
+export type LiveState = "starting" | "preparing_model" | "listening" | "thinking" | "speaking" | "paused" | "failed" | "ended";
+
+export interface LiveAvailability {
+  available: boolean;
+  reason?: string;
+}
+
+export interface LiveUpdate {
+  sessionId: string;
+  state: LiveState;
+  /** What the recogniser currently hears. Partial until `final` is true. */
+  heard?: { text: string; final: boolean };
+  /** The last sentence the tutor spoke. */
+  said?: string;
+  /** True while a request to the model is in flight. */
+  sharing: boolean;
+  error?: string;
+}
+
 export interface ReplayDesktopApi {
   getPermissions(): Promise<PermissionStatus[]>;
   requestPermission(name: PermissionName): Promise<PermissionStatus[]>;
   openPermissionSettings(name: PermissionName): Promise<void>;
   listSessions(): Promise<SessionSummary[]>;
-  startRecording(options: { microphone: boolean; displayId?: string }): Promise<SessionSummary>;
+  startRecording(options: { microphone: boolean; live?: boolean; displayId?: string }): Promise<SessionSummary>;
   stopRecording(): Promise<SessionSummary>;
   processSession(sessionId: string): Promise<WorkflowView>;
   listWorkflows(): Promise<WorkflowView[]>;
@@ -173,8 +192,12 @@ export interface ReplayDesktopApi {
   listRuns(workflowId: string): Promise<RunHistoryView[]>;
   respondToRun(runId: string, response: RunResponse): Promise<void>;
   stopRun(runId: string): Promise<void>;
+  getLiveAvailability(): Promise<LiveAvailability>;
+  setLivePaused(paused: boolean): Promise<void>;
+  endLive(): Promise<void>;
   onProcessingUpdate(listener: (update: ProcessingUpdate) => void): () => void;
   onRunUpdate(listener: (update: RunUpdate) => void): () => void;
+  onLiveUpdate(listener: (update: LiveUpdate) => void): () => void;
 }
 
 export const ipcChannels = {
@@ -196,4 +219,8 @@ export const ipcChannels = {
   respondToRun: "runner:respond",
   stopRun: "runner:stop",
   runUpdate: "runner:update",
+  liveAvailability: "live:availability",
+  setLivePaused: "live:set-paused",
+  endLive: "live:end",
+  liveUpdate: "live:update",
 } as const;
