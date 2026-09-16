@@ -27,6 +27,8 @@ const VERBS_BY_KIND: Readonly<Record<string, string>> = {
   drag: "dragged",
 };
 
+const NEWLINE_BYTE = 0x0a;
+
 /**
  * Follows a session's `events.jsonl` from wherever the previous read left
  * off. The recorder flushes and fsyncs the file after every event, so
@@ -35,7 +37,8 @@ const VERBS_BY_KIND: Readonly<Record<string, string>> = {
  */
 export class LiveEventsTail {
   #offset = 0;
-  #carry = "";
+  /** Undecoded bytes after the last complete line seen so far. */
+  #carry = Buffer.alloc(0);
 
   constructor(private readonly path: string) {}
 
@@ -54,17 +57,30 @@ export class LiveEventsTail {
       if (stats.size <= this.#offset) return [];
       const length = stats.size - this.#offset;
       const buffer = Buffer.alloc(length);
-      await handle.read(buffer, 0, length, this.#offset);
-      this.#offset = stats.size;
-      const text = this.#carry + buffer.toString("utf8");
-      const lines = text.split("\n");
-      // The writer fsyncs after every whole event, so a trailing entry with
-      // no newline yet is a line still being written. Hold it back until a
-      // later read completes it, rather than risk parsing a half event.
-      this.#carry = lines.pop() ?? "";
-      return lines
-        .map((line) => toAction(line))
-        .filter((action): action is ObservedAction => action !== undefined);
+      const { bytesRead } = await handle.read(buffer, 0, length, this.#offset);
+      this.#offset += bytesRead;
+      const bytes = Buffer.concat([this.#carry, buffer.subarray(0, bytesRead)]);
+
+      // Split on the raw newline byte, not on a decoded string. 0x0A never
+      // occurs inside a multi-byte UTF-8 sequence, so this can never cut a
+      // character in half. Decoding each read's bytes to a string before
+      // recombining with the carry (as this used to) corrupts any
+      // multi-byte character that straddles a read boundary: both halves
+      // decode independently to U+FFFD, and once that has happened the
+      // original bytes cannot be recovered from either side.
+      const actions: ObservedAction[] = [];
+      let start = 0;
+      for (let index = 0; index < bytes.length; index += 1) {
+        if (bytes[index] !== NEWLINE_BYTE) continue;
+        const action = toAction(bytes.toString("utf8", start, index));
+        if (action !== undefined) actions.push(action);
+        start = index + 1;
+      }
+      // Bytes after the last newline are a line still being written (the
+      // writer fsyncs after every whole event); hold them back, still
+      // undecoded, until a later read completes them.
+      this.#carry = bytes.subarray(start);
+      return actions;
     } finally {
       await handle.close();
     }

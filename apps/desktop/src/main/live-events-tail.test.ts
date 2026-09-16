@@ -91,4 +91,28 @@ describe("LiveEventsTail", () => {
       'clicked "Add note" in Northstar Ledger — Invoice review',
     ]);
   });
+
+  it("keeps a multi-byte character intact when a read splits it mid-character", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "replay-tail-multibyte-"));
+    const path = join(directory, "events.jsonl");
+    const emDash = "—"; // U+2014, UTF-8 bytes 0xE2 0x80 0x94.
+    const line = Buffer.from(clickLine("event-1", `Approve ${emDash} invoice`), "utf8");
+    const emDashOffset = line.indexOf(Buffer.from(emDash, "utf8"));
+    // Write only the em dash's first two bytes (0xE2 0x80): the file ends
+    // mid-character, with no newline yet, exactly as a live writer would
+    // leave it between two fsyncs.
+    const splitPoint = emDashOffset + 2;
+    await writeFile(path, line.subarray(0, splitPoint));
+    const tail = new LiveEventsTail(path);
+
+    expect(await tail.read()).toEqual([]);
+
+    // Append the em dash's remaining byte (0x94), the rest of the line, and
+    // its newline.
+    await appendFile(path, line.subarray(splitPoint));
+    const actions = await tail.read();
+
+    expect(actions).toHaveLength(1);
+    expect(actions[0]?.description).toContain(`Approve ${emDash} invoice`);
+  });
 });
