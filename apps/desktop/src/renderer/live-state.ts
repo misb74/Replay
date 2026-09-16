@@ -19,3 +19,14 @@ export function liveAvailabilityNote(availability: LiveAvailability): string | u
   if (availability.available) return undefined;
   return availability.reason ?? "Unavailable on this Mac";
 }
+
+export function recordControlState(
+  availability: LiveAvailability,
+  liveChosen: boolean,
+): { liveEnabled: boolean; note: string | undefined; narrationLocked: boolean } {
+  return {
+    liveEnabled: availability.available,
+    note: liveAvailabilityNote(availability),
+    narrationLocked: liveChosen,
+  };
+}

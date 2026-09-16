@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   BranchPathView,
   CompileResultView,
+  LiveAvailability,
+  LiveUpdate,
   PermissionName,
   PermissionStatus,
   ProcessingUpdate,
@@ -14,6 +16,7 @@ import type {
   StepView,
   WorkflowView,
 } from "../shared/contracts.js";
+import { liveStateLabel, recordControlState } from "./live-state.js";
 import { createMockApi } from "./mock-api.js";
 import { activeRecording, buildableRecording, latestUnprocessedRecording } from "./recording-state.js";
 import { editWorkflow, isWorkflowReviewValid, type WorkflowEdit } from "./workflow-state.js";
@@ -47,6 +50,8 @@ export function App() {
   const [captured, setCaptured] = useState<SessionSummary>();
   const [processing, setProcessing] = useState<ProcessingUpdate>();
   const [run, setRun] = useState<RunUpdate>();
+  const [liveAvailability, setLiveAvailability] = useState<LiveAvailability>({ available: false });
+  const [liveUpdate, setLiveUpdate] = useState<LiveUpdate>();
   const [error, setError] = useState<string>();
   const [loaded, setLoaded] = useState(false);
   const dismissedSessions = useRef(new Set<string>());
@@ -75,6 +80,8 @@ export function App() {
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => api.onProcessingUpdate(setProcessing), [api]);
   useEffect(() => api.onRunUpdate(setRun), [api]);
+  useEffect(() => { void api.getLiveAvailability().then(setLiveAvailability); }, [api]);
+  useEffect(() => api.onLiveUpdate(setLiveUpdate), [api]);
 
   const receiveWorkflow = useCallback((workflow: WorkflowView) => {
     setSelected(workflow);
@@ -89,7 +96,7 @@ export function App() {
     return <PermissionSetup api={api} permissions={permissions} error={error} onRefresh={refresh} />;
   }
 
-  async function toggleRecording(microphone: boolean) {
+  async function toggleRecording(microphone: boolean, live: boolean) {
     try {
       setError(undefined);
       if (recording?.state === "recording") {
@@ -100,7 +107,7 @@ export function App() {
           setError("The recording was interrupted before it finished, so Replay will not offer it for building. Please make a new recording.");
         }
       } else {
-        const started = await api.startRecording({ microphone });
+        const started = await api.startRecording({ microphone: microphone || live, live });
         setSessions((items) => [started, ...items.filter((item) => item.id !== started.id)]);
       }
     } catch (cause) {
@@ -160,6 +167,8 @@ export function App() {
         workflows={workflows}
         selectedId={selected?.id}
         recording={recording}
+        liveAvailability={liveAvailability}
+        liveUpdate={liveUpdate}
         onSelect={(workflow) => setSelected(workflow)}
         onRecord={toggleRecording}
       />
@@ -180,7 +189,7 @@ export function App() {
               onRunChange={setRun}
               onWorkflowRefresh={receiveWorkflow}
             />
-          : <EmptyWorkspace onRecord={() => void toggleRecording(true)} />}
+          : <EmptyWorkspace onRecord={() => void toggleRecording(true, false)} />}
       </main>
     </div>
   );
@@ -190,22 +199,51 @@ function Sidebar(props: {
   workflows: WorkflowView[];
   selectedId: string | undefined;
   recording: SessionSummary | undefined;
+  liveAvailability: LiveAvailability;
+  liveUpdate: LiveUpdate | undefined;
   onSelect: (workflow: WorkflowView) => void;
-  onRecord: (microphone: boolean) => Promise<void>;
+  onRecord: (microphone: boolean, live: boolean) => Promise<void>;
 }) {
   const [microphone, setMicrophone] = useState(false);
+  const [live, setLive] = useState(false);
+  const controls = recordControlState(props.liveAvailability, live);
   const isRecording = props.recording?.state === "recording";
   return (
     <aside className="sidebar">
       <div className="app-brand"><BrandLockup /></div>
       <section className={`record-card ${isRecording ? "active" : ""}`}>
-        <button className="record-button" onClick={() => void props.onRecord(microphone)}>
+        <button className="record-button" onClick={() => void props.onRecord(microphone, live)}>
           <span className="record-dot" />
           {isRecording ? "Stop recording" : "Record a workflow"}
         </button>
         {isRecording
-          ? <RecordingClock startedAt={props.recording!.startedAt} />
-          : <label className="mic-toggle"><input type="checkbox" checked={microphone} onChange={(event) => setMicrophone(event.target.checked)} /><span>Include narration</span></label>}
+          ? <>
+              <RecordingClock startedAt={props.recording!.startedAt} />
+              {props.liveUpdate && props.liveUpdate.state !== "ended"
+                ? <div className="live-status">Live · {liveStateLabel(props.liveUpdate.state)}</div>
+                : undefined}
+            </>
+          : <>
+              <label className="mic-toggle">
+                <input
+                  type="checkbox"
+                  checked={microphone || controls.narrationLocked}
+                  disabled={controls.narrationLocked}
+                  onChange={(event) => setMicrophone(event.target.checked)}
+                />
+                <span>Include narration</span>
+              </label>
+              <label className="mic-toggle">
+                <input
+                  type="checkbox"
+                  checked={live}
+                  disabled={!controls.liveEnabled}
+                  onChange={(event) => setLive(event.target.checked)}
+                />
+                <span>Talk to Replay while recording</span>
+              </label>
+              {controls.note ? <small className="live-note">{controls.note}</small> : undefined}
+            </>}
       </section>
       <nav className="workflow-nav" aria-label="Workflows">
         <div className="nav-heading"><span>Workflows</span><span className="count">{props.workflows.length}</span></div>
