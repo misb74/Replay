@@ -340,7 +340,8 @@ interface Utterance {
  *    user was last heard. Only reports about outstanding sentences count, so
  *    a sentence a stop has already forgotten (invariant 2) starts no echo
  *    tail when it is reported late, and a pause ends any echo tail, so
- *    listening resumes without one. In full duplex nothing is dropped.
+ *    listening resumes without one. In full duplex no event is dropped on
+ *    these grounds.
  */
 export class LiveAssistService {
   readonly #options: LiveAssistOptions &
@@ -878,7 +879,8 @@ export class LiveAssistService {
     try {
       await queued;
     } catch (cause) {
-      // Never queued, so no speech event will ever settle it.
+      // Never queued, so no speech event will ever settle it, and it leaves no
+      // echo to wait out.
       this.#utterances.delete(utteranceId);
       throw cause;
     }

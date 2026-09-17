@@ -1164,7 +1164,7 @@ describe("not hearing itself", () => {
     expect(model.requests.map((request) => request.userText)).toEqual(["Yes, it was forty cents over."]);
   });
 
-  it("never counts what it ignored as the user speaking, so its next check is not held back", async () => {
+  it("never counts what it ignored as the user speaking, or as words waiting for their turn to close, so its next check is not held back", async () => {
     const { transport, checks } = checkingTransport(() => ({ ask: true, question: "Why?" }));
     const harness = await makeHarness({
       transport,
@@ -1175,10 +1175,11 @@ describe("not hearing itself", () => {
 
     await harness.at(5_000);
     expect(spokenTexts(harness)).toEqual(["Why?"]);
-    await harness.at(6_000);
+    await harness.at(9_000);
     harness.finishUtterances();
-    // Half a second later the microphone half-hears the room's echo of the question.
-    await harness.at(6_500);
+    // Half a second later, and half a second before the next poll, the
+    // microphone half-hears the room's echo of the question.
+    await harness.at(9_500);
     harness.emitTranscript("why", false);
     await harness.at(10_000);
 
