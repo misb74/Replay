@@ -23,6 +23,7 @@ public final class MacInputMonitor: InputMonitoring, @unchecked Sendable {
     private var gesture: MouseGesture?
     private var lastBundleId: String?
     private var lastWindowTitle: String?
+    private var lastRecordedProcessId: Int32?
     private var excludedProcessIds: Set<Int32> = []
 
     public init() {}
@@ -178,6 +179,11 @@ public final class MacInputMonitor: InputMonitoring, @unchecked Sendable {
         guard shouldRecordInput(targetProcessId: targetProcessId, excluded: excludedProcessIds) else {
             return
         }
+        // The switch-back decision in `applicationActivated` compares
+        // against this, so it must track the process id of every event
+        // actually recorded here — never a value derived from accessibility
+        // data, which can be briefly unreadable.
+        lock.replayWithLock { lastRecordedProcessId = targetProcessId }
 
         let eventNanos = event.timestamp
         let timestampMs = Double(eventNanos >= startedAtNanos ? eventNanos - startedAtNanos : 0) / 1_000_000
@@ -313,16 +319,19 @@ public final class MacInputMonitor: InputMonitoring, @unchecked Sendable {
         }
 
         let recorded: Bool = lock.replayWithLock {
+            // Decided by process id alone: an accessibility read can race
+            // the window becoming readable and return a nil title exactly
+            // at activation, and nil must never be able to invent or hide a
+            // switch the way a bundle id/title comparison would.
             let shouldRecord = shouldRecordAppSwitch(
                 activatedProcessId: activatedProcessId,
-                activatedBundleId: target.bundleId,
-                activatedWindowTitle: target.windowTitle,
-                lastRecorded: (bundleId: lastBundleId, windowTitle: lastWindowTitle),
+                lastRecordedProcessId: lastRecordedProcessId,
                 excluded: state.3
             )
             if shouldRecord {
                 lastBundleId = target.bundleId
                 lastWindowTitle = target.windowTitle
+                lastRecordedProcessId = activatedProcessId
             }
             return shouldRecord
         }
@@ -397,6 +406,7 @@ public final class MacInputMonitor: InputMonitoring, @unchecked Sendable {
             gesture = nil
             lastBundleId = nil
             lastWindowTitle = nil
+            lastRecordedProcessId = nil
             excludedProcessIds = []
         }
     }
@@ -413,23 +423,27 @@ func shouldRecordInput(targetProcessId: Int32, excluded: Set<Int32>) -> Bool {
 
 /// Whether an application activation should be recorded as an `app_switch`.
 /// An activation aimed at an excluded process is always dropped. Otherwise,
-/// an activation that lands back on the bundle id and window title already
-/// recorded as current is not a genuine switch: without this check, the
-/// user's return from an excluded activation (Replay's own live-tutor
-/// panel, say) to the application already being recorded would be
-/// misreported as a fresh switch, because the excluded activation never
-/// updated the last-recorded context in the first place. The same check is
-/// correct when nothing is excluded at all.
+/// an activation of the process already recorded as current is not a
+/// genuine switch: without this check, the user's return from an excluded
+/// activation (Replay's own live-tutor panel, say) to the application
+/// already being recorded would be misreported as a fresh switch, because
+/// the excluded activation never updated the last-recorded process in the
+/// first place. The same check is correct when nothing is excluded at all.
+///
+/// This is decided by process id alone, never a bundle id or window title.
+/// The activation notification always supplies a process id, whereas a
+/// window title comes from an accessibility read that can race the window
+/// becoming readable and return `nil` exactly at activation — a nil or
+/// coincidentally equal title must never be able to invent or hide a
+/// switch. A `nil` `lastRecordedProcessId` (nothing recorded yet) always
+/// counts as a switch, since `Int32` can never equal `nil`.
 func shouldRecordAppSwitch(
     activatedProcessId: Int32,
-    activatedBundleId: String?,
-    activatedWindowTitle: String?,
-    lastRecorded: (bundleId: String?, windowTitle: String?),
+    lastRecordedProcessId: Int32?,
     excluded: Set<Int32>
 ) -> Bool {
     guard shouldRecordInput(targetProcessId: activatedProcessId, excluded: excluded) else {
         return false
     }
-    return activatedBundleId != lastRecorded.bundleId
-        || activatedWindowTitle != lastRecorded.windowTitle
+    return activatedProcessId != lastRecordedProcessId
 }
