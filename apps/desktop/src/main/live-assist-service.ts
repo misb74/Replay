@@ -342,11 +342,12 @@ interface SpeechWindow {
  * 5. A screenshot is removed from disk in a `finally` as soon as it has been
  *    read, so before any request carries it, and whether or not reading it
  *    succeeded. Every screenshot is written inside one owner-only directory
- *    made at `start()`, which `end()` removes whole as soon as the replies
- *    have unwound and before it waits for anything else, so that a quit cut
- *    short leaves no pictures of the user's screen behind. That sweeps any
- *    screenshot the sidecar wrote after its request had stopped waiting for
- *    it.
+ *    made at `start()`, which `end()` removes whole as soon as starting has
+ *    settled and before it waits for anything else, so that a quit cut short
+ *    leaves no pictures of the user's screen behind. The tutor may create no
+ *    directories, so a screenshot the sidecar writes after that fails rather
+ *    than remaking the directory — which is also what becomes of one it
+ *    finished writing after its request had stopped waiting for it.
  * 6. The history holds each turn once, and only what the user heard. A reply
  *    enters the user's turn and its own, still empty, into the history in
  *    `#speak`, in the synchronous step that hands over its first sentence.
@@ -420,9 +421,9 @@ interface SpeechWindow {
  *     cannot take a screenshot or a sentence, and a check of the tutor's own
  *     are reported at most. The tutor says once that it cannot reach Claude,
  *     pauses itself after `FAILURES_BEFORE_PAUSE` such failures in a row, and
- *     pauses at once when the key is rejected. Any request that does reach
- *     Claude ends the run, a check of the tutor's own included, though only
- *     the user's own turns ever count towards it. Resuming begins a fresh run,
+ *     pauses at once when the key is rejected. The run is the user's own
+ *     turns alone: only a turn of theirs counts towards it, and only a turn
+ *     of theirs that Claude answers clears it. Resuming begins a fresh run,
  *     and takes the reason for the last one off the panel. Its apology
  *     answers nothing, so it is part of no turn, and a user who talks over
  *     one is still in the turn it failed to answer.
@@ -633,23 +634,25 @@ export class LiveAssistService {
    * starting, for every reply to unwind, and for every write those replies
    * queued as they did, but never fails because one of them did.
    *
-   * The screenshot directory is removed whole as soon as starting and every
-   * reply have unwound, which also sweeps a screenshot the sidecar finished
-   * writing after its request had stopped waiting for it. Only those two have
-   * to come first: starting is what makes the directory, and a reply still in
-   * flight may be reading a screenshot. Silencing the tutor and the writes to
-   * the session directory have nothing to do with pictures of the user's
-   * screen, and both can outlast the few seconds a quit gives `end()` — the
-   * sidecar's own client waits fifteen for a command — so neither is waited
-   * for first.
+   * The screenshot directory is removed whole as soon as starting has
+   * settled, which is the one thing the removal waits for: starting is what
+   * makes the directory. Everything else a quit must not wait on — silencing
+   * the tutor, a reply parked in a screenshot request, the writes to the
+   * session directory — is waited for after it, because a quit gives `end()`
+   * only a few seconds while the sidecar's own client waits fifteen for a
+   * command, and an unresponsive sidecar is likelier at quit, not less. None
+   * of them needs the directory to still be there: the tutor is given no
+   * leave to create directories, so a screenshot the sidecar writes after
+   * this fails outright, which is also what sweeps one it finished writing
+   * after its request had stopped waiting for it.
    */
   async #finishEnding(stopping: Promise<void> | undefined): Promise<void> {
-    await Promise.allSettled([this.#starting, ...this.#running]);
+    await Promise.allSettled([this.#starting]);
     if (this.#screenshotDirectory !== undefined) {
       // Nothing is left to report a failed removal to.
       await rm(this.#screenshotDirectory, { recursive: true, force: true }).catch(() => undefined);
     }
-    await Promise.allSettled([stopping, this.flush()]);
+    await Promise.allSettled([stopping, ...this.#running, this.flush()]);
   }
 
   #onTranscript(event: LiveTranscriptSignal): void {
@@ -910,7 +913,7 @@ export class LiveAssistService {
         this.#record.log({ type: "request", model, inputTokens, outputTokens, cacheReadTokens });
       }
     }
-    this.#noteClaudeAnswered();
+    this.#noteTurnAnswered();
     if (!this.#shouldContinue(reply)) return;
     await this.#speak(reply, buffer.trim());
     if (!this.#shouldContinue(reply)) return;
@@ -918,14 +921,20 @@ export class LiveAssistService {
   }
 
   /**
-   * The stream ran to its end, or the check came back, so Claude is reachable
-   * and whatever failed before it was no run of failures after all (spec §8).
-   * That is true whoever holds the floor by the time it is known, like the
+   * The stream ran to its end, so Claude answered the user's turn and
+   * whatever failed before it was no run of failures after all (spec §8).
+   * Only a turn of the user's clears the run, for the same reason only a turn
+   * of theirs counts towards it: the policy is there to stop a failing
+   * network apologising to the user on every turn for ever, and a check of
+   * the tutor's own that happens to get through says nothing about whether
+   * their next turn will.
+   *
+   * It is true whoever holds the floor by the time it is known, like the
    * actions a superseded read returns (invariant 7), so a reply the user has
-   * talked over still clears it. Only the panel's error is left to the reply
-   * that still holds the floor, because publishing is an act.
+   * talked over at the last instant still clears it. Publishing the error is
+   * left to the reply that still holds the floor, because that is an act.
    */
-  #noteClaudeAnswered(): void {
+  #noteTurnAnswered(): void {
     this.#consecutiveFailures = 0;
   }
 
@@ -1037,7 +1046,6 @@ export class LiveAssistService {
       trigger: check.trigger.description,
       signal: check.controller.signal,
     });
-    this.#noteClaudeAnswered();
     if (!this.#shouldContinue(check)) return;
     // A check spends tokens the user never asked to spend, so what it cost is
     // logged beside the screenshot it took, as a turn's request is.

@@ -745,6 +745,35 @@ describe("LiveAssistService screenshots", () => {
     expect(existsSync(directory)).toBe(false);
   });
 
+  it("removes the screenshots without waiting for a reply wedged in a screenshot request", async () => {
+    const harness = await makeHarness({ transport: heldTransport().transport });
+    harness.sidecar.hold("screenshot");
+
+    harness.emitTranscript("Question?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    const directory = dirname(harness.sidecar.screenshots[0]!);
+    expect(existsSync(directory)).toBe(true);
+
+    let entered = () => {};
+    const flushing = new Promise<void>((resolve) => { entered = resolve; });
+    let goneWhileWedged: boolean | undefined;
+    harness.service.flush = async () => {
+      goneWhileWedged = !existsSync(directory);
+      entered();
+    };
+
+    const ending = harness.service.end();
+    await flushing;
+
+    // The reply is still waiting on the sidecar, which has nothing to answer
+    // with that could need the directory: a screenshot it writes after this
+    // finds none to write into, because the tutor may create no directories.
+    expect(goneWhileWedged).toBe(true);
+    expect(existsSync(directory)).toBe(false);
+    harness.sidecar.release("screenshot");
+    await ending;
+  });
+
   it("removes the screenshots without waiting for the tutor to fall silent", async () => {
     const harness = await makeHarness({ transport: transportYielding([{ kind: "text", text: "A long answer." }]) });
 
@@ -3242,7 +3271,7 @@ describe("when Claude cannot be reached", () => {
     expect(harness.service.state).not.toBe("paused");
   });
 
-  it("takes a check that reached Claude as proof enough that the network is back", async () => {
+  it("pauses over the user's turns failing, however well its own checks are going", async () => {
     const harness = await makeHarness({
       transport: {
         async *reply() { throw new LiveModelError("unavailable"); },
@@ -3263,10 +3292,12 @@ describe("when Claude cannot be reached", () => {
       await harness.at(at + 1_000);
     }
 
-    // Every failure is the first of a fresh run, so the tutor says so each
-    // time rather than falling silent and pausing itself.
-    expect(spokenTexts(harness)).toEqual(Array.from({ length: 4 }, () => "I can't reach Claude right now."));
-    expect(harness.service.state).toBe("listening");
+    // A check getting through says nothing about whether the user's next turn
+    // will, so the run is theirs alone: the tutor says so once and pauses at
+    // the third rather than apologising on every turn for ever, which is the
+    // circle spec §8 exists to break.
+    expect(spokenTexts(harness)).toEqual(["I can't reach Claude right now."]);
+    expect(harness.service.state).toBe("paused");
   });
 
   it("keeps the reason a session failed when listening resumes, since that one is final", async () => {
