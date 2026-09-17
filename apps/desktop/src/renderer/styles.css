@@ -160,12 +160,15 @@ body.panel-body { min-width: 0; min-height: 0; overflow: hidden; background: #0b
 .live-panel-state { padding: 3px 8px; border-radius: 99px; background: #1e293b; color: #cbd5e1; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
 .live-panel-state.paused { background: #422006; color: #fbbf24; }
 .live-panel-state.failed { background: #450a0a; color: #f87171; }
+/* Beside the state badge, not below the transcript (spec §8: `Failed ·
+   capture stopped`, `Paused · Claude unavailable`) — a flex item that
+   shrinks and truncates rather than pushing the sharing dot out of the row. */
+.live-panel-error { min-width: 0; flex: 0 1 auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #f87171; font-size: 9px; font-weight: 600; }
 .live-share-dot { width: 8px; height: 8px; margin-left: auto; border-radius: 50%; background: #334155; flex: none; }
 .live-share-dot.on { background: #34d399; box-shadow: 0 0 0 3px rgba(52,211,153,.25); }
-.live-panel-heard, .live-panel-said, .live-panel-error { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.live-panel-heard, .live-panel-said { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .live-panel-heard { color: #94a3b8; font-size: 11px; }
 .live-panel-said { color: #f8fafc; font-size: 11px; font-weight: 600; }
-.live-panel-error { color: #f87171; font-size: 10px; }
 .live-panel-note { flex: none; color: #94a3b8; font-size: 9px; }
 .live-panel-actions { margin-top: auto; display: flex; gap: 6px; flex: none; }
 .live-panel-actions button { flex: 1; padding: 6px 8px; border: 1px solid #334155; border-radius: 7px; background: #1e293b; color: #e2e8f0; font-size: 10px; font-weight: 700; cursor: pointer; -webkit-app-region: no-drag; }

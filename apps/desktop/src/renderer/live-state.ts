@@ -51,14 +51,22 @@ export function liveFailureReason(code: string): string {
 }
 
 /**
- * What the panel shows for `update.error`: only once the session itself has
- * failed, and only when the service actually published a reason. A single
- * turn's failure sets `error` too (spec §8's one retry before the tutor
- * apologises and keeps listening), but that is not the session failing, so
- * the panel says nothing about it until the state itself is `failed`.
+ * What the panel shows for `update.error`: once the session has failed, or
+ * once it is paused and the service has a reason for that — spec §8's
+ * `Paused · Claude unavailable` after three failures, and its immediate
+ * auto-pause on an authentication failure, both need the reason visible, not
+ * just the badge. The service keeps `#error` set through a pause it caused
+ * and clears it on resume, so `paused` with no `error` is an ordinary manual
+ * pause and says nothing extra.
+ *
+ * A single turn's failure sets `error` too, without pausing or failing the
+ * session (spec §8's one retry before the tutor apologises and keeps
+ * listening) — that is nobody's business but the tutor's, so every other
+ * state stays silent about it.
  */
 export function liveFailureText(state: LiveState, error: string | undefined): string | undefined {
-  if (state !== "failed" || error === undefined) return undefined;
+  if (error === undefined) return undefined;
+  if (state !== "failed" && state !== "paused") return undefined;
   return liveFailureReason(error);
 }
 
@@ -75,6 +83,16 @@ export function livePanelPaused(state: LiveState): boolean {
 /** Pause has nothing left to do once the session has failed; End Live still does. */
 export function livePanelShowsPause(state: LiveState): boolean {
   return state !== "failed";
+}
+
+/**
+ * The sharing dot's accessible name. A bare `title` attribute is exposed
+ * unreliably by screen readers, so the panel pairs this with `role="img"`;
+ * unlike the dot's colour, which only shows the "on" state, the name always
+ * says which state it is rather than falling silent for "off".
+ */
+export function liveShareLabel(sharing: boolean): string {
+  return sharing ? "Sharing screen with Claude" : "Not sharing screen with Claude";
 }
 
 export function liveAvailabilityNote(availability: LiveAvailability): string | undefined {

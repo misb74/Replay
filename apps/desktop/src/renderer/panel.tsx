@@ -1,7 +1,7 @@
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { LiveUpdate } from "../shared/contracts.js";
-import { liveFailureText, livePanelPaused, livePanelShowsPause, liveStateLabel } from "./live-state.js";
+import { liveFailureText, livePanelPaused, livePanelShowsPause, liveShareLabel, liveStateLabel } from "./live-state.js";
 import { createMockApi } from "./mock-api.js";
 import "./styles.css";
 
@@ -27,16 +27,17 @@ function Panel() {
   const state = update?.state ?? "starting";
   const paused = livePanelPaused(state);
   const failureText = liveFailureText(state, update?.error);
+  const shareLabel = liveShareLabel(update?.sharing ?? false);
 
   return (
     <div className="live-panel">
       <div className="live-panel-head">
         <span className={`live-panel-state ${state}`}>{liveStateLabel(state)}</span>
-        <span className={`live-share-dot ${update?.sharing ? "on" : ""}`} title="Sharing screen with Claude" />
+        {failureText ? <span className="live-panel-error">· {failureText}</span> : undefined}
+        <span className={`live-share-dot ${update?.sharing ? "on" : ""}`} role="img" aria-label={shareLabel} title={shareLabel} />
       </div>
       <p className="live-panel-heard">{update?.heard?.text ?? "…"}</p>
       <p className="live-panel-said">{update?.said ?? ""}</p>
-      {failureText ? <p className="live-panel-error">{failureText}</p> : undefined}
       {paused ? <small className="live-panel-note">Narration still recording</small> : undefined}
       <div className="live-panel-actions">
         {livePanelShowsPause(state)

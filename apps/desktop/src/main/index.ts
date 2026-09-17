@@ -144,19 +144,12 @@ function openLivePanel(): void {
     skipTaskbar: true,
     show: false,
     backgroundColor: "#0b1220",
-    webPreferences: {
-      preload: join(app.getAppPath(), "dist/preload/index.cjs"),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      webSecurity: true,
-    },
+    webPreferences: secureWebPreferences(),
   });
   panelWindow.setAlwaysOnTop(true, "floating");
   panelWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   panelWindow.once("ready-to-show", () => panelWindow?.showInactive());
-  panelWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-  panelWindow.webContents.on("will-navigate", (event) => event.preventDefault());
+  denyWindowOpenAndNavigation(panelWindow);
   // The panel's own subscription starts empty: without this, it would say
   // "Starting" until the next change, however far into the conversation it
   // opened (spec §8's states are meant to be read live, not guessed at).
@@ -179,11 +172,22 @@ function sendToPanel(channel: string, value: unknown): void {
 }
 
 /**
- * Ends the live conversation, if one is running, and closes its panel. The
- * conversation never outlives its recording, so every path that ends a
- * recording comes through here. A `failure` is published after the service's
- * own `ended` update, so the panel says why the tutor stopped rather than
- * falling silent (spec §8).
+ * Ends the live conversation, if one is running. The conversation never
+ * outlives its recording, so every path that ends a recording comes through
+ * here. A `failure` is published after the service's own `ended` update, so
+ * the panel says why the tutor stopped rather than falling silent (spec §8).
+ *
+ * A session ending *with* a reason leaves its panel open, showing that
+ * reason, instead of closing it in the same breath — `Failed · capture
+ * stopped` would otherwise be gone before anyone had read it. End Live is
+ * what dismisses it: that calls this function again, finds nothing left
+ * running, and closes the panel then, in the branch below. Every other end
+ * path — Stop, a fresh recording, quitting — has nothing worth keeping on
+ * screen, so it still closes the panel immediately, as before.
+ *
+ * `lastLiveUpdate` is scoped to the session it belongs to: cleared on every
+ * path out of this function, so a panel opened for whatever recording comes
+ * next never briefly replays a line that belonged to this one.
  *
  * It never fails and never waits beyond `LIVE_END_DEADLINE_MS`, because the
  * recording is never the casualty: Stop ends the tutor before it stops the
@@ -193,16 +197,24 @@ function sendToPanel(channel: string, value: unknown): void {
 async function endLiveSession(failure?: string): Promise<void> {
   const session = liveSession;
   liveSession = undefined;
-  if (!session) return;
+  if (!session) {
+    // Either there was never a session, or a previous call already ended one
+    // and left its panel open with a reason — this is End Live dismissing it.
+    withoutFailing(closeLivePanel);
+    lastLiveUpdate = undefined;
+    return;
+  }
   await withDeadline(session.service.end(), LIVE_END_DEADLINE_MS, () => {
     // Carries no session content: the tutor's files, not what is in them.
     console.warn("The live conversation did not finish within five seconds; some of its notes may be incomplete.");
   });
   if (failure !== undefined) {
     withoutFailing(() => publishLiveUpdate({ sessionId: session.id, state: "failed", sharing: false, error: failure }));
+  } else {
+    // Guarded on its own, so a panel that cannot be told still gets closed.
+    withoutFailing(closeLivePanel);
   }
-  // Guarded on its own, so a panel that cannot be told still gets closed.
-  withoutFailing(closeLivePanel);
+  lastLiveUpdate = undefined;
 }
 
 /**
@@ -274,6 +286,28 @@ function liveStartOptions(client: SidecarClient): LiveStartOptions {
   };
 }
 
+/**
+ * The `webPreferences` every Replay window shares: an isolated, sandboxed
+ * preload with no Node integration. One definition, shared by the main
+ * window and the panel, so hardening one can never mean forgetting the
+ * other.
+ */
+function secureWebPreferences() {
+  return {
+    preload: join(app.getAppPath(), "dist/preload/index.cjs"),
+    contextIsolation: true,
+    nodeIntegration: false,
+    sandbox: true,
+    webSecurity: true,
+  };
+}
+
+/** The other half of every Replay window's posture: no new windows, no navigating away from the page it was given. */
+function denyWindowOpenAndNavigation(window: BrowserWindow): void {
+  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  window.webContents.on("will-navigate", (event) => event.preventDefault());
+}
+
 function createWindow(): BrowserWindow {
   const window = new BrowserWindow({
     width: 1440,
@@ -283,17 +317,10 @@ function createWindow(): BrowserWindow {
     titleBarStyle: "hiddenInset",
     backgroundColor: "#f8fafc",
     show: false,
-    webPreferences: {
-      preload: join(app.getAppPath(), "dist/preload/index.cjs"),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      webSecurity: true,
-    },
+    webPreferences: secureWebPreferences(),
   });
   window.once("ready-to-show", () => window.show());
-  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-  window.webContents.on("will-navigate", (event) => event.preventDefault());
+  denyWindowOpenAndNavigation(window);
   return window;
 }
 

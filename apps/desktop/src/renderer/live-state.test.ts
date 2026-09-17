@@ -5,6 +5,7 @@ import {
   liveFailureText,
   livePanelPaused,
   livePanelShowsPause,
+  liveShareLabel,
   liveStateLabel,
   liveStatusLabel,
   recordControlState,
@@ -156,23 +157,38 @@ describe("liveFailureReason", () => {
 });
 
 describe("liveFailureText", () => {
-  it("shows nothing while the state is not failed, even with an error code on the update", () => {
-    // One turn failing sets `error` without failing the session (spec §8's
-    // single retry before the tutor apologises and keeps listening); the
-    // panel says nothing about it until the state itself is `failed`.
-    expect(liveFailureText("listening", "timeout")).toBeUndefined();
+  it("shows nothing while running normally, even with an error code left over from a retried turn", () => {
+    // One turn failing sets `error` without failing or pausing the session
+    // (spec §8's single retry before the tutor apologises and keeps
+    // listening); the panel says nothing about it while nothing else is
+    // wrong.
+    for (const state of ["starting", "preparing_model", "listening", "thinking", "speaking"] as const) {
+      expect(liveFailureText(state, "timeout")).toBeUndefined();
+    }
   });
 
   it("shows nothing once failed if the service never published a reason", () => {
     expect(liveFailureText("failed", undefined)).toBeUndefined();
   });
 
+  it("shows nothing once paused with no reason — a manual pause has none", () => {
+    expect(liveFailureText("paused", undefined)).toBeUndefined();
+  });
+
   it("shows the mapped reason once the state is failed", () => {
     expect(liveFailureText("failed", "capture stopped")).toBe("capture stopped");
   });
 
+  it("shows the mapped reason once auto-paused, in spec's own words — the service keeps `error` set through a pause it caused", () => {
+    expect(liveFailureText("paused", "unavailable")).toBe("Claude unavailable");
+  });
+
   it("falls back for an unrecognised code while failed", () => {
     expect(liveFailureText("failed", "a_future_swift_code")).toBe("something went wrong");
+  });
+
+  it("falls back for an unrecognised code while paused", () => {
+    expect(liveFailureText("paused", "a_future_swift_code")).toBe("something went wrong");
   });
 });
 
@@ -197,5 +213,15 @@ describe("livePanelShowsPause", () => {
     for (const state of ["starting", "preparing_model", "listening", "thinking", "speaking", "paused", "ended"] as const) {
       expect(livePanelShowsPause(state)).toBe(true);
     }
+  });
+});
+
+describe("liveShareLabel", () => {
+  it("names the sharing dot for a screen reader while a request is in flight", () => {
+    expect(liveShareLabel(true)).toBe("Sharing screen with Claude");
+  });
+
+  it("names it while nothing is in flight, rather than leaving a stale label", () => {
+    expect(liveShareLabel(false)).toBe("Not sharing screen with Claude");
   });
 });
