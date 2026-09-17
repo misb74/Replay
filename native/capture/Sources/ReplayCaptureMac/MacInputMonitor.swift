@@ -182,8 +182,16 @@ public final class MacInputMonitor: InputMonitoring, @unchecked Sendable {
         // The switch-back decision in `applicationActivated` compares
         // against this, so it must track the process id of every event
         // actually recorded here — never a value derived from accessibility
-        // data, which can be briefly unreadable.
-        lock.replayWithLock { lastRecordedProcessId = targetProcessId }
+        // data, which can be briefly unreadable. `targetProcessId` can
+        // itself be 0 (unknown, e.g. no frontmost application reported for
+        // a key event); `nextRecordedProcessId` keeps the current tracked
+        // pid rather than overwriting it with that meaningless value.
+        lock.replayWithLock {
+            lastRecordedProcessId = nextRecordedProcessId(
+                current: lastRecordedProcessId,
+                targetProcessId: targetProcessId
+            )
+        }
 
         let eventNanos = event.timestamp
         let timestampMs = Double(eventNanos >= startedAtNanos ? eventNanos - startedAtNanos : 0) / 1_000_000
@@ -416,34 +424,54 @@ public final class MacInputMonitor: InputMonitoring, @unchecked Sendable {
 /// recording. Matching is by process id only: in development every Electron
 /// app — Replay included — reports the same bundle id, so filtering on
 /// bundle id would also drop the user's real input in other Electron apps
-/// such as Slack or VS Code.
+/// such as Slack or VS Code. A `targetProcessId` of zero or less means the
+/// target process could not be determined; it is never in `excluded` (real
+/// excluded ids are always positive), so unresolvable input is still
+/// recorded rather than silently dropped.
 func shouldRecordInput(targetProcessId: Int32, excluded: Set<Int32>) -> Bool {
     !excluded.contains(targetProcessId)
 }
 
 /// Whether an application activation should be recorded as an `app_switch`.
-/// An activation aimed at an excluded process is always dropped. Otherwise,
-/// an activation of the process already recorded as current is not a
-/// genuine switch: without this check, the user's return from an excluded
-/// activation (Replay's own live-tutor panel, say) to the application
-/// already being recorded would be misreported as a fresh switch, because
-/// the excluded activation never updated the last-recorded process in the
-/// first place. The same check is correct when nothing is excluded at all.
+/// A process id of zero or less is unknown — the activation could not be
+/// resolved to a running application — and carries no signal, so it is
+/// always dropped without changing anything. An activation aimed at an
+/// excluded process is also always dropped. Otherwise, an activation of the
+/// process already recorded as current is not a genuine switch: without
+/// this check, the user's return from an excluded activation (Replay's own
+/// live-tutor panel, say) to the application already being recorded would
+/// be misreported as a fresh switch, because the excluded activation never
+/// updated the last-recorded process in the first place. The same check is
+/// correct when nothing is excluded at all.
 ///
 /// This is decided by process id alone, never a bundle id or window title.
-/// The activation notification always supplies a process id, whereas a
-/// window title comes from an accessibility read that can race the window
+/// A window title comes from an accessibility read that can race the window
 /// becoming readable and return `nil` exactly at activation — a nil or
 /// coincidentally equal title must never be able to invent or hide a
 /// switch. A `nil` `lastRecordedProcessId` (nothing recorded yet) always
-/// counts as a switch, since `Int32` can never equal `nil`.
+/// counts as a switch, since a positive `Int32` can never equal `nil`.
 func shouldRecordAppSwitch(
     activatedProcessId: Int32,
     lastRecordedProcessId: Int32?,
     excluded: Set<Int32>
 ) -> Bool {
+    guard activatedProcessId > 0 else {
+        return false
+    }
     guard shouldRecordInput(targetProcessId: activatedProcessId, excluded: excluded) else {
         return false
     }
     return activatedProcessId != lastRecordedProcessId
+}
+
+/// The process id `MacInputMonitor` should track as "last recorded" after
+/// seeing an event whose target process id is `targetProcessId`. A target
+/// process id of zero or less means it could not be determined (for
+/// example a key event with no frontmost application reported), which
+/// carries no signal, so `current` is kept rather than being overwritten
+/// with a meaningless value — that overwrite is what let a later,
+/// perfectly ordinary activation of the application the user was already
+/// in be misreported as a switch.
+func nextRecordedProcessId(current: Int32?, targetProcessId: Int32) -> Int32? {
+    targetProcessId > 0 ? targetProcessId : current
 }

@@ -114,3 +114,49 @@ import Testing
         excluded: excluded
     ) == true)
 }
+
+@Test func eventWithAnUnknownTargetProcessLeavesTheTrackedPidUnchanged() {
+    // Round-2 regression: process(type:event:) must never overwrite the
+    // tracked pid with 0 (unknown — e.g. a keyDown with no frontmost
+    // application reported), or a later legitimate activation of the
+    // application the user was already in would be misreported as a switch.
+    let afterUnknownEvent = nextRecordedProcessId(current: 1234, targetProcessId: 0)
+    #expect(afterUnknownEvent == 1234)
+    #expect(shouldRecordAppSwitch(
+        activatedProcessId: 1234,
+        lastRecordedProcessId: afterUnknownEvent,
+        excluded: []
+    ) == false)
+}
+
+@Test func activationWithAnUnknownPidProducesNoSwitch() {
+    // An activation notification with no resolvable NSRunningApplication
+    // falls back to pid 0 in applicationActivated. It must be treated as no
+    // signal at all: no switch, and — since MacInputMonitor only writes its
+    // tracked state when this returns true — no change to what's tracked.
+    #expect(shouldRecordAppSwitch(
+        activatedProcessId: 0,
+        lastRecordedProcessId: 1234,
+        excluded: []
+    ) == false)
+}
+
+@Test func aNegativePidBehavesLikeZero() {
+    #expect(nextRecordedProcessId(current: 1234, targetProcessId: -1) == 1234)
+    #expect(shouldRecordAppSwitch(
+        activatedProcessId: -1,
+        lastRecordedProcessId: 1234,
+        excluded: []
+    ) == false)
+}
+
+@Test func aRealPidStillUpdatesTheTrackedPidAndADifferentRealPidStillProducesASwitch() {
+    // Confirms the unknown-pid guards added for round 2 do not disturb the
+    // ordinary, real-pid path this fix must not regress.
+    #expect(nextRecordedProcessId(current: 1234, targetProcessId: 5678) == 5678)
+    #expect(shouldRecordAppSwitch(
+        activatedProcessId: 5678,
+        lastRecordedProcessId: 1234,
+        excluded: []
+    ) == true)
+}
