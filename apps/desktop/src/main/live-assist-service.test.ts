@@ -744,6 +744,39 @@ describe("LiveAssistService screenshots", () => {
     expect(existsSync(directory)).toBe(false);
   });
 
+  it("removes the screenshots before it waits for the last writes to land", async () => {
+    const harness = await makeHarness({ transport: heldTransport().transport });
+    harness.sidecar.failScreenshots();
+
+    harness.emitTranscript("Question?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    const [late] = harness.sidecar.screenshots;
+    const directory = dirname(late!);
+    await writeFile(late!, "late screenshot");
+
+    // The last writes are slow, as they can be while the process is quitting
+    // and has only a moment left before it exits.
+    let flushed = () => {};
+    let entered = () => {};
+    const flushing = new Promise<void>((resolve) => { entered = resolve; });
+    let goneWhenWaitingBegan: boolean | undefined;
+    harness.service.flush = async () => {
+      goneWhenWaitingBegan = !existsSync(directory);
+      entered();
+      await new Promise<void>((resolve) => { flushed = () => resolve(); });
+    };
+
+    const ending = harness.service.end();
+    await flushing;
+
+    // Whatever the quit does next, no screenshot of the user's screen is left
+    // behind waiting for a write to a different directory altogether.
+    expect(goneWhenWaitingBegan).toBe(true);
+    expect(existsSync(directory)).toBe(false);
+    flushed();
+    await ending;
+  });
+
   it("sends nothing to Claude when a pause lands while the screenshot is being taken", async () => {
     const model = heldTransport();
     const harness = await makeHarness({ transport: model.transport });

@@ -340,8 +340,11 @@ interface SpeechWindow {
  * 5. A screenshot is removed from disk in a `finally` as soon as it has been
  *    read, so before any request carries it, and whether or not reading it
  *    succeeded. Every screenshot is written inside one owner-only directory
- *    made at `start()`, which `end()` removes whole, sweeping any screenshot
- *    the sidecar wrote after its request had stopped waiting for it.
+ *    made at `start()`, which `end()` removes whole as soon as the replies
+ *    have unwound and before it waits for anything else, so that a quit cut
+ *    short leaves no pictures of the user's screen behind. That sweeps any
+ *    screenshot the sidecar wrote after its request had stopped waiting for
+ *    it.
  * 6. The history holds each turn once, and only what the user heard. A reply
  *    enters the user's turn and its own, still empty, into the history in
  *    `#speak`, in the synchronous step that hands over its first sentence.
@@ -615,17 +618,24 @@ export class LiveAssistService {
   /**
    * The recording stops once `end()` resolves, so this waits for the stop, for
    * starting, for every reply to unwind, and for every write those replies
-   * queued as they did, but never fails because one of them did. Only then
-   * does it remove the screenshot directory whole, which also sweeps a
-   * screenshot the sidecar finished writing after its request had stopped
-   * waiting for it.
+   * queued as they did, but never fails because one of them did.
+   *
+   * The screenshot directory is removed whole as soon as the replies have
+   * unwound, which also sweeps a screenshot the sidecar finished writing
+   * after its request had stopped waiting for it. It comes before the wait
+   * for the writes, not after: a quit gives `end()` only a few seconds before
+   * the process exits, and pictures of the user's screen must not be what a
+   * slow write leaves behind. Nothing about them depends on the writes, which
+   * go to the session directory instead. Only the unwinding has to come
+   * first, because a reply still in flight may be reading a screenshot.
    */
   async #finishEnding(stopping: Promise<void> | undefined): Promise<void> {
     await Promise.allSettled([stopping, this.#starting, ...this.#running]);
+    if (this.#screenshotDirectory !== undefined) {
+      // Nothing is left to report a failed removal to.
+      await rm(this.#screenshotDirectory, { recursive: true, force: true }).catch(() => undefined);
+    }
     await this.flush();
-    if (this.#screenshotDirectory === undefined) return;
-    // Nothing is left to report a failed removal to.
-    await rm(this.#screenshotDirectory, { recursive: true, force: true }).catch(() => undefined);
   }
 
   #onTranscript(event: LiveTranscriptSignal): void {
