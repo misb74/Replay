@@ -185,4 +185,56 @@ describe("SidecarClient", () => {
     await expect(statusPromise).resolves.toMatchObject({ type: "status", state: "idle" });
     client.close();
   });
+
+  it("fails the live session instead of forwarding a speech event with no time", async () => {
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+    await client.start();
+    const speeches: unknown[] = [];
+    const states: unknown[] = [];
+    client.on("live_speech", (event) => speeches.push(event));
+    client.on("live_state", (event) => states.push(event));
+
+    transport.respond({ protocolVersion: 1, event: "live_speech", sessionId: "session-1", utteranceId: "utterance-1", phase: "finished" });
+
+    expect(speeches).toEqual([]);
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_timing_invalid" })]);
+    client.close();
+  });
+
+  it("fails the live session instead of forwarding a speech event whose time is not finite", async () => {
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+    await client.start();
+    const speeches: unknown[] = [];
+    const states: unknown[] = [];
+    client.on("live_speech", (event) => speeches.push(event));
+    client.on("live_state", (event) => states.push(event));
+
+    transport.respond({ protocolVersion: 1, event: "live_speech", sessionId: "session-1", utteranceId: "utterance-1", phase: "started", atMs: "soon" });
+
+    expect(speeches).toEqual([]);
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_timing_invalid" })]);
+    client.close();
+  });
+
+  it("fails the live session instead of forwarding a transcript event with no start or end", async () => {
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+    await client.start();
+    const transcripts: unknown[] = [];
+    const states: unknown[] = [];
+    client.on("live_transcript", (event) => transcripts.push(event));
+    client.on("live_state", (event) => states.push(event));
+
+    transport.respond({ protocolVersion: 1, event: "live_transcript", sessionId: "session-1", segmentId: "segment-1", text: "Hello", isFinal: true, startMs: 10 });
+    transport.respond({ protocolVersion: 1, event: "live_transcript", sessionId: "session-1", segmentId: "segment-2", text: "Hello", isFinal: true, startMs: 10, endMs: Number.NaN });
+
+    expect(transcripts).toEqual([]);
+    expect(states).toEqual([
+      expect.objectContaining({ state: "failed", reason: "live_timing_invalid" }),
+      expect.objectContaining({ state: "failed", reason: "live_timing_invalid" }),
+    ]);
+    client.close();
+  });
 });

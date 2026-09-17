@@ -29,6 +29,43 @@ export interface DisplayConfiguration {
   displayId?: number;
 }
 
+/**
+ * What a recording with live audio needs beyond an ordinary one. Its presence
+ * is what makes the recording live: the sidecar prepares the speech model
+ * first, and `record` carries the `live` block.
+ */
+export interface LiveStartOptions {
+  /**
+   * Called with the reserved session id each time the sidecar answers that it
+   * is still preparing the speech model, so the record card can show the wait.
+   * No recording exists yet.
+   */
+  onPreparing?: (sessionId: string) => void;
+  /**
+   * Runs once the speech model is ready and immediately before `record` is
+   * sent, so that the conversation's clocks start with the recording. A
+   * failure here fails the start, and nothing is recorded.
+   */
+  beforeRecord?: (session: { id: string; directory: string }) => Promise<void>;
+}
+
+export interface SessionServiceOptions {
+  /**
+   * Called once the active recording is no longer running, however that
+   * happened: stopped, refused, or found already over. Live audio and its
+   * panel belong to the recording, so they end here too. The sidecar exiting
+   * is not reported here — its own `exit` event already says so, and it ends
+   * the live conversation in failure rather than merely ending it.
+   */
+  onRecordingEnded?: (sessionId: string) => void;
+}
+
+/** How long a live start waits for the speech model before it gives up (spec §8). */
+const LIVE_PREPARE_DEADLINE_MS = 600_000;
+
+/** How often the sidecar is asked again while it is still preparing the model. */
+const LIVE_PREPARE_POLL_MS = 1_000;
+
 export class SessionService {
   readonly #sessionsDirectory: string;
   #activeSessionId: string | undefined;
@@ -36,8 +73,10 @@ export class SessionService {
   #activeGeneration = 0;
   #initialization: Promise<void> | undefined;
   #exitRecovery: Promise<void> = Promise.resolve();
+  readonly #options: SessionServiceOptions;
 
-  constructor(readonly sidecar: SidecarClient, dataDirectory: string) {
+  constructor(readonly sidecar: SidecarClient, dataDirectory: string, options: SessionServiceOptions = {}) {
+    this.#options = options;
     this.#sessionsDirectory = join(dataDirectory, "sessions");
     sidecar.on("exit", () => {
       this.#activeSessionId = undefined;
@@ -73,7 +112,13 @@ export class SessionService {
       .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
   }
 
-  async start(options: { microphone: boolean; display: DisplayConfiguration; appVersion: string }): Promise<SessionSummary> {
+  async start(options: {
+    microphone: boolean;
+    live?: LiveStartOptions;
+    display: DisplayConfiguration;
+    appVersion: string;
+    excludeProcessIds?: readonly number[];
+  }): Promise<SessionSummary> {
     await this.initialize();
     if (this.#activeSessionId) throw new Error("A recording is already active");
     const sessionId = `session-${new Date().toISOString().replace(/[:.]/gu, "-")}-${randomUUID().slice(0, 8)}`;
@@ -83,6 +128,17 @@ export class SessionService {
     this.#activeSessionId = sessionId;
     this.#activePhase = "starting";
     const generation = ++this.#activeGeneration;
+    if (options.live) {
+      try {
+        await this.#prepareLiveAudio(sessionId, options.live);
+        await options.live.beforeRecord?.({ id: sessionId, directory: sessionDirectory });
+      } catch (cause) {
+        // Nothing was recorded, so the reservation goes with it and the user
+        // may try again at once.
+        this.#clearActiveSession(sessionId, generation);
+        throw cause;
+      }
+    }
     try {
       const result = await this.sidecar.request("record", {
         sessionId,
@@ -90,6 +146,8 @@ export class SessionService {
         includeAudio: options.microphone,
         display: options.display,
         appVersions: { replay: options.appVersion },
+        ...(options.live ? { live: {} } : {}),
+        ...(options.excludeProcessIds?.length ? { excludeProcessIds: [...options.excludeProcessIds] } : {}),
       });
       if (result.type !== "recording_started" || (result.sessionId !== undefined && result.sessionId !== sessionId)) {
         throw new SidecarRequestError("unexpected_response", "The capture sidecar did not confirm the requested recording.");
@@ -110,6 +168,36 @@ export class SessionService {
       throw error;
     }
     return this.summary(sessionId);
+  }
+
+  /**
+   * Waits for the sidecar's speech model, asking again about once a second
+   * while it answers that it is still preparing. The sidecar answers at once
+   * and never waits for a download of its own, so the wait is bounded here:
+   * after `LIVE_PREPARE_DEADLINE_MS` the start gives up rather than leaving
+   * the user in front of a button that never fires. A refusal — an
+   * unsupported language, a microphone that cannot be opened — comes back as
+   * the sidecar's own error, and its message is what the record card shows.
+   */
+  async #prepareLiveAudio(sessionId: string, live: LiveStartOptions): Promise<void> {
+    const deadline = Date.now() + LIVE_PREPARE_DEADLINE_MS;
+    for (;;) {
+      const result = await this.sidecar.request("live_prepare");
+      // The reservation can be dropped while this waits, when the sidecar
+      // exits. Asking again would start a fresh capture process, whose clock
+      // begins at zero, so nothing more is prepared for a recording that has
+      // already gone.
+      if (this.#activeSessionId !== sessionId) {
+        throw new SidecarRequestError("exited", "The capture sidecar exited while starting the recording.");
+      }
+      if (result.type === "live_ready") return;
+      if (result.type !== "live_preparing") {
+        throw new SidecarRequestError("unexpected_response", "The capture sidecar did not confirm the speech model.");
+      }
+      if (Date.now() >= deadline) throw new Error("Preparing the speech model took too long.");
+      live.onPreparing?.(sessionId);
+      await new Promise((resolve) => { setTimeout(resolve, LIVE_PREPARE_POLL_MS); });
+    }
   }
 
   async stop(): Promise<SessionSummary> {
@@ -328,6 +416,7 @@ export class SessionService {
     this.#activeSessionId = undefined;
     this.#activePhase = undefined;
     this.#activeGeneration += 1;
+    this.#options.onRecordingEnded?.(expectedSessionId);
   }
 }
 

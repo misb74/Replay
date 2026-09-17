@@ -72,4 +72,14 @@ describe("liveStatusLabel", () => {
   it("shows nothing when nothing is recording", () => {
     expect(liveStatusLabel({ sessionId: "session-1", state: "listening", sharing: false }, undefined)).toBeUndefined();
   });
+
+  it("shows the speech model being prepared for a start that has no recording yet", () => {
+    expect(liveStatusLabel({ sessionId: "session-1", state: "preparing_model", sharing: false }, undefined))
+      .toBe("Live · Preparing speech model");
+  });
+
+  it("still shows the speech model being prepared once the recording it belongs to exists", () => {
+    expect(liveStatusLabel({ sessionId: "session-1", state: "preparing_model", sharing: false }, "session-1"))
+      .toBe("Live · Preparing speech model");
+  });
 });

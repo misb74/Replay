@@ -75,8 +75,37 @@ const permissionDescriptions: Record<PermissionName, string> = {
 export function createMockApi(): ReplayDesktopApi {
   let workflow = createDemoWorkflow();
   let recording: SessionSummary | undefined;
+  let liveSessionId: string | undefined;
   const processingListeners = new Set<(update: ProcessingUpdate) => void>();
   const runListeners = new Set<(update: RunUpdate) => void>();
+  const liveListeners = new Set<(update: LiveUpdate) => void>();
+
+  const publishLive = (update: LiveUpdate) => {
+    if (update.sessionId === liveSessionId) liveListeners.forEach((listener) => listener(update));
+  };
+
+  /**
+   * Plays a scripted conversation so the record card and the panel can be
+   * developed in a browser, where there is no sidecar to talk to.
+   */
+  const playLiveSession = (sessionId: string) => {
+    liveSessionId = sessionId;
+    const script: LiveUpdate[] = [
+      { sessionId, state: "preparing_model", sharing: false },
+      { sessionId, state: "listening", sharing: false },
+      { sessionId, state: "listening", heard: { text: "Why did I flag that one?", final: true }, sharing: false },
+      { sessionId, state: "thinking", sharing: true },
+      { sessionId, state: "speaking", said: "The totals differ by forty cents.", sharing: false },
+      { sessionId, state: "listening", sharing: false },
+    ];
+    script.forEach((update, index) => setTimeout(() => publishLive(update), 1_200 * index));
+  };
+
+  const endLiveSession = () => {
+    if (liveSessionId) publishLive({ sessionId: liveSessionId, state: "ended", sharing: false });
+    liveSessionId = undefined;
+  };
+
   const permissions = (Object.keys(permissionDescriptions) as PermissionName[]).map<PermissionStatus>((name) => ({
     name,
     state: "granted",
@@ -98,17 +127,19 @@ export function createMockApi(): ReplayDesktopApi {
         { id: "live-2", startMs: 9_000, endMs: 13_500, text: "Good — once it's open, compare the invoice total with the purchase order total before deciding.", speaker: "assistant" },
       ];
     },
-    async startRecording({ microphone }) {
+    async startRecording({ microphone, live }) {
       recording = {
         id: `session-${Date.now()}`,
         name: microphone ? "Narrated recording" : "Screen recording",
         state: "recording",
         startedAt: new Date().toISOString(),
       };
+      if (live) playLiveSession(recording.id);
       return recording;
     },
     async stopRecording() {
       if (!recording) throw new Error("No recording is active");
+      endLiveSession();
       recording = { ...recording, state: "processing", durationMs: 42_000 };
       return recording;
     },
@@ -162,12 +193,14 @@ export function createMockApi(): ReplayDesktopApi {
     async stopRun(runId) {
       runListeners.forEach((listener) => listener({ runId, workflowId: workflow.id, status: "aborted", message: "Run stopped by the operator" }));
     },
-    async getLiveAvailability(): Promise<LiveAvailability> { return { available: false, reason: "Live is unavailable in the browser preview" }; },
-    async setLivePaused(): Promise<void> {},
-    async endLive(): Promise<void> {},
+    async getLiveAvailability(): Promise<LiveAvailability> { return { available: true }; },
+    async setLivePaused(paused: boolean): Promise<void> {
+      if (liveSessionId) publishLive({ sessionId: liveSessionId, state: paused ? "paused" : "listening", sharing: false });
+    },
+    async endLive(): Promise<void> { endLiveSession(); },
     onProcessingUpdate(listener) { processingListeners.add(listener); return () => processingListeners.delete(listener); },
     onRunUpdate(listener) { runListeners.add(listener); return () => runListeners.delete(listener); },
-    onLiveUpdate(_listener: (update: LiveUpdate) => void) { return () => {}; },
+    onLiveUpdate(listener) { liveListeners.add(listener); return () => { liveListeners.delete(listener); }; },
   };
 }
 

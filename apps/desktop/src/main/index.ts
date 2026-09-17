@@ -13,20 +13,28 @@ import {
   Tray,
 } from "electron";
 import { ModelAdapterError, type ModelAdapterErrorCode } from "@replay/pipeline";
-import type { CompileRequest, PermissionName, ProcessSessionIpcResult, RunMode, RunResponse, WorkflowView } from "../shared/contracts.js";
+import type { CompileRequest, LiveAvailability, LiveUpdate, PermissionName, PermissionStatus, ProcessSessionIpcResult, RunMode, RunResponse, WorkflowView } from "../shared/contracts.js";
 import { ipcChannels } from "../shared/contracts.js";
 import { CompilerService } from "./compiler-service.js";
+import { LiveAssistService, type LiveSidecar, type LiveSpeechSignal, type LiveStateSignal, type LiveTranscriptSignal } from "./live-assist-service.js";
+import { LiveEventsTail } from "./live-events-tail.js";
+import { createClaudeLiveTransport } from "./live-model.js";
 import { DesktopPipelineService } from "./pipeline-service.js";
 import { RunnerService } from "./runner-service.js";
-import { PermissionService, SessionService } from "./session-service.js";
+import { PermissionService, SessionService, type LiveStartOptions } from "./session-service.js";
 import { createRecordingVideoHandler, recordingVideoPrivileges, recordingVideoScheme } from "./recording-video-protocol.js";
-import { SidecarClient } from "./sidecar-client.js";
+import { SidecarClient, SidecarRequestError } from "./sidecar-client.js";
 import { WorkflowRepository } from "./workflow-repository.js";
 
 let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let sidecar: SidecarClient | undefined;
 let runner: RunnerService | undefined;
+/** The conversation running with the current recording, and the recording it belongs to. */
+let liveSession: { id: string; service: LiveAssistService } | undefined;
+
+/** How long a quit waits for the live conversation to finish its files. */
+const QUIT_LIVE_DEADLINE_MS = 5_000;
 
 app.setName("Replay");
 protocol.registerSchemesAsPrivileged([{
@@ -39,21 +47,26 @@ app.whenReady().then(async () => {
   const sidecarClient = new SidecarClient({ binaryPath: captureBinaryPath() });
   sidecar = sidecarClient;
   const workflows = new WorkflowRepository(dataDirectory);
-  const sessions = new SessionService(sidecarClient, dataDirectory);
+  const sessions = new SessionService(sidecarClient, dataDirectory, {
+    // However a recording ends, the tutor and its panel end with it.
+    onRecordingEnded: (sessionId) => { if (liveSession?.id === sessionId) void endLiveSession(); },
+  });
   const permissions = new PermissionService(sidecarClient);
   const compiler = new CompilerService(workflows, sessions, dataDirectory);
   await Promise.all([workflows.initialize(), sessions.initialize()]);
   protocol.handle(recordingVideoScheme, createRecordingVideoHandler(sessions));
+  sidecarClient.on("exit", () => {
+    // The capture process is gone, and with it the recording, the microphone,
+    // and the clock the conversation's times are on (spec §8).
+    void endLiveSession("capture stopped");
+  });
 
   mainWindow = createWindow();
-  const send = (channel: string, value: unknown) => {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, value);
-  };
   runner = new RunnerService(workflows, sidecarClient, dataDirectory, {
     model: process.env.REPLAY_CLAUDE_MODEL ?? "claude-sonnet-5",
-    onUpdate: (update) => send(ipcChannels.runUpdate, update),
+    onUpdate: (update) => sendToWindow(ipcChannels.runUpdate, update),
   });
-  registerIpc({ dataDirectory, workflows, sessions, permissions, compiler, sidecar: sidecarClient, runner, send });
+  registerIpc({ dataDirectory, workflows, sessions, permissions, compiler, sidecar: sidecarClient, runner, send: sendToWindow });
   installRunKillSwitch(runner);
   tray = createTray(runner);
   installContentPolicy();
@@ -71,12 +84,144 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
   runner?.stopAll();
+  if (liveSession) {
+    // The conversation finishes its files and sweeps its screenshots before
+    // the app goes, so the quit waits for it — but never for long. Ending it
+    // clears `liveSession`, so the quit below takes the ordinary path.
+    event.preventDefault();
+    void withDeadline(endLiveSession(), QUIT_LIVE_DEADLINE_MS).then(() => app.quit());
+    return;
+  }
   sidecar?.close();
   globalShortcut.unregisterAll();
   tray?.destroy();
 });
+
+/** Waits for `work`, but never longer than `ms`, so a quit is never held up. */
+function withDeadline(work: Promise<void>, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    void work.catch(() => undefined).finally(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+function sendToWindow(channel: string, value: unknown): void {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, value);
+}
+
+/** The conversation reaches both the main window's record card and the floating panel. */
+function publishLiveUpdate(update: LiveUpdate): void {
+  sendToWindow(ipcChannels.liveUpdate, update);
+  sendToPanel(ipcChannels.liveUpdate, update);
+}
+
+// Task 17 replaces these three with the floating panel window.
+function openLivePanel(): void {}
+function closeLivePanel(): void {}
+function sendToPanel(_channel: string, _value: unknown): void {}
+
+/**
+ * Ends the live conversation, if one is running, and closes its panel. The
+ * conversation never outlives its recording, so every path that ends a
+ * recording comes through here. A `failure` is published after the service's
+ * own `ended` update, so the panel says why the tutor stopped rather than
+ * falling silent (spec §8).
+ */
+async function endLiveSession(failure?: string): Promise<void> {
+  const session = liveSession;
+  liveSession = undefined;
+  if (!session) return;
+  try {
+    await session.service.end();
+  } finally {
+    if (failure !== undefined) {
+      publishLiveUpdate({ sessionId: session.id, state: "failed", sharing: false, error: failure });
+    }
+    closeLivePanel();
+  }
+}
+
+/** Spec §6.1: the first failing check is the reason the record card shows. */
+function liveAvailability(permissions: PermissionStatus[]): LiveAvailability {
+  const [major] = process.getSystemVersion().split(".");
+  if (Number(major) < 26) return { available: false, reason: "Needs macOS 26" };
+  if (!process.env.ANTHROPIC_API_KEY) return { available: false, reason: "Set ANTHROPIC_API_KEY in .env" };
+  if (permissions.find((permission) => permission.name === "microphone")?.state !== "granted") {
+    return { available: false, reason: "Grant Microphone in System Settings" };
+  }
+  return { available: true };
+}
+
+/**
+ * The only capability the tutor has over the Mac: it can look at the screen,
+ * speak, stop speaking, and be paused. There is deliberately no path here to
+ * any `act_*` command other than the screenshot.
+ */
+function createLiveSidecar(client: SidecarClient): LiveSidecar {
+  // A sidecar that has gone is never revived for the tutor. A fresh capture
+  // process would start its clock again at zero, and this conversation belongs
+  // to the recording that went with the old one.
+  const request = async (command: string, payload: Record<string, unknown> = {}) => {
+    if (!client.isRunning()) throw new SidecarRequestError("exited", "The capture sidecar is no longer running.");
+    return client.request(command, payload);
+  };
+  return {
+    screenshot: async (outputPath) => {
+      // Replay's own windows are never in what the tutor sees, and
+      // `createDirectories: false` stops a late screenshot from recreating the
+      // private directory the conversation has already swept.
+      const result = await request("act_screenshot", { outputPath, excludeProcessIds: [process.pid], createDirectories: false });
+      return { path: result.screenshot?.path ?? outputPath };
+    },
+    speak: async (utteranceId, text) => { await request("live_speak", { utteranceId, text }); },
+    stopSpeaking: async () => { await request("live_stop_speaking"); },
+    setPaused: async (paused) => { await request("live_set_paused", { paused }); },
+    onTranscript: (listener) => client.on("live_transcript", (event) => listener(event as LiveTranscriptSignal)),
+    onSpeech: (listener) => client.on("live_speech", (event) => listener(event as LiveSpeechSignal)),
+    onState: (listener) => client.on("live_state", (event) => listener(event as LiveStateSignal)),
+  };
+}
+
+/**
+ * What `SessionService.start` needs to bring the tutor up with a recording.
+ * The conversation is made and started in the moment before `record` is sent,
+ * so its clocks begin with the recording rather than minutes earlier while the
+ * speech model was being prepared.
+ */
+function liveStartOptions(client: SidecarClient): LiveStartOptions {
+  return {
+    onPreparing: (sessionId) => publishLiveUpdate({ sessionId, state: "preparing_model", sharing: false }),
+    beforeRecord: async ({ id, directory }) => {
+      const service = new LiveAssistService({
+        sessionId: id,
+        sessionDirectory: directory,
+        sidecar: createLiveSidecar(client),
+        transport: createClaudeLiveTransport({
+          apiKey: process.env.ANTHROPIC_API_KEY ?? "",
+          model: process.env.REPLAY_LIVE_MODEL ?? "claude-opus-5",
+        }),
+        events: new LiveEventsTail(join(directory, "events.jsonl")),
+        onUpdate: publishLiveUpdate,
+        readImage: async (path) => nativeImage.createFromPath(path).toJPEG(85).toString("base64"),
+        // Half duplex until echo cancellation is verified: while the tutor
+        // speaks, the user interrupts with Pause rather than by talking over it.
+        fullDuplex: process.env.REPLAY_LIVE_FULL_DUPLEX === "1",
+      });
+      liveSession = { id, service };
+      try {
+        await service.start();
+      } catch (cause) {
+        await endLiveSession();
+        throw cause;
+      }
+    },
+  };
+}
 
 function createWindow(): BrowserWindow {
   const window = new BrowserWindow({
@@ -140,18 +285,40 @@ function registerIpc(services: {
   ipcMain.handle(ipcChannels.startRecording, async (_event, value: unknown) => {
     const options = recordingOptions(value);
     const display = screen.getPrimaryDisplay();
-    return services.sessions.start({
-      microphone: options.microphone,
-      display: {
-        width: Math.round(display.size.width * display.scaleFactor),
-        height: Math.round(display.size.height * display.scaleFactor),
-        scale: display.scaleFactor,
-        displayId: display.id,
-      },
-      appVersion: app.getVersion(),
-    });
+    try {
+      const summary = await services.sessions.start({
+        microphone: options.microphone || options.live,
+        ...(options.live ? { live: liveStartOptions(services.sidecar) } : {}),
+        display: {
+          width: Math.round(display.size.width * display.scaleFactor),
+          height: Math.round(display.size.height * display.scaleFactor),
+          scale: display.scaleFactor,
+          displayId: display.id,
+        },
+        appVersion: app.getVersion(),
+        // Replay's own windows are absent from every recording (spec §4.3).
+        excludeProcessIds: [process.pid],
+      });
+      if (options.live) openLivePanel();
+      return summary;
+    } catch (cause) {
+      // A start that failed leaves no recording for the tutor to belong to.
+      await endLiveSession();
+      throw cause;
+    }
   });
-  ipcMain.handle(ipcChannels.stopRecording, () => services.sessions.stop());
+  ipcMain.handle(ipcChannels.stopRecording, async () => {
+    // The tutor falls silent and finishes its files first: its speech commands
+    // reach the sidecar only while the recording is still running.
+    await endLiveSession();
+    return services.sessions.stop();
+  });
+  ipcMain.handle(ipcChannels.liveAvailability, async () => liveAvailability(await services.permissions.get()));
+  ipcMain.handle(ipcChannels.setLivePaused, async (_event, value: unknown) => {
+    if (typeof value !== "boolean") throw new Error("Invalid pause value");
+    await liveSession?.service.setPaused(value);
+  });
+  ipcMain.handle(ipcChannels.endLive, async () => { await endLiveSession(); });
   ipcMain.handle(ipcChannels.processSession, async (_event, value: unknown) => {
     const sessionId = safeId(value, "session");
     try {
@@ -225,9 +392,9 @@ function permissionName(value: unknown): PermissionName {
   throw new Error("Invalid permission name");
 }
 
-function recordingOptions(value: unknown): { microphone: boolean } {
+function recordingOptions(value: unknown): { microphone: boolean; live: boolean } {
   if (!isRecord(value) || typeof value.microphone !== "boolean") throw new Error("Invalid recording options");
-  return { microphone: value.microphone };
+  return { microphone: value.microphone, live: value.live === true };
 }
 
 function safeId(value: unknown, label: string): string {

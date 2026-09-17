@@ -114,6 +114,9 @@ export function App() {
       }
     } catch (cause) {
       setError(messageOf(cause));
+      // A start that never reached a recording leaves no live conversation
+      // behind, so its "preparing" note must not linger on the card.
+      if (recording?.state !== "recording") setLiveUpdate(undefined);
       try {
         setSessions(await api.listSessions());
       } catch {
@@ -220,10 +223,7 @@ function Sidebar(props: {
           {isRecording ? "Stop recording" : "Record a workflow"}
         </button>
         {isRecording
-          ? <>
-              <RecordingClock startedAt={props.recording!.startedAt} />
-              {liveStatus ? <div className="live-status">{liveStatus}</div> : undefined}
-            </>
+          ? <RecordingClock startedAt={props.recording!.startedAt} />
           : <>
               <label className="mic-toggle">
                 <input
@@ -245,6 +245,8 @@ function Sidebar(props: {
               </label>
               {controls.note ? <small className="live-note">{controls.note}</small> : undefined}
             </>}
+        {/* Also shown before the recording exists, while the speech model is prepared. */}
+        {liveStatus ? <div className="live-status">{liveStatus}</div> : undefined}
       </section>
       <nav className="workflow-nav" aria-label="Workflows">
         <div className="nav-heading"><span>Workflows</span><span className="count">{props.workflows.length}</span></div>

@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { access } from "node:fs/promises";
 
 export interface SidecarResult {
-  type: "recording_started" | "recording_stopped" | "status" | "permissions" | "screenshot" | "action_completed" | "heartbeat" | "guardrails_subscribed" | "guardrails_unsubscribed" | "speech_queued" | "speech_stopped" | "live_paused" | "live_resumed";
+  type: "recording_started" | "recording_stopped" | "status" | "permissions" | "screenshot" | "action_completed" | "heartbeat" | "guardrails_subscribed" | "guardrails_unsubscribed" | "speech_queued" | "speech_stopped" | "live_paused" | "live_resumed" | "live_preparing" | "live_ready";
   state?: "idle" | "recording";
   sessionId?: string;
   eventCount?: number;
@@ -187,6 +187,20 @@ export class SidecarClient {
       return;
     }
     if (value.event === "live_transcript" || value.event === "live_speech" || value.event === "live_state") {
+      if (!hasLiveTimes(value)) {
+        // The conversation tells the tutor's own voice from the user's by
+        // comparing these times, so a line without them would silently switch
+        // that judgement off and let the tutor answer itself. The live session
+        // fails visibly instead of running on half-safe.
+        this.#events.emit("live_state", {
+          protocolVersion: 1,
+          event: "live_state",
+          sessionId: typeof value.sessionId === "string" ? value.sessionId : "",
+          state: "failed",
+          reason: "live_timing_invalid",
+        } satisfies SidecarLiveStateEvent);
+        return;
+      }
       this.#events.emit(value.event, value as unknown as SidecarLiveTranscriptEvent | SidecarLiveSpeechEvent | SidecarLiveStateEvent);
       return;
     }
@@ -309,4 +323,19 @@ function childProcessTransport(child: ChildProcessWithoutNullStreams): SidecarTr
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether a live event carries the capture-relative times the conversation
+ * needs: a transcript's `startMs` and `endMs`, and a speech phase's `atMs`. A
+ * `live_state` event carries none and is always accepted.
+ */
+function hasLiveTimes(value: Record<string, unknown>): boolean {
+  if (value.event === "live_transcript") return isFiniteNumber(value.startMs) && isFiniteNumber(value.endMs);
+  if (value.event === "live_speech") return isFiniteNumber(value.atMs);
+  return true;
+}
+
+function isFiniteNumber(value: unknown): boolean {
+  return typeof value === "number" && Number.isFinite(value);
 }

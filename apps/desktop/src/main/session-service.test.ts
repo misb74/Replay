@@ -1,9 +1,9 @@
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionService } from "./session-service.js";
-import type { SidecarClient } from "./sidecar-client.js";
+import { SidecarRequestError, type SidecarClient } from "./sidecar-client.js";
 
 describe("SessionService recovery", () => {
   it("marks an abruptly terminated recording partial without deleting events", async () => {
@@ -231,5 +231,273 @@ describe("SessionService live transcript", () => {
     const service = new SessionService({ on: () => () => {} } as unknown as SidecarClient, root);
 
     await expect(service.readLiveTranscript("../outside")).rejects.toThrow("Invalid session id");
+  });
+});
+
+const display = { width: 100, height: 100, scale: 2 };
+
+interface FakeSidecar {
+  client: SidecarClient;
+  requests: Array<{ command: string; payload: Record<string, unknown> }>;
+  commands: string[];
+  emit: (event: string) => void;
+}
+
+/** A sidecar that answers `handler` and remembers everything it was asked. */
+function fakeSidecar(handler: (command: string, payload: Record<string, unknown>) => Promise<unknown>): FakeSidecar {
+  const requests: Array<{ command: string; payload: Record<string, unknown> }> = [];
+  const listeners = new Map<string, Set<(...arguments_: unknown[]) => void>>();
+  const client = {
+    on(event: string, listener: (...arguments_: unknown[]) => void) {
+      const registered = listeners.get(event) ?? new Set<(...arguments_: unknown[]) => void>();
+      registered.add(listener);
+      listeners.set(event, registered);
+      return () => registered.delete(listener);
+    },
+    async request(command: string, payload: Record<string, unknown> = {}) {
+      requests.push({ command, payload });
+      return handler(command, payload);
+    },
+  } as unknown as SidecarClient;
+  return {
+    client,
+    requests,
+    get commands() { return requests.map((request) => request.command); },
+    emit: (event) => listeners.get(event)?.forEach((listener) => listener({})),
+  };
+}
+
+/** Writes what the sidecar writes when a recording starts, so summaries can be read. */
+async function writeRecordingMetadata(payload: Record<string, unknown>): Promise<void> {
+  const directory = String(payload.sessionDirectory);
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, "events.jsonl"), "");
+  await writeFile(join(directory, "meta.json"), JSON.stringify({
+    schemaVersion: 1,
+    sessionId: String(payload.sessionId),
+    status: "recording",
+    partial: true,
+    startedAt: "2026-08-17T10:00:00.000Z",
+    display: payload.display,
+    narration: payload.includeAudio,
+    appVersions: payload.appVersions,
+    eventCount: 0,
+  }));
+}
+
+describe("SessionService live start", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("asks the sidecar for live audio and window exclusions when starting", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-live-start-"));
+    const sidecar = fakeSidecar(async (command, payload) => {
+      if (command === "live_prepare") return { type: "live_ready" };
+      await writeRecordingMetadata(payload);
+      return { type: "recording_started", sessionId: String(payload.sessionId), state: "recording" };
+    });
+    const service = new SessionService(sidecar.client, root);
+
+    await service.start({ microphone: true, live: {}, display, appVersion: "0.1.0", excludeProcessIds: [4321] });
+
+    expect(sidecar.requests.find((request) => request.command === "record")?.payload).toMatchObject({
+      includeAudio: true,
+      live: {},
+      excludeProcessIds: [4321],
+    });
+  });
+
+  it("never prepares the speech model for an ordinary recording", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-plain-start-"));
+    const sidecar = fakeSidecar(async (_command, payload) => {
+      await writeRecordingMetadata(payload);
+      return { type: "recording_started", sessionId: String(payload.sessionId), state: "recording" };
+    });
+    const service = new SessionService(sidecar.client, root);
+
+    await service.start({ microphone: false, display, appVersion: "0.1.0" });
+
+    expect(sidecar.commands).toEqual(["record"]);
+    expect(sidecar.requests[0]?.payload).not.toHaveProperty("live");
+  });
+
+  it("keeps asking for the speech model until it is ready, and only then records", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-live-prepare-"));
+    let answered = 0;
+    const sidecar = fakeSidecar(async (command, payload) => {
+      if (command === "live_prepare") return answered++ < 2 ? { type: "live_preparing" } : { type: "live_ready" };
+      await writeRecordingMetadata(payload);
+      return { type: "recording_started", sessionId: String(payload.sessionId), state: "recording" };
+    });
+    const service = new SessionService(sidecar.client, root);
+    await service.initialize();
+    vi.useFakeTimers();
+
+    const started = service.start({ microphone: true, live: {}, display, appVersion: "0.1.0" });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await started;
+
+    expect(sidecar.commands).toEqual(["live_prepare", "live_prepare", "live_prepare", "record"]);
+  });
+
+  it("shows the wait while the speech model is being prepared", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-live-preparing-note-"));
+    let answered = 0;
+    const sidecar = fakeSidecar(async (command, payload) => {
+      if (command === "live_prepare") return answered++ < 1 ? { type: "live_preparing" } : { type: "live_ready" };
+      await writeRecordingMetadata(payload);
+      return { type: "recording_started", sessionId: String(payload.sessionId), state: "recording" };
+    });
+    const service = new SessionService(sidecar.client, root);
+    await service.initialize();
+    vi.useFakeTimers();
+    const preparing: string[] = [];
+
+    const started = service.start({ microphone: true, live: { onPreparing: (id) => preparing.push(id) }, display, appVersion: "0.1.0" });
+    await vi.advanceTimersByTimeAsync(5_000);
+    const summary = await started;
+
+    expect(preparing).toEqual([summary.id]);
+  });
+
+  it("starts the live conversation after the speech model and before the recording", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-live-hook-"));
+    const order: string[] = [];
+    const sidecar = fakeSidecar(async (command, payload) => {
+      order.push(command);
+      if (command === "live_prepare") return { type: "live_ready" };
+      await writeRecordingMetadata(payload);
+      return { type: "recording_started", sessionId: String(payload.sessionId), state: "recording" };
+    });
+    const service = new SessionService(sidecar.client, root);
+    let session: { id: string; directory: string } | undefined;
+
+    const summary = await service.start({
+      microphone: true,
+      live: { beforeRecord: async (started) => { order.push("live_conversation"); session = started; } },
+      display,
+      appVersion: "0.1.0",
+    });
+
+    expect(order).toEqual(["live_prepare", "live_conversation", "record"]);
+    expect(session).toEqual({ id: summary.id, directory: service.directory(summary.id) });
+  });
+
+  it("records nothing and reserves nothing when the live conversation cannot start", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-live-hook-failed-"));
+    const sidecar = fakeSidecar(async (command, payload) => {
+      if (command === "live_prepare") return { type: "live_ready" };
+      await writeRecordingMetadata(payload);
+      return { type: "recording_started", sessionId: String(payload.sessionId), state: "recording" };
+    });
+    const service = new SessionService(sidecar.client, root);
+    const start = () => service.start({
+      microphone: true,
+      live: { beforeRecord: async () => { throw new Error("The tutor could not start."); } },
+      display,
+      appVersion: "0.1.0",
+    });
+
+    await expect(start()).rejects.toThrow("The tutor could not start.");
+    // A second attempt is refused for the same reason, never as already active,
+    // so the failed start left no reservation behind.
+    await expect(start()).rejects.toThrow("The tutor could not start.");
+    expect(sidecar.commands).toEqual(["live_prepare", "live_prepare"]);
+  });
+
+  it("rejects a live start with the sidecar's own reason when the speech model fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-live-prepare-failed-"));
+    const sidecar = fakeSidecar(async (command) => {
+      if (command === "live_prepare") throw new SidecarRequestError("unsupported", "Live audio needs macOS 26.");
+      throw new Error(`Unexpected ${command}`);
+    });
+    const service = new SessionService(sidecar.client, root);
+    const start = () => service.start({ microphone: true, live: {}, display, appVersion: "0.1.0" });
+
+    await expect(start()).rejects.toThrow("Live audio needs macOS 26.");
+    await expect(start()).rejects.toThrow("Live audio needs macOS 26.");
+    expect(sidecar.commands).toEqual(["live_prepare", "live_prepare"]);
+  });
+
+  it("starts no conversation when the sidecar goes while the speech model is prepared", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-live-prepare-exit-"));
+    const sidecar: FakeSidecar = fakeSidecar(async (command) => {
+      if (command !== "live_prepare") throw new Error(`Unexpected ${command}`);
+      // The capture process dies as the speech model becomes ready. A later
+      // request would start a fresh one, whose capture clock begins again at
+      // zero, so nothing more may be prepared for this recording.
+      sidecar.emit("exit");
+      return { type: "live_ready" };
+    });
+    const service = new SessionService(sidecar.client, root);
+    let conversations = 0;
+
+    await expect(service.start({
+      microphone: true,
+      live: { beforeRecord: async () => { conversations += 1; } },
+      display,
+      appVersion: "0.1.0",
+    })).rejects.toMatchObject({ code: "exited" });
+
+    expect(conversations).toBe(0);
+    expect(sidecar.commands).toEqual(["live_prepare"]);
+  });
+
+  it("gives up on the speech model after ten minutes and records nothing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-live-prepare-slow-"));
+    const sidecar = fakeSidecar(async (command) => {
+      if (command === "live_prepare") return { type: "live_preparing" };
+      throw new Error(`Unexpected ${command}`);
+    });
+    const service = new SessionService(sidecar.client, root);
+    await service.initialize();
+    vi.useFakeTimers();
+
+    const started = service.start({ microphone: true, live: {}, display, appVersion: "0.1.0" });
+    const rejected = expect(started).rejects.toThrow("Preparing the speech model took too long.");
+    await vi.advanceTimersByTimeAsync(600_000);
+    await rejected;
+
+    expect(sidecar.commands).not.toContain("record");
+  });
+});
+
+describe("SessionService recording lifetime", () => {
+  it("reports that the recording ended once it has stopped", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-ended-stop-"));
+    const sidecar = fakeSidecar(async (command, payload) => {
+      if (command === "record") {
+        await writeRecordingMetadata(payload);
+        return { type: "recording_started", sessionId: String(payload.sessionId), state: "recording" };
+      }
+      return { type: "recording_stopped", sessionId: String(payload.sessionId) };
+    });
+    const ended: string[] = [];
+    const service = new SessionService(sidecar.client, root, { onRecordingEnded: (id) => ended.push(id) });
+
+    const started = await service.start({ microphone: false, display, appVersion: "0.1.0" });
+    expect(ended).toEqual([]);
+    await service.stop();
+
+    expect(ended).toEqual([started.id]);
+  });
+
+  it("reports that the recording ended when the sidecar is found idle", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-ended-idle-"));
+    const sidecar = fakeSidecar(async (command, payload) => {
+      if (command === "record") {
+        await writeRecordingMetadata(payload);
+        return { type: "recording_started", sessionId: String(payload.sessionId), state: "recording" };
+      }
+      if (command === "status") return { type: "status", state: "idle" };
+      throw new SidecarRequestError("timeout", "The capture sidecar did not answer stop in time.");
+    });
+    const ended: string[] = [];
+    const service = new SessionService(sidecar.client, root, { onRecordingEnded: (id) => ended.push(id) });
+
+    const started = await service.start({ microphone: false, display, appVersion: "0.1.0" });
+    await service.stop();
+
+    expect(ended).toEqual([started.id]);
+    expect((await service.readMetadata(started.id)).status).toBe("interrupted");
   });
 });
