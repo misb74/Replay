@@ -18,6 +18,8 @@ export interface LiveHistoryItem {
   text: string;
   /** Present on user turns whose screenshot is still being sent. */
   screenshot?: { base64: string };
+  /** When `screenshot` was taken, as time into the session such as `4:07`. */
+  screenshotTakenAt?: string;
   /** Present on user turns whose screenshot has aged out. */
   screenshotOmittedAt?: string;
 }
