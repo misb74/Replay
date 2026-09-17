@@ -189,7 +189,7 @@ describe("SidecarClient", () => {
     transport.respond({ protocolVersion: 1, event: "live_speech", sessionId: "session-1", utteranceId: "utterance-1", phase: "finished" });
 
     expect(speeches).toEqual([]);
-    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_timing_invalid" })]);
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_event_invalid" })]);
     client.close();
   });
 
@@ -205,7 +205,7 @@ describe("SidecarClient", () => {
     transport.respond({ protocolVersion: 1, event: "live_speech", sessionId: "session-1", utteranceId: "utterance-1", phase: "started", atMs: "soon" });
 
     expect(speeches).toEqual([]);
-    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_timing_invalid" })]);
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_event_invalid" })]);
     client.close();
   });
 
@@ -223,7 +223,7 @@ describe("SidecarClient", () => {
     transport.respond({ protocolVersion: 1, event: "live_speech", sessionId: "session-1", utteranceId: "utterance-1", phase: "interrupted", atMs: 10 });
 
     expect(speeches).toEqual([]);
-    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_timing_invalid" })]);
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_event_invalid" })]);
     client.close();
   });
 
@@ -238,7 +238,7 @@ describe("SidecarClient", () => {
     // leave the panel saying the session is fine.
     transport.respond({ protocolVersion: 1, event: "live_state", sessionId: "session-1", state: "reconnecting" });
 
-    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_timing_invalid" })]);
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_event_invalid" })]);
     client.close();
   });
 
@@ -256,8 +256,8 @@ describe("SidecarClient", () => {
 
     expect(transcripts).toEqual([]);
     expect(states).toEqual([
-      expect.objectContaining({ state: "failed", reason: "live_timing_invalid" }),
-      expect.objectContaining({ state: "failed", reason: "live_timing_invalid" }),
+      expect.objectContaining({ state: "failed", reason: "live_event_invalid" }),
+      expect.objectContaining({ state: "failed", reason: "live_event_invalid" }),
     ]);
     client.close();
   });

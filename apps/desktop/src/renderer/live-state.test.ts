@@ -100,8 +100,8 @@ describe("liveFailureReason", () => {
     expect(liveFailureReason("capture stopped")).toBe("capture stopped");
   });
 
-  it("names a live event that arrived without usable capture times", () => {
-    expect(liveFailureReason("live_timing_invalid")).toBe("capture timing was invalid");
+  it("names a live event the app could not read — its times, its phase, or its state", () => {
+    expect(liveFailureReason("live_event_invalid")).toBe("a live event could not be understood");
   });
 
   it("names the sidecar's own audio failure", () => {

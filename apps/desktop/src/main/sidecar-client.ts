@@ -198,7 +198,7 @@ export class SidecarClient {
           event: "live_state",
           sessionId: typeof value.sessionId === "string" ? value.sessionId : "",
           state: "failed",
-          reason: "live_timing_invalid",
+          reason: "live_event_invalid",
         } satisfies SidecarLiveStateEvent);
         return;
       }

@@ -17,7 +17,7 @@ export function liveStateLabel(state: LiveState): string {
 
 /**
  * The wiring reports a failed turn or a failed session with a code, not a
- * sentence — `live_timing_invalid` from the sidecar client; the Mac audio
+ * sentence — `live_event_invalid` from the sidecar client; the Mac audio
  * session's own wire codes (`audio_route_changed`, `recogniser_failed`,
  * `narration_write_failed`, `audio_engine_stopped`) and its coordinator's
  * error mapping (`permission_denied`, `capture_failed`, `io_failed`), both
@@ -31,7 +31,7 @@ export function liveStateLabel(state: LiveState): string {
  */
 const FAILURE_REASONS: Record<string, string> = {
   "capture stopped": "capture stopped",
-  live_timing_invalid: "capture timing was invalid",
+  live_event_invalid: "a live event could not be understood",
   live_audio_failed: "live audio failed",
   audio_route_changed: "audio route changed",
   recogniser_failed: "speech recognition stopped working",
