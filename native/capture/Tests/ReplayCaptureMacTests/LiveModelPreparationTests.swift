@@ -50,7 +50,8 @@ private func waitUntil(
     return await condition()
 }
 
-@Test func anInstalledModelIsReadyAtOnce() async throws {
+@Test(.enabled(if: liveAudioIsAvailableOnThisSystem))
+func anInstalledModelIsReadyAtOnce() async throws {
     guard #available(macOS 26, *) else { return }
     let installs = CallCounter()
     let provider = MacLiveAudioProvider(
@@ -65,7 +66,8 @@ private func waitUntil(
     #expect(await installs.count == 0, "an installed model needs no installation")
 }
 
-@Test func anUnsupportedModelIsReportedRatherThanInstalled() async throws {
+@Test(.enabled(if: liveAudioIsAvailableOnThisSystem))
+func anUnsupportedModelIsReportedRatherThanInstalled() async throws {
     guard #available(macOS 26, *) else { return }
     let installs = CallCounter()
     let provider = MacLiveAudioProvider(
@@ -80,7 +82,8 @@ private func waitUntil(
     #expect(await installs.count == 0)
 }
 
-@Test func prepareStartsOneInstallationPerLocaleAndDoesNotWaitForIt() async throws {
+@Test(.enabled(if: liveAudioIsAvailableOnThisSystem))
+func prepareStartsOneInstallationPerLocaleAndDoesNotWaitForIt() async throws {
     guard #available(macOS 26, *) else { return }
     let entered = CallCounter()
     let gate = Gate()
@@ -114,7 +117,8 @@ private func waitUntil(
     #expect(await entered.count == 1, "one installation per locale, however often prepare is asked")
 }
 
-@Test func concurrentPreparesStartOnlyOneInstallation() async throws {
+@Test(.enabled(if: liveAudioIsAvailableOnThisSystem))
+func concurrentPreparesStartOnlyOneInstallation() async throws {
     guard #available(macOS 26, *) else { return }
     let entered = CallCounter()
     let gate = Gate()
@@ -139,7 +143,8 @@ private func waitUntil(
     #expect(await entered.count == 1, "three overlapping asks must not become three downloads")
 }
 
-@Test func anInstallationFailureIsReportedOnceAndTheNextCallTriesAgain() async throws {
+@Test(.enabled(if: liveAudioIsAvailableOnThisSystem))
+func anInstallationFailureIsReportedOnceAndTheNextCallTriesAgain() async throws {
     guard #available(macOS 26, *) else { return }
     let attempts = CallCounter()
     let provider = MacLiveAudioProvider(
@@ -168,7 +173,8 @@ private func waitUntil(
     #expect(await attempts.count == 2)
 }
 
-@Test func installationsThatFindNothingToInstallStopAnsweringPreparingForever() async throws {
+@Test(.enabled(if: liveAudioIsAvailableOnThisSystem))
+func installationsThatFindNothingToInstallStopAnsweringPreparingForever() async throws {
     guard #available(macOS 26, *) else { return }
     let attempts = CallCounter()
     let provider = MacLiveAudioProvider(
@@ -203,7 +209,8 @@ private func waitUntil(
 /// a test that drove `makeSession` far enough to find this check missing
 /// would go on to build a real audio engine and open the microphone, which
 /// this suite must never do.
-@Test func makeSessionsModelCheckRefusesWithoutDownloadingAnything() async throws {
+@Test(.enabled(if: liveAudioIsAvailableOnThisSystem))
+func makeSessionsModelCheckRefusesWithoutDownloadingAnything() async throws {
     guard #available(macOS 26, *) else { return }
     let installs = CallCounter()
     let provider = MacLiveAudioProvider(
@@ -218,7 +225,8 @@ private func waitUntil(
     #expect(await installs.count == 0, "starting a recording must never begin a download; only prepare() may")
 }
 
-@Test func makeSessionsModelCheckPassesOnceTheModelIsInstalled() async throws {
+@Test(.enabled(if: liveAudioIsAvailableOnThisSystem))
+func makeSessionsModelCheckPassesOnceTheModelIsInstalled() async throws {
     guard #available(macOS 26, *) else { return }
     let installs = CallCounter()
     let provider = MacLiveAudioProvider(

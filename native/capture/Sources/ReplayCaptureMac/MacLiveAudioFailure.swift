@@ -72,9 +72,16 @@ final class LiveAudioFailureReporter: @unchecked Sendable {
 
     /// Starts watching `engine` for the configuration change AVFoundation
     /// posts when the audio hardware's channel count or sample rate
-    /// changes — headphones going in, a Bluetooth device connecting, a
-    /// display waking. `AVAudioEngine.h`: "the engine stops itself (see
+    /// changes — a Bluetooth device connecting, an input device at a
+    /// different rate being selected, a display with speakers waking.
+    /// `AVAudioEngine.h`: "the engine stops itself (see
     /// `AVAudioEngine(stop)`), and issues this notification".
+    ///
+    /// It is the format that matters, not the socket: plugging in analogue
+    /// headphones only qualifies if it changes the channel count or the
+    /// sample rate, which depends on the Mac and on what the device
+    /// reports. The manual checklist in this package's README says the
+    /// same, and asks for a device that certainly does change one.
     ///
     /// Called once per session, as its engine starts: one reporter belongs
     /// to one engine, and that engine is started once.

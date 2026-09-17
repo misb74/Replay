@@ -16,9 +16,9 @@ import Speech
 /// path is actor-isolated. Every audio callback below is an explicitly
 /// `@Sendable` closure, which per SE-0420 inherits no isolation, and
 /// touches only the lock-protected state in `MicrophoneTap` and
-/// `SpeechPlayback`. The spike proved why this matters: an isolated
-/// callback trapped with SIGTRAP the instant AVFAudio invoked it on its own
-/// realtime queue.
+/// `SpeechPlayback`. This is not a style preference: an actor-isolated
+/// callback traps with SIGTRAP the instant AVFAudio invokes it on its own
+/// realtime queue, which it always does.
 @available(macOS 26, *)
 actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
     private let configuration: LiveAudioStartConfiguration
@@ -607,7 +607,8 @@ final class SpeechPlayback: @unchecked Sendable {
 ///
 /// It has two independent jobs, each with its own converter, because the
 /// voice-processed tap format is neither something AAC can encode (it had
-/// nine channels on the spike's Mac, all carrying the same signal) nor
+/// nine channels on the MacBook Pro this was measured on, all carrying
+/// the same signal) nor
 /// something the analyser accepts.
 ///
 /// Two disciplines again. `lock` guards the timing and the analyser's
@@ -675,8 +676,8 @@ final class MicrophoneTap: @unchecked Sendable {
         fileConverter.primeMethod = .none
         analyzerConverter.primeMethod = .none
         // Mix the tap's channels down rather than remapping the first one.
-        // On the spike's Mac all nine carried the same signal, so either
-        // would do; on hardware where they genuinely differ, a remap could
+        // Where this was measured all nine carried the same signal, so
+        // either would do; on hardware where they genuinely differ, a remap could
         // record silence. Deliberately not done for the analyser: its whole
         // value here rests on the echo-cancelled signal, and mixing in a
         // channel that turned out to be raw microphone could undo that.

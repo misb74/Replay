@@ -7,7 +7,8 @@ import Testing
 /// device, reads no microphone and produces no sound. So the conversion
 /// every live audio path depends on — the narration file's, the analyser's,
 /// and the synthesiser's playback — can be checked here for real, with
-/// synthetic buffers, without any of what Amendment A forbids.
+/// synthetic buffers, and without opening a microphone or making a sound,
+/// which this suite must never do.
 ///
 /// What these pin down is that a converted stream contains its source audio
 /// exactly once. `convertToBuffer:error:withInputFromBlock:` fills the

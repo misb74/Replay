@@ -19,7 +19,8 @@ import Testing
 /// What cannot be checked here is the other half — that AVFoundation
 /// really does post that notification when the audio route changes, and
 /// that the engine really does stop itself when it does. Only hardware can
-/// show that; see the task report for what to watch for.
+/// show that, and the manual checklist in this package's README is where
+/// it is checked.
 
 private actor ReportedReasons {
     private(set) var reasons: [String] = []
@@ -154,7 +155,8 @@ private func makeTapFedTheWrongFormat(
     return tap
 }
 
-@Test func aTapThatCannotConvertWhatTheMicrophoneGivesItSaysSo() async throws {
+@Test(.enabled(if: liveAudioIsAvailableOnThisSystem))
+func aTapThatCannotConvertWhatTheMicrophoneGivesItSaysSo() async throws {
     guard #available(macOS 26, *) else { return }
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("replay-tap-\(UUID().uuidString)", isDirectory: true)

@@ -38,8 +38,7 @@ import Testing
 }
 
 @Test func sameProcessReactivatedProducesNoSwitchEvenWithAnUnreadableTitle() {
-    // Regression for the reviewer's Important finding on 690792f: the
-    // switch-back decision no longer takes a window title at all, so an
+    // The switch-back decision no longer takes a window title at all, so an
     // accessibility read that races the window becoming readable and
     // returns nil exactly at activation has no way to invent a switch. The
     // process id is the only signal, and it is unaffected by that race.
@@ -51,9 +50,9 @@ import Testing
 }
 
 @Test func twoProcessesSharingABundleIdAndWindowTitleStillProduceASwitch() {
-    // The reverse gap the reviewer named: two processes that happen to
-    // report the same bundle id (as two Electron apps' bundle id always
-    // does in development) and the same — or equally unreadable — window
+    // The reverse case: two processes that happen to report the same
+    // bundle id — which two Electron processes always do in development —
+    // and the same, or equally unreadable, window
     // title must not be mistaken for one application. Since neither is even
     // an input to this function any more, that coincidence cannot suppress
     // a genuine switch between two different process ids.
@@ -151,8 +150,8 @@ import Testing
 }
 
 @Test func aRealPidStillUpdatesTheTrackedPidAndADifferentRealPidStillProducesASwitch() {
-    // Confirms the unknown-pid guards added for round 2 do not disturb the
-    // ordinary, real-pid path this fix must not regress.
+    // Confirms the guards against an unknown process id leave the
+    // ordinary, real-pid path alone.
     #expect(nextRecordedProcessId(current: 1234, targetProcessId: 5678) == 5678)
     #expect(shouldRecordAppSwitch(
         activatedProcessId: 5678,

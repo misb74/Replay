@@ -272,10 +272,14 @@ import Testing
     ))
 }
 
-@Test func recordForwardsExcludedProcessIdsToTheInputMonitor() async throws {
+/// Replay's own windows must stay out of all three of a session's records:
+/// the video, the screenshots, and the input log. The screenshot path is
+/// asserted separately; these are the other two.
+@Test func recordForwardsExcludedProcessIdsToTheRecorderAndTheInputMonitor() async throws {
     let monitor = FakeInputMonitor()
+    let recorder = FakeRecorder()
     let service = SidecarService(
-        recorder: FakeRecorder(),
+        recorder: recorder,
         inputMonitor: monitor,
         permissions: FakePermissions(),
         actions: FakeActions()
@@ -297,6 +301,10 @@ import Testing
 
     #expect(start.ok)
     #expect(monitor.receivedExcludedProcessIds() == [4321])
+    #expect(
+        recorder.receivedConfiguration()?.excludeProcessIds == [4321],
+        "the recorder must be told to keep those windows out of video.mp4, not only the input monitor out of events.jsonl"
+    )
 
     _ = await service.handle(.init(
         requestId: "stop-exclusions",
@@ -537,6 +545,61 @@ import Testing
     #expect(configuration.sessionId == "session-live")
     #expect(configuration.locale == "en-GB")
     #expect(configuration.audioURL.lastPathComponent == "audio.m4a")
+}
+
+/// Exactly one thing may write `audio.m4a`. For an ordinary recording that
+/// is the recorder's own `AVAudioRecorder`; for a live recording it is the
+/// live session's microphone tap, which writes the same file from the
+/// voice-processed input. Two writers would corrupt it, and only on a Mac
+/// with a real microphone — nothing else in this suite would notice.
+@Test func aLiveRecordingLeavesTheNarrationFileToTheLiveSession() async throws {
+    let recorder = FakeRecorder()
+    let service = SidecarService(
+        recorder: recorder,
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: FakeLiveAudio()
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let response = await service.handle(liveRecordCommand(directory: directory))
+
+    #expect(response.ok)
+    #expect(
+        recorder.receivedConfiguration()?.audioURL == nil,
+        "the recorder must not open the microphone for a live recording: the live session owns audio.m4a"
+    )
+}
+
+/// The same narration, without a live session: here the recorder is the one
+/// writing it, so it must be given the URL.
+@Test func anOrdinaryNarratedRecordingLeavesTheNarrationFileToTheRecorder() async throws {
+    let recorder = FakeRecorder()
+    let service = SidecarService(
+        recorder: recorder,
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions()
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let response = await service.handle(.init(
+        requestId: "request-narrated",
+        command: .record(.init(
+            sessionId: "session-narrated",
+            sessionDirectory: directory.path,
+            includeAudio: true,
+            display: .init(width: 100, height: 50, scale: 1)
+        ))
+    ))
+
+    #expect(response.ok)
+    #expect(recorder.receivedConfiguration()?.audioURL?.lastPathComponent == "audio.m4a")
 }
 
 @Test func recordWithLiveFailsWhenLiveAudioIsUnavailable() async throws {
@@ -956,6 +1019,7 @@ private final class FakeRecorder: RecordingControlling, @unchecked Sendable {
     private let stopError: SidecarOperationError?
     private var healthy: Bool
     private var startCount = 0
+    private var lastConfiguration: RecordingStartConfiguration?
 
     init(
         captureOrigin: UInt64 = DispatchTime.now().uptimeNanoseconds,
@@ -970,7 +1034,10 @@ private final class FakeRecorder: RecordingControlling, @unchecked Sendable {
     }
 
     func start(configuration: RecordingStartConfiguration) async throws -> RecordingTiming {
-        lock.withLock { startCount += 1 }
+        lock.withLock {
+            startCount += 1
+            lastConfiguration = configuration
+        }
         if let startError { throw startError }
         return RecordingTiming(captureOriginUptimeNanoseconds: captureOrigin)
     }
@@ -980,6 +1047,7 @@ private final class FakeRecorder: RecordingControlling, @unchecked Sendable {
     func isHealthy() async -> Bool { lock.withLock { healthy } }
     func setHealthy(_ healthy: Bool) { lock.withLock { self.healthy = healthy } }
     func startCallCount() -> Int { lock.withLock { startCount } }
+    func receivedConfiguration() -> RecordingStartConfiguration? { lock.withLock { lastConfiguration } }
 }
 
 private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
@@ -988,9 +1056,12 @@ private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
     private var handler: InputEventHandler?
     private var timeOrigin: UInt64?
     private var excludedProcessIds: [Int32] = []
+    private let holdsStart: Bool
+    private var startContinuation: CheckedContinuation<Void, Never>?
 
-    init(startError: SidecarOperationError? = nil) {
+    init(startError: SidecarOperationError? = nil, holdsStart: Bool = false) {
         self.startError = startError
+        self.holdsStart = holdsStart
     }
 
     func start(
@@ -999,6 +1070,11 @@ private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
         excludeProcessIds: [Int32],
         handler: @escaping InputEventHandler
     ) async throws {
+        if holdsStart {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                lock.withLock { startContinuation = continuation }
+            }
+        }
         if let currentError = lock.withLock({ startError }) {
             throw currentError
         }
@@ -1028,6 +1104,19 @@ private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
 
     func receivedExcludedProcessIds() -> [Int32] {
         lock.withLock { excludedProcessIds }
+    }
+
+    func isHoldingStart() -> Bool {
+        lock.withLock { startContinuation != nil }
+    }
+
+    func releaseStart() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            let taken = startContinuation
+            startContinuation = nil
+            return taken
+        }
+        continuation?.resume()
     }
 }
 
@@ -1144,6 +1233,36 @@ private actor SafetyEventCollector {
     func values() -> [SidecarEventEnvelope] {
         events
     }
+}
+
+/// A recording is only "active" once the input monitor has started, but the
+/// live session — and so the microphone — is open before that. A shutdown
+/// landing in between must still close it, or the microphone stays open for
+/// the life of the process with nothing left holding a reference to it.
+@Test func shutdownDuringStartupStillReleasesTheMicrophone() async throws {
+    let monitor = FakeInputMonitor(holdsStart: true)
+    let live = FakeLiveAudio()
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: monitor,
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let starting = Task { await service.handle(liveRecordCommand(directory: directory)) }
+    while !monitor.isHoldingStart() {
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+
+    await service.shutdown()
+
+    #expect(await live.session.stopped, "the live session must be stopped even though no recording was active yet")
+    monitor.releaseStart()
+    _ = await starting.value
 }
 
 private actor FakeLiveSession: LiveAudioControlling {

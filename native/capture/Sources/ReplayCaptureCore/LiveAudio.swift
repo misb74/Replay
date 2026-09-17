@@ -144,10 +144,12 @@ public protocol LiveAudioProviding: AnyObject, Sendable {
 /// Every speech event it sends carries that conversion's result as `atMs`,
 /// read at the moment its phase was decided.
 ///
-/// Guaranteed under actor reentrancy, and — where noted — under a
-/// scheduling race that reentrancy alone cannot rule out. Each point below
-/// has a deterministic interleaving test in `LiveAudioTests.swift` (fakes
-/// that suspend until released, not fakes that always run to completion):
+/// What it guarantees, under actor reentrancy and — where noted — under a
+/// scheduling race that reentrancy alone cannot rule out. `LiveAudioTests`
+/// covers each point, mostly with fakes that suspend until the test
+/// releases them, so the interleaving is chosen rather than hoped for;
+/// where an ordering cannot be pinned at all, the test runs the race many
+/// times instead and requires every outcome to be correct.
 ///
 /// 1. Every utterance that is ever queued emits exactly one `started` (or
 ///    none, if it is refused before it is ever dequeued) followed by
@@ -157,118 +159,92 @@ public protocol LiveAudioProviding: AnyObject, Sendable {
 /// 2. `stopSpeaking()` and `stop()` cancel whichever utterance is actually
 ///    in flight at the instant they are called, if any, rather than
 ///    letting it play to completion, and never land on a later, unrelated
-///    utterance instead. The second half holds even under a scheduling
-///    race actor isolation does not rule out — see "Targeted stop" below
-///    — because it does not depend on this coordinator's own methods
-///    never being called concurrently with each other; it depends only on
-///    `SpeechSynthesizing` conformances honouring the per-id contract
-///    documented on `stopSpeaking(utteranceId:)`.
+///    utterance instead. The second half does not depend on this
+///    coordinator's own methods never running concurrently; it depends
+///    only on `SpeechSynthesizing` conformances honouring the per-id
+///    contract documented on `stopSpeaking(utteranceId:)`.
 /// 3. `setPaused(true)` stops an in-flight utterance the same way, and
 ///    cancels everything still queued — including an utterance queued but
 ///    not yet dequeued when the pause lands — rather than letting it
 ///    start.
 /// 4. A state event (`preparingModel`/`listening`/`paused`/`failed`) is
-///    only sent if it is still true at the moment it is actually sent —
-///    one superseded by a concurrent call while this call was suspended is
-///    dropped rather than sent stale, and none at all follows `stop()`,
-///    including a `failed` from a `start()` that `stop()` interrupted or
-///    from a `reportFailure(reason:)` that landed after it.
+///    only sent if it is still true at the moment it is sent: one
+///    superseded by a concurrent call while this call was suspended is
+///    dropped rather than sent stale, and none is *decided* once `stop()`
+///    has run, including a `failed` from a `start()` that `stop()`
+///    interrupted or from a `reportFailure(reason:)` that landed after it.
+///    An event decided before that may still be in flight to the sink when
+///    `stop()` returns; what is ruled out is deciding a new one.
 /// 5. `stop()` does not return until the drain loop has fully quiesced:
 ///    every utterance already dequeued has received its terminal event
-///    before `stop()`'s caller resumes. `start()`'s failure path does the
-///    same before it throws.
+///    before `stop()`'s caller resumes. The failure path does the same
+///    before it reports.
 /// 6. Once `start()` has failed, a failure has been reported through
 ///    `reportFailure(reason:)`, or `stop()` has been called, the
 ///    coordinator permanently refuses new speech: `speak()` emits
 ///    `.cancelled` immediately rather than queuing, and the recogniser is
 ///    left stopped, not still running, in every case. A later
 ///    `setPaused(false)` does not resurrect it.
-/// 7. Exactly one `failed` is ever sent, whichever of the two failure
-///    paths gets there first and however often `reportFailure(reason:)`
-///    is called — and only after every utterance's terminal event, never
-///    before.
+/// 7. Exactly one `failed` is ever sent, whichever failure path gets there
+///    first and however often `reportFailure(reason:)` is called — and
+///    only after every utterance's terminal event, never before.
 ///
 /// Deliberately *not* guaranteed: transcripts are not gated by speech.
 /// `ingest(_:)` only checks `paused`/`stopped`, never whether an utterance
 /// is mid-flight, so transcripts keep flowing while the tutor talks — that
 /// is full duplex by design (the user can barge in), not an oversight.
 ///
-/// Targeted stop (mechanism for 2's "never land on a later utterance").
-/// `stopSpeaking()` passes `inFlightUtteranceId`, captured synchronously
-/// before its own first `await`, as the id
-/// `synthesiser.stopSpeaking(utteranceId:)` names. Naming the id is what
-/// makes this correct under timing this actor's own isolation cannot
-/// control: resuming from `synthesiser.speak(_:utteranceId:)` — for
-/// example because the utterance finished on its own — is itself a
-/// scheduling event, not guaranteed to run before some other, already
-/// ready job on this actor, so a stop decided while that utterance was
-/// still in flight can still reach the synthesiser after it has already
-/// finished. Untargeted, that stale stop would have nothing of its own
-/// left to apply to and, under the requirement the previous round of this
-/// task placed on `speak(_:)`, would have been held and wrongly applied to
-/// whatever later, unrelated utterance spoke next — the actual defect
-/// that requirement introduced (round 2 of this task's report has the
-/// probe evidence). Named, the same stale stop instead targets a specific
-/// id that has already finished, which `stopSpeaking(utteranceId:)`'s
-/// contract defines as having no effect, so it cannot land on anything
-/// else. `stopSpeaking()` still tells the synthesiser first, before the
-/// slower per-item cancellation emits below it, which remains worth doing
-/// (it shortens the window during which a real synthesiser is still
-/// audibly playing something the coordinator has already decided to stop)
-/// — it is just no longer what correctness depends on.
+/// **Targeted stop** (mechanism for 2's second half). `stopSpeaking()`
+/// captures `inFlightUtteranceId` synchronously, before its own first
+/// `await`, and passes it to `synthesiser.stopSpeaking(utteranceId:)`.
+/// Naming the id is what makes this correct under timing this actor cannot
+/// control: resuming from `synthesiser.speak(_:utteranceId:)` is itself a
+/// scheduling event, so a stop decided while an utterance was in flight can
+/// still reach the synthesiser after that utterance has finished on its
+/// own. Named, such a stop targets an id the contract defines as no longer
+/// stoppable, and so does nothing; unnamed, it would have had to guess.
+/// The synthesiser is still told before the per-item cancellations are
+/// emitted, which shortens how long a real one keeps playing something
+/// already decided against, but correctness no longer rests on that.
 ///
-/// Mechanism for 1 and 3: `generation` is bumped synchronously, before any
-/// `await`, at the top of `stopSpeaking()` — and so transitively by
-/// `stop()` and `setPaused(true)`, which both call it with nothing awaited
-/// first, so the bump happens no later than it would if they bumped it
-/// themselves. `stopSpeaking()` also snapshots and clears `queue` in that
-/// same stretch, which is what covers an utterance still queued, not yet
-/// dequeued, when the call lands. Each pass of the drain loop separately
-/// captures `generation` at the moment it dequeues an utterance,
-/// synchronously alongside the dequeue. After the utterance's `started`
-/// event has actually been sent — the first `await` since that capture —
-/// the loop re-checks: if `generation` has changed, the utterance is
-/// cancelled without ever being handed to the synthesiser, closing the
-/// window where a stop/pause that lands during that `await` would
-/// otherwise be silently lost.
+/// **Mechanism for 1 and 3.** `generation` is bumped synchronously, before
+/// any `await`, at the top of `stopSpeaking()` — and so transitively by
+/// `stop()` and `setPaused(true)`, neither of which awaits anything first.
+/// The same stretch snapshots and clears `queue`, which covers an utterance
+/// still queued when the call lands. Each pass of the drain loop captures
+/// `generation` as it dequeues, and re-checks it after the `started` event
+/// has been sent: if it changed, the utterance is cancelled without ever
+/// reaching the synthesiser, closing the window where a stop or pause
+/// landing during that `await` would otherwise be lost.
 ///
-/// Mechanism for 4: every branch of `setPaused(_:)` that follows an `await`
-/// re-reads `self.paused`/`stopped` and compares against the value this
-/// call was asked to set, sending the event only if nothing else has since
-/// changed it or stopped the coordinator entirely. `start()` does the same
-/// for `listening` against `paused`/`stopped`, and for `failed` against a
-/// separate `stopCalled` flag, set only inside `stop()`: both failure
-/// paths set `stopped` themselves, so `stopped` alone cannot tell "did
-/// `stop()` run" from "did sending `failed` set this". `start()`'s first
-/// event, `preparingModel`, has nothing before it to order it against, so
-/// it is guarded on `stopped` too — otherwise a failure reported before
-/// `start()` would be followed by it.
+/// **Mechanism for 4.** Every branch of `setPaused(_:)` that follows an
+/// `await` re-reads `paused`/`stopped` and compares against what this call
+/// was asked to set, emitting only if nothing has since changed it.
+/// `start()` does the same for `listening`, and for `failed` against a
+/// separate `stopCalled` flag set only inside `stop()` — both failure paths
+/// set `stopped` themselves, so `stopped` alone cannot distinguish "`stop()`
+/// ran" from "sending `failed` set this". `preparingModel` has nothing
+/// before it to order against, so it is guarded on `stopped` too.
 ///
-/// Mechanism for 1, 5, 6's failure-path cases and 7: both failure paths —
-/// `start()`'s own and `reportFailure(reason:)` — set `stopped = true`
-/// synchronously and then run the one shared
-/// `tearDownAndReportFailure(reason:)`, which calls `stopSpeaking()` — not
-/// just the flag — and `recogniser.stop()`, then awaits the drain before
-/// deciding anything else, mirroring `stop()` itself (all of these may now
-/// call `recogniser.stop()`, possibly concurrently — the requirement on
-/// `SpeechRecognizing.stop()` covers this). Anything already queued
-/// (`speak()` has no dependency on `start()` having succeeded first) is
-/// cancelled rather than left stranded, and nothing is sent — `failed` or
-/// otherwise — before every dequeued utterance's terminal event is. That
-/// one path also checks and sets `failureReported` in a single await-free
-/// stretch, which is what makes 7's "exactly one" hold when a reported
-/// failure and a failing `start()` both arrive.
-/// `clearDrain()` also refuses to restart the drain once `stopped`, which
-/// would otherwise be a second way for the same utterances to be lost:
-/// without it, a queue left non-empty while stopped — which should not
-/// happen given the above, but this is the backstop — would have made
-/// `runDrain`'s own `!stopped` loop guard and `clearDrain`'s restart fight
-/// forever, each exiting and immediately re-triggering the other.
+/// **Mechanism for 1, 5, 6 and 7.** Both failure paths — `start()`'s own
+/// and `reportFailure(reason:)` — set `stopped` synchronously and then run
+/// the one shared `tearDownAndReportFailure(reason:)`, which calls
+/// `stopSpeaking()` and `recogniser.stop()` and awaits the drain before
+/// deciding anything else, mirroring `stop()`. (All three may call
+/// `recogniser.stop()`, possibly concurrently; the requirement on
+/// `SpeechRecognizing.stop()` covers that.) Anything already queued is
+/// cancelled rather than stranded, and nothing is sent before every
+/// dequeued utterance's terminal event. That path checks and sets
+/// `failureReported` in one await-free stretch, which is what makes 7 hold
+/// when a reported failure and a failing `start()` arrive together.
+/// `clearDrain()` refuses to restart the drain once `stopped`, so a queue
+/// somehow left non-empty cannot make it and `runDrain`'s own `!stopped`
+/// guard trigger each other indefinitely.
 ///
-/// As with `queue`, every read of `generation`/`inFlightUtteranceId`/
-/// `paused`/`stopped`/`stopCalled`/`failureReported` used to decide
-/// whether to act is paired with its mutation in the same await-free
-/// stretch — no `await` separates a check from the state it is checking.
+/// Throughout, every read of `generation`/`inFlightUtteranceId`/`paused`/
+/// `stopped`/`stopCalled`/`failureReported` used to decide whether to act
+/// is paired with its mutation in the same await-free stretch: no `await`
+/// separates a check from the state it is checking.
 public actor LiveAudioCoordinator: LiveAudioControlling {
     private struct QueuedUtterance {
         let id: String
@@ -335,6 +311,12 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
         // below, so nothing can report before this line — but one guard is
         // cheaper than re-deriving that every time this file is read.
         guard !stopped else { return }
+        // Not a download: the sidecar refuses `record` until
+        // `LiveAudioProviding.prepare(locale:)` has said the model is
+        // installed, so by now there is nothing left to fetch. What this
+        // marks is the engine being built — opening the microphone,
+        // starting the analyser — which is short but not instant, and
+        // during which the tutor cannot yet hear anything.
         await emit(.init(event: .state, sessionId: sessionId, state: .preparingModel))
         do {
             try await recogniser.start { [weak self] segment in
@@ -509,7 +491,7 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
     }
 
     /// Waits for the speech queue to empty. Tests only.
-    public func drainForTesting() async {
+    func drainForTesting() async {
         await drain?.value
     }
 
@@ -517,7 +499,7 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
     /// test confirm the drain has genuinely stopped (rather than a task
     /// existing that will just recreate itself) without inferring it
     /// indirectly from CPU usage.
-    public var isDrainingForTesting: Bool { drain != nil }
+    var isDrainingForTesting: Bool { drain != nil }
 
     private func ingest(_ segment: RecognisedSegment) async {
         guard !paused, !stopped else { return }

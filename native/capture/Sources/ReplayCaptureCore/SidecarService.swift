@@ -71,43 +71,7 @@ public protocol SafetyMonitoring: AnyObject, Sendable {
     func stop() async
 }
 
-public extension InputMonitoring {
-    func start(
-        sessionId: String,
-        startedAtUptimeNanoseconds: UInt64,
-        handler: @escaping InputEventHandler
-    ) async throws {
-        try await start(
-            sessionId: sessionId,
-            startedAtUptimeNanoseconds: startedAtUptimeNanoseconds,
-            excludeProcessIds: [],
-            handler: handler
-        )
-    }
-}
-
 public extension ActionPerforming {
-    func screenshot(
-        to outputURL: URL,
-        displayId: UInt32?,
-        excludeProcessIds: [Int32]
-    ) async throws -> ScreenshotResult {
-        try await screenshot(
-            to: outputURL,
-            displayId: displayId,
-            excludeProcessIds: excludeProcessIds,
-            createDirectories: true
-        )
-    }
-
-    func screenshot(to outputURL: URL, displayId: UInt32?) async throws -> ScreenshotResult {
-        try await screenshot(to: outputURL, displayId: displayId, excludeProcessIds: [])
-    }
-
-    func screenshot(to outputURL: URL) async throws -> ScreenshotResult {
-        try await screenshot(to: outputURL, displayId: nil, excludeProcessIds: [])
-    }
-
     func typeText(_ text: String) async throws {
         try await typeText(text, target: nil)
     }
@@ -349,9 +313,12 @@ public actor SidecarService {
         guardrailsActive = false
         guardrailsTripped = false
         safetyInterlock.reset()
+        // Outside the `if let` below: a shutdown that lands between the live
+        // session starting and `active` being assigned would otherwise leave
+        // the microphone open for the life of the process.
+        await activeLiveSession?.stop()
+        activeLiveSession = nil
         if let active {
-            await activeLiveSession?.stop()
-            activeLiveSession = nil
             await inputMonitor.stop()
             try? await recorder.stop()
             try? await active.writer.markInterrupted(reason: "sidecar_shutdown")

@@ -444,7 +444,10 @@ func shouldRecordInput(targetProcessId: Int32, excluded: Set<Int32>) -> Bool {
 /// updated the last-recorded process in the first place. The same check is
 /// correct when nothing is excluded at all.
 ///
-/// This is decided by process id alone, never a bundle id or window title.
+/// An activation is decided by process id alone, never a bundle id or
+/// window title. (Bundle identity is a separate producer's business:
+/// `emitContextChanges` uses it to notice the frontmost application
+/// changing between polls. This function covers the activation path only.)
 /// A window title comes from an accessibility read that can race the window
 /// becoming readable and return `nil` exactly at activation — a nil or
 /// coincidentally equal title must never be able to invent or hide a

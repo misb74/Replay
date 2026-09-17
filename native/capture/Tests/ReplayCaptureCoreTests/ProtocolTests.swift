@@ -260,6 +260,50 @@ import Testing
     #expect(object["reason"] as? String == "microphone_unavailable")
 }
 
+/// The desktop half keys on these exact strings. Nothing on this side
+/// pinned them, so a rename here would have reached the panel as speech
+/// that never starts or a state that never arrives.
+@Test func speechPhasesEncodeAsTheNamesTheDesktopKeysOn() throws {
+    let phases: [SidecarLiveSpeechPhase: String] = [
+        .started: "started",
+        .finished: "finished",
+        .cancelled: "cancelled",
+    ]
+    for (phase, expected) in phases {
+        let envelope = SidecarLiveEventEnvelope(
+            event: .speech,
+            sessionId: "session-1",
+            utteranceId: "utterance-1",
+            phase: phase,
+            atMs: 0
+        )
+        let object = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder.replay.encode(envelope)) as? [String: Any]
+        )
+        #expect(object["phase"] as? String == expected)
+    }
+}
+
+@Test func liveStatesEncodeAsTheNamesTheDesktopKeysOn() throws {
+    let states: [SidecarLiveState: String] = [
+        .preparingModel: "preparing_model",
+        .listening: "listening",
+        .paused: "paused",
+        .failed: "failed",
+    ]
+    for (state, expected) in states {
+        let envelope = SidecarLiveEventEnvelope(
+            event: .state,
+            sessionId: "session-1",
+            state: state
+        )
+        let object = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder.replay.encode(envelope)) as? [String: Any]
+        )
+        #expect(object["state"] as? String == expected)
+    }
+}
+
 @Test func speechEventEncodesAtMs() throws {
     let envelope = SidecarLiveEventEnvelope(
         event: .speech,

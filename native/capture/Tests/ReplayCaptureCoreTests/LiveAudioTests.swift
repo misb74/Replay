@@ -103,9 +103,10 @@ private actor FakeSynthesiser: SpeechSynthesizing {
     private var autoCompletes = true
     private var holdStops = false
     private var heldStop: CheckedContinuation<Void, Never>?
-    /// Ids a stop arrived for while they were not playing. Scoped per id,
-    /// unlike round 2's single global flag: a stop remembered for one id
-    /// can never be misapplied to a later, unrelated one. An entry may
+    /// Ids a stop arrived for while they were not playing. Scoped per id
+    /// rather than a single global "a stop was requested" flag: a stop
+    /// remembered for one id can never be misapplied to a later,
+    /// unrelated one. An entry may
     /// name an utterance that had already finished, which is harmless —
     /// that id is never spoken again, and registering the next utterance
     /// forgets it.
@@ -782,9 +783,9 @@ private actor CompletionFlag {
 /// actor — must never affect a later, unrelated utterance queued after it.
 /// `async let` races `stopSpeaking()` against `finishCurrent()` without
 /// pinning which wins; run enough times and both orderings occur. Neither
-/// may ever let C be cancelled: unlike round 2's global "remembered stop"
-/// requirement (see this file's `FakeSynthesiser` and the report), the
-/// targeted contract makes the outcome correct regardless of which one
+/// may ever let C be cancelled: unlike a global "remembered stop", which
+/// would have had to guess which utterance it meant, the targeted
+/// contract makes the outcome correct regardless of which one
 /// wins, so this does not need to hit one specific interleaving to prove
 /// anything — it needs to show that *no* interleaving, across many tries,
 /// ever produces the wrong answer.
