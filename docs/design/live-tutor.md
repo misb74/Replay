@@ -111,18 +111,19 @@ Commands:
 | --- | --- | --- |
 | `record` (extended) | `live?: { locale?: string }`, `excludeProcessIds?: [Int32]` | See §4.2, §4.3 |
 | `act.screenshot` (extended) | `excludeProcessIds?: [Int32]` | See §4.3 |
+| `live.prepare` | `{ locale?: string }` | Makes sure the on-device speech model for `locale` is installed, with or without a recording active |
 | `live.speak` | `{ utteranceId: string, text: string }` | Queue one utterance |
 | `live.stopSpeaking` | — | Stop now, clear the queue |
 | `live.setPaused` | `{ paused: Bool }` | See §4.1 |
 
-Results: `live.speak` → `speech_queued`; `live.stopSpeaking` → `speech_stopped`; `live.setPaused` → `live_paused` / `live_resumed`.
+Results: `live.prepare` → `live_ready` or `live_preparing`; `live.speak` → `speech_queued`; `live.stopSpeaking` → `speech_stopped`; `live.setPaused` → `live_paused` / `live_resumed`. A `record` whose `live` block asks for a model that is not yet ready is refused with `invalid_state`; the caller polls `live.prepare` until it answers `live_ready` first.
 
 Events (pushed through the existing `SidecarEventEnvelope`, alongside safety events):
 
 | Event | Payload |
 | --- | --- |
 | `live.transcript` | `{ sessionId, segmentId, text, isFinal, startMs, endMs }` |
-| `live.speech` | `{ sessionId, utteranceId, phase: "started" \| "finished" \| "cancelled" }` |
+| `live.speech` | `{ sessionId, utteranceId, phase: "started" \| "finished" \| "cancelled", atMs }` |
 | `live.state` | `{ sessionId, state: "preparing_model" \| "listening" \| "paused" \| "failed", reason? }` |
 
 Error codes: add `unsupported`. Live failures after a successful start never fail the recording; they are reported as `live.state: failed`.

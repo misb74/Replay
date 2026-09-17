@@ -158,12 +158,14 @@ Automatic transcription, condensed actions, screen-change scores, frame plans, a
 
 Claude calls start only after the user starts Build or Run. The exchange is deliberately narrower than the local evidence set:
 
-| Direction | During Build | During Run |
-| --- | --- | --- |
-| Mac to Claude | Session identifier, versioned prompts, redacted condensed actions, narration text, frame plan, selected full frames, and the first-pass segmentation used to derive decisions | Approved step, expectation, condition, target, or custom-action text; a fresh screenshot; and the screenshot's absolute local path used by the Agent SDK |
-| Claude to Mac | Structured workflow name, goal, parameters, step segmentation, decisions, confidence, and open questions | Structured verdict and reason, branch result, re-grounded target bounds, or one bounded action proposal |
+| Direction | During Build | During Run | During Live |
+| --- | --- | --- | --- |
+| Mac to Claude | Session identifier, versioned prompts, redacted condensed actions, narration text, frame plan, selected full frames, and the first-pass segmentation used to derive decisions | Approved step, expectation, condition, target, or custom-action text; a fresh screenshot; and the screenshot's absolute local path used by the Agent SDK | A screenshot taken when you finish speaking or a proactive check fires (not visually redacted; Replay's own windows excluded); your speech as text; up to 10 recent action lines (role, label, window, and app only — secure fields are already redacted at capture, and typed text or field values are never included); and up to the last 20 turns of conversation history, with screenshots kept for the 3 most recent user turns |
+| Claude to Mac | Structured workflow name, goal, parameters, step segmentation, decisions, confidence, and open questions | Structured verdict and reason, branch result, re-grounded target bounds, or one bounded action proposal | Text replies and questions |
 
 The normal UI never collects vault values, and the runner never uses or logs values supplied for vault-backed actions. Secure-field event text is redacted before persistence. Full frames and run screenshots are not visually redacted, and narration is not secret-scanned, so information visible on screen or spoken aloud can cross this boundary after the user starts Build or Run. Raw video, raw audio, the full event log, target crops, workflow revisions, exports, and run logs remain local.
+
+Live follows the same visibility rule: its screenshots are not visually redacted either, so anything on screen while the box is ticked can cross the same way. Nothing is sent while paused or after Stop, and the tutor's replies are text only — it has no path to any action. Each screenshot is read into the request and then deleted; only `transcript.json` and `live.jsonl` (both owner-only) persist the conversation on disk, never the video or the audio file.
 
 ## Approval and learning loop
 
@@ -225,6 +227,7 @@ Open low-confidence questions block approval. Approval creates a new immutable r
 - The renderer has no direct Node.js access. The preload exposes only typed Replay operations over Electron IPC.
 - The sidecar accepts a small, versioned command set. It has no shell, clipboard, or arbitrary file-upload action.
 - Raw video and audio remain local. The Claude boundary receives only the model inputs described above after the user starts Build or Run.
+- The live tutor can look and talk. Its capability object exposes only screenshot capture, speech, and pause control, with no reference to any action command — click, type, key, scroll, drag, or navigate.
 - Secure-field text is redacted before event serialization. Secure targets have no reusable crop, and structured secret parameters are represented only by vault references.
 - Workflow revisions, export files, run logs, frames, crops, and screenshots are written with owner-only file modes. Frame, crop, export, and run directories are created private.
 - Only the exact approved, content-hashed revision can be compiled or run. Autonomous mode additionally requires a clean test of that same revision.
