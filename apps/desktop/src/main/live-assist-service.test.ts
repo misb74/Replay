@@ -1345,20 +1345,36 @@ describe("speaking first", () => {
 // Each test holds every condition of spec §5.5 but one, and shows that one
 // alone keeps the tutor from checking.
 describe("when the tutor may speak first", () => {
-  it("leaves forty-five seconds from the moment it falls silent, whatever it last said", async () => {
+  it.each([
+    ["is heard to the end", (harness: Harness) => { harness.finishUtterances(); }],
+    ["is cut off by the user", (harness: Harness) => { harness.emitTranscript("wait", false); }],
+  ])("leaves forty-five seconds from the moment it falls silent, when its answer %s", async (_, fallSilent) => {
     const { transport, checks } = checkingTransport(() => ({ ask: false }), ["The third one."]);
     const harness = await makeHarness({ transport, events: eventLogRepeating(committedClick) });
 
-    // The user asks, and the answer is still being heard at sixty seconds.
+    // The user asks, and the answer is still being spoken at sixty seconds.
     await harness.at(40_000);
     harness.emitTranscript("Which column is the total?", true);
     await harness.at(60_000);
     expect(spokenTexts(harness)).toEqual(["The third one."]);
-    harness.finishUtterances();
+    fallSilent(harness);
 
     await harness.at(100_000);
     expect(checks).toHaveLength(0);
     await harness.at(105_000);
+    expect(checks).toHaveLength(1);
+  });
+
+  it("counts a sentence handed to the sidecar as speech, even when the sidecar never confirms it", async () => {
+    const { transport, checks } = checkingTransport(() => ({ ask: false }), ["The third one."]);
+    const harness = await makeHarness({ transport, events: eventLogRepeating(committedClick) });
+    harness.sidecar.speak = async () => { throw new Error("The capture sidecar did not answer."); };
+
+    await harness.at(40_000);
+    harness.emitTranscript("Which column is the total?", true);
+    await harness.at(85_000);
+    expect(checks).toHaveLength(0);
+    await harness.at(90_000);
     expect(checks).toHaveLength(1);
   });
 
@@ -1572,6 +1588,39 @@ describe("a check that loses its chance", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("says nothing once its check has run out of time, and reports the timeout", async () => {
+    const held = heldChecks();
+    const harness = await makeHarness({ transport: held.transport, events: eventLog([committedClick]) });
+
+    await harness.at(45_000);
+    expect(held.checks).toHaveLength(1);
+
+    // The request runs past its twenty seconds, and an answer still arrives.
+    await harness.at(65_000);
+    held.answer({ ask: true, question: "Why?" });
+    await harness.settle();
+
+    expect(harness.sidecar.spoken).toEqual([]);
+    expect(harness.updates.at(-1)).toMatchObject({ state: "listening", sharing: false, error: "timeout" });
+  });
+
+  it("says nothing more of its question once the check has run out of time", async () => {
+    const { transport } = checkingTransport(() => ({ ask: true, question: "You flagged that one. Was it the amount?" }));
+    const harness = await makeHarness({ transport, events: eventLog([committedClick]) });
+    harness.sidecar.hold("speak");
+
+    await harness.at(45_000);
+    expect(spokenTexts(harness)).toEqual(["You flagged that one."]);
+
+    // The sidecar is slow to take the first sentence, past the check's twenty seconds.
+    await harness.at(65_000);
+    harness.sidecar.release("speak");
+    await harness.settle();
+
+    expect(spokenTexts(harness)).toEqual(["You flagged that one."]);
+    expect(harness.updates.at(-1)).toMatchObject({ sharing: false, error: "timeout" });
+  });
+
   it("says nothing more of a question the user talks over", async () => {
     const { transport } = checkingTransport(() => ({ ask: true, question: "You flagged that one. Was it the amount?" }));
     const harness = await makeHarness({ transport, events: eventLog([committedClick]) });
@@ -1619,6 +1668,20 @@ describe("reading the event log", () => {
     // read found reaches the reply.
     expect(checks).toHaveLength(0);
     expect(model.requests[0]?.actions).toEqual([committedClick.description]);
+  });
+
+  it("reads it once for a check, however long the read takes", async () => {
+    const reads: Array<(actions: ObservedAction[]) => void> = [];
+    const { transport, checks } = checkingTransport(() => ({ ask: false }));
+    const harness = await makeHarness({ transport, events: { read: () => new Promise((resolve) => { reads.push(resolve); }) } });
+
+    // Two more chances to check come and go while the first read is under way.
+    await harness.at(55_000);
+    reads[0]!([committedClick]);
+    await harness.settle();
+
+    expect(reads).toHaveLength(1);
+    expect(checks).toHaveLength(1);
   });
 
   it("ends even while a read of it never returns", async () => {
