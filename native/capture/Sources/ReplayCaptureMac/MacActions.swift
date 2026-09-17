@@ -15,7 +15,8 @@ public final class MacActionPerformer: ActionPerforming, Sendable {
     public func screenshot(
         to outputURL: URL,
         displayId: UInt32?,
-        excludeProcessIds: [Int32]
+        excludeProcessIds: [Int32],
+        createDirectories: Bool
     ) async throws -> ScreenshotResult {
         guard #available(macOS 14.0, *) else {
             throw SidecarOperationError.captureFailed
@@ -58,7 +59,7 @@ public final class MacActionPerformer: ActionPerforming, Sendable {
             throw SidecarOperationError.captureFailed
         }
 
-        let parent = outputURL.deletingLastPathComponent()
+        try prepareScreenshotOutput(at: outputURL, createDirectories: createDirectories)
         guard let png = NSBitmapImageRep(cgImage: image).representation(
             using: .png,
             properties: [:]
@@ -66,11 +67,6 @@ public final class MacActionPerformer: ActionPerforming, Sendable {
             throw SidecarOperationError.ioFailed
         }
         do {
-            try FileManager.default.createDirectory(
-                at: parent,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
             try png.write(to: outputURL, options: .atomic)
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o600],
@@ -499,4 +495,29 @@ func excludedApplications(
     guard !processIds.isEmpty else { return [] }
     let wanted = Set(processIds)
     return content.applications.filter { wanted.contains($0.processID) }
+}
+
+/// Readies the folder a screenshot will be written into. When
+/// `createDirectories` is false, a missing folder is an error rather than
+/// something to recreate: a caller that swept its private folder must never
+/// have a late screenshot bring it back.
+func prepareScreenshotOutput(at outputURL: URL, createDirectories: Bool) throws {
+    let parent = outputURL.deletingLastPathComponent()
+    if createDirectories {
+        do {
+            try FileManager.default.createDirectory(
+                at: parent,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            throw SidecarOperationError.ioFailed
+        }
+        return
+    }
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDirectory),
+          isDirectory.boolValue else {
+        throw SidecarOperationError.ioFailed
+    }
 }

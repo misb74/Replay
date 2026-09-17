@@ -45,7 +45,12 @@ public protocol InputMonitoring: AnyObject, Sendable {
 }
 
 public protocol ActionPerforming: AnyObject, Sendable {
-    func screenshot(to outputURL: URL, displayId: UInt32?, excludeProcessIds: [Int32]) async throws -> ScreenshotResult
+    func screenshot(
+        to outputURL: URL,
+        displayId: UInt32?,
+        excludeProcessIds: [Int32],
+        createDirectories: Bool
+    ) async throws -> ScreenshotResult
     func click(_ command: ActClickCommand) async throws
     func isFocusedElementSecure() async throws -> Bool
     func typeText(_ text: String, target: ElementSelector?) async throws
@@ -66,6 +71,19 @@ public protocol SafetyMonitoring: AnyObject, Sendable {
 }
 
 public extension ActionPerforming {
+    func screenshot(
+        to outputURL: URL,
+        displayId: UInt32?,
+        excludeProcessIds: [Int32]
+    ) async throws -> ScreenshotResult {
+        try await screenshot(
+            to: outputURL,
+            displayId: displayId,
+            excludeProcessIds: excludeProcessIds,
+            createDirectories: true
+        )
+    }
+
     func screenshot(to outputURL: URL, displayId: UInt32?) async throws -> ScreenshotResult {
         try await screenshot(to: outputURL, displayId: displayId, excludeProcessIds: [])
     }
@@ -173,7 +191,8 @@ public actor SidecarService {
                 let screenshot = try await actions.screenshot(
                     to: URL(fileURLWithPath: command.outputPath),
                     displayId: command.displayId,
-                    excludeProcessIds: command.excludeProcessIds
+                    excludeProcessIds: command.excludeProcessIds,
+                    createDirectories: command.createDirectories
                 )
                 result = SidecarResponseResult(type: .screenshot, screenshot: screenshot)
             case let .actClick(command):

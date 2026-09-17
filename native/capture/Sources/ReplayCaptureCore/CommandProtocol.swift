@@ -125,17 +125,25 @@ public struct ActScreenshotCommand: Codable, Equatable, Sendable {
     public var outputPath: String
     public var displayId: UInt32?
     public var excludeProcessIds: [Int32]
+    public var createDirectories: Bool
 
-    public init(outputPath: String, displayId: UInt32? = nil, excludeProcessIds: [Int32] = []) {
+    public init(
+        outputPath: String,
+        displayId: UInt32? = nil,
+        excludeProcessIds: [Int32] = [],
+        createDirectories: Bool = true
+    ) {
         self.outputPath = outputPath
         self.displayId = displayId
         self.excludeProcessIds = excludeProcessIds
+        self.createDirectories = createDirectories
     }
 
     private enum CodingKeys: String, CodingKey {
         case outputPath
         case displayId
         case excludeProcessIds
+        case createDirectories
     }
 
     public init(from decoder: Decoder) throws {
@@ -143,6 +151,7 @@ public struct ActScreenshotCommand: Codable, Equatable, Sendable {
         outputPath = try container.decode(String.self, forKey: .outputPath)
         displayId = try container.decodeIfPresent(UInt32.self, forKey: .displayId)
         excludeProcessIds = try container.decodeIfPresent([Int32].self, forKey: .excludeProcessIds) ?? []
+        createDirectories = try container.decodeIfPresent(Bool.self, forKey: .createDirectories) ?? true
     }
 }
 

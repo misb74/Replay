@@ -467,6 +467,24 @@ import Testing
     #expect(await actions.lastScreenshotExclusions == [99])
 }
 
+@Test func screenshotForwardsCreateDirectories() async throws {
+    let actions = FakeActions()
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: actions
+    )
+
+    let response = await service.handle(.init(
+        requestId: "request-1",
+        command: .actScreenshot(.init(outputPath: "/tmp/shot.png", createDirectories: false))
+    ))
+
+    #expect(response.ok)
+    #expect(await actions.lastScreenshotCreateDirectories == false)
+}
+
 @Test func guardrailCannotBeLostWhileSubscriptionIsStarting() async {
     let safety = FakeSafetyMonitor(eventOnStart: .init(type: .killSwitch, timestampMs: 0))
     let received = SafetyEventCollector()
@@ -592,13 +610,20 @@ private actor FakeActions: ActionPerforming {
     private var drags = 0
     private var navigations = 0
     private(set) var lastScreenshotExclusions: [Int32] = []
+    private(set) var lastScreenshotCreateDirectories: Bool?
 
     init(focusedSecure: Bool = false) {
         self.focusedSecure = focusedSecure
     }
 
-    func screenshot(to outputURL: URL, displayId: UInt32?, excludeProcessIds: [Int32]) async throws -> ScreenshotResult {
+    func screenshot(
+        to outputURL: URL,
+        displayId: UInt32?,
+        excludeProcessIds: [Int32],
+        createDirectories: Bool
+    ) async throws -> ScreenshotResult {
         lastScreenshotExclusions = excludeProcessIds
+        lastScreenshotCreateDirectories = createDirectories
         return ScreenshotResult(path: outputURL.path, width: 100, height: 50, scale: 2)
     }
 

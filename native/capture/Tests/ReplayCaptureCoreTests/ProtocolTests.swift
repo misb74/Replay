@@ -127,6 +127,30 @@ import Testing
     #expect(command.excludeProcessIds.isEmpty)
 }
 
+@Test func screenshotCommandDefaultsToCreatingDirectories() throws {
+    let decoded = try JSONDecoder.replay.decode(
+        SidecarCommandEnvelope.self,
+        from: Data(#"{"protocolVersion":1,"requestId":"1","command":"act_screenshot","payload":{"outputPath":"/tmp/a.png"}}"#.utf8)
+    )
+    guard case let .actScreenshot(command) = decoded.command else {
+        Issue.record("Expected a screenshot command")
+        return
+    }
+    #expect(command.createDirectories)
+}
+
+@Test func screenshotCommandCarriesCreateDirectories() throws {
+    let envelope = SidecarCommandEnvelope(
+        requestId: "request-no-create",
+        command: .actScreenshot(.init(outputPath: "/tmp/live/a.png", createDirectories: false))
+    )
+    let decoded = try JSONDecoder.replay.decode(
+        SidecarCommandEnvelope.self,
+        from: JSONEncoder.replay.encode(envelope)
+    )
+    #expect(decoded == envelope)
+}
+
 @Test func liveCommandsRoundTrip() throws {
     let commands: [SidecarCommand] = [
         .liveSpeak(.init(utteranceId: "utterance-1", text: "Both totals match.")),
