@@ -6,6 +6,7 @@ import {
   livePanelPaused,
   livePanelShowsPause,
   liveShareLabel,
+  liveShareWord,
   liveStateLabel,
   liveStatusLabel,
   recordControlState,
@@ -223,5 +224,15 @@ describe("liveShareLabel", () => {
 
   it("names it while nothing is in flight, rather than leaving a stale label", () => {
     expect(liveShareLabel(false)).toBe("Not sharing screen with Claude");
+  });
+});
+
+describe("liveShareWord", () => {
+  it("shows a visible word while sharing, not just the dot's colour — a proactive check can set it while the state badge still reads Listening", () => {
+    expect(liveShareWord(true)).toBe("Sharing");
+  });
+
+  it("shows nothing the rest of the time — its absence already reads as not sharing", () => {
+    expect(liveShareWord(false)).toBeUndefined();
   });
 });

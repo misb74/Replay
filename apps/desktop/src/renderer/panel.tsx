@@ -1,7 +1,7 @@
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { LiveUpdate } from "../shared/contracts.js";
-import { liveFailureText, livePanelPaused, livePanelShowsPause, liveShareLabel, liveStateLabel } from "./live-state.js";
+import { liveFailureText, livePanelPaused, livePanelShowsPause, liveShareLabel, liveShareWord, liveStateLabel } from "./live-state.js";
 import { createMockApi } from "./mock-api.js";
 import "./styles.css";
 
@@ -28,13 +28,17 @@ function Panel() {
   const paused = livePanelPaused(state);
   const failureText = liveFailureText(state, update?.error);
   const shareLabel = liveShareLabel(update?.sharing ?? false);
+  const shareWord = liveShareWord(update?.sharing ?? false);
 
   return (
     <div className="live-panel">
       <div className="live-panel-head">
         <span className={`live-panel-state ${state}`}>{liveStateLabel(state)}</span>
         {failureText ? <span className="live-panel-error">· {failureText}</span> : undefined}
-        <span className={`live-share-dot ${update?.sharing ? "on" : ""}`} role="img" aria-label={shareLabel} title={shareLabel} />
+        <span className="live-share-status">
+          {shareWord ? <span className="live-share-word">{shareWord}</span> : undefined}
+          <span className={`live-share-dot ${update?.sharing ? "on" : ""}`} role="img" aria-label={shareLabel} title={shareLabel} />
+        </span>
       </div>
       <p className="live-panel-heard">{update?.heard?.text ?? "…"}</p>
       <p className="live-panel-said">{update?.said ?? ""}</p>

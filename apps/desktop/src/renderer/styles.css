@@ -164,7 +164,15 @@ body.panel-body { min-width: 0; min-height: 0; overflow: hidden; background: #0b
    capture stopped`, `Paused · Claude unavailable`) — a flex item that
    shrinks and truncates rather than pushing the sharing dot out of the row. */
 .live-panel-error { min-width: 0; flex: 0 1 auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #f87171; font-size: 9px; font-weight: 600; }
-.live-share-dot { width: 8px; height: 8px; margin-left: auto; border-radius: 50%; background: #334155; flex: none; }
+/* Grouped and pushed to the right edge together, so the word (when sharing
+   is true) always sits right beside the dot it explains, regardless of
+   whether the failure text before it is present. */
+.live-share-status { margin-left: auto; display: flex; align-items: center; gap: 4px; flex: none; }
+/* The dot's colour alone misses a proactive check, where `sharing` can be
+   true while the state badge still reads "Listening" — this is the word a
+   sighted user actually sees, not just infers from a colour change. */
+.live-share-word { color: #34d399; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+.live-share-dot { width: 8px; height: 8px; border-radius: 50%; background: #334155; flex: none; }
 .live-share-dot.on { background: #34d399; box-shadow: 0 0 0 3px rgba(52,211,153,.25); }
 .live-panel-heard, .live-panel-said { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .live-panel-heard { color: #94a3b8; font-size: 11px; }

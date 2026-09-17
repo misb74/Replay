@@ -59,6 +59,13 @@ export function App() {
   const recording = activeRecording(sessions);
 
   const refresh = useCallback(async () => {
+    // Of the three availability checks, the microphone permission is the one
+    // that can plausibly change without a relaunch — granted mid-session
+    // through the same System Settings flow that re-polls `permissions`
+    // below. Fetched alongside it, with its own silent catch kept exactly as
+    // it was: an availability check failing is not worth an error banner
+    // over, unlike a failure to load permissions, workflows or sessions.
+    void api.getLiveAvailability().then(setLiveAvailability).catch(() => undefined);
     try {
       const [nextPermissions, nextWorkflows, nextSessions] = await Promise.all([api.getPermissions(), api.listWorkflows(), api.listSessions()]);
       setPermissions(nextPermissions);
@@ -78,10 +85,10 @@ export function App() {
     }
   }, [api]);
 
+  // Fetches live availability too, so mount is covered without a second effect.
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => api.onProcessingUpdate(setProcessing), [api]);
   useEffect(() => api.onRunUpdate(setRun), [api]);
-  useEffect(() => { void api.getLiveAvailability().then(setLiveAvailability).catch(() => undefined); }, [api]);
   useEffect(() => api.onLiveUpdate(setLiveUpdate), [api]);
 
   const receiveWorkflow = useCallback((workflow: WorkflowView) => {
@@ -239,11 +246,12 @@ function Sidebar(props: {
                   type="checkbox"
                   checked={live}
                   disabled={!controls.liveEnabled}
+                  aria-describedby={controls.note ? "live-availability-note" : undefined}
                   onChange={(event) => setLive(event.target.checked)}
                 />
                 <span>Talk to Replay while recording</span>
               </label>
-              {controls.note ? <small className="live-note">{controls.note}</small> : undefined}
+              {controls.note ? <small className="live-note" id="live-availability-note">{controls.note}</small> : undefined}
             </>}
         {/* Also shown before the recording exists, while the speech model is prepared. */}
         {liveStatus ? <div className="live-status">{liveStatus}</div> : undefined}

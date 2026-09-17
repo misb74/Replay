@@ -95,6 +95,20 @@ export function liveShareLabel(sharing: boolean): string {
   return sharing ? "Sharing screen with Claude" : "Not sharing screen with Claude";
 }
 
+/**
+ * The sharing dot's visible word, for sighted users — the dot's colour is
+ * not enough on its own, because `sharing` can be true while the state badge
+ * still reads "Listening" (a proactive check runs without moving the state
+ * to "Thinking"), which is exactly the moment a person needs to see it
+ * rather than infer it from a small dot changing colour. Its absence already
+ * reads as "not sharing", the way the dot's own colour does, so — unlike
+ * `liveShareLabel`, which always names both states for a screen reader —
+ * there is nothing to say the rest of the time.
+ */
+export function liveShareWord(sharing: boolean): string | undefined {
+  return sharing ? "Sharing" : undefined;
+}
+
 export function liveAvailabilityNote(availability: LiveAvailability): string | undefined {
   if (availability.available) return undefined;
   return availability.reason ?? "Unavailable on this Mac";
