@@ -114,4 +114,151 @@ describe("SidecarClient", () => {
     expect(activity).toBe(true);
     client.close();
   });
+
+  it("routes live events to their listeners and never to pending requests", async () => {
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+    const transcripts: unknown[] = [];
+    const speeches: unknown[] = [];
+    const states: unknown[] = [];
+    client.on("live_transcript", (event) => transcripts.push(event));
+    client.on("live_speech", (event) => speeches.push(event));
+    client.on("live_state", (event) => states.push(event));
+
+    // Open a pending request
+    const statusPromise = client.request("status");
+    const statusRequest = JSON.parse(transport.written[0]!) as { requestId: string };
+
+    // Emit all three live events while request is pending
+    transport.lineListeners.forEach((listener) =>
+      listener(JSON.stringify({
+        protocolVersion: 1,
+        event: "live_transcript",
+        sessionId: "session-1",
+        segmentId: "segment-1",
+        text: "Any difference is flagged",
+        isFinal: true,
+        startMs: 1200,
+        endMs: 2400,
+      }))
+    );
+    transport.lineListeners.forEach((listener) =>
+      listener(JSON.stringify({
+        protocolVersion: 1,
+        event: "live_speech",
+        sessionId: "session-1",
+        utteranceId: "utterance-1",
+        phase: "started",
+        atMs: 2600,
+      }))
+    );
+    transport.lineListeners.forEach((listener) =>
+      listener(JSON.stringify({
+        protocolVersion: 1,
+        event: "live_state",
+        sessionId: "session-1",
+        state: "listening",
+      }))
+    );
+
+    // Assert live events reached their listeners
+    expect(transcripts).toEqual([expect.objectContaining({ text: "Any difference is flagged", isFinal: true })]);
+    expect(speeches).toEqual([expect.objectContaining({ phase: "started", atMs: 2600 })]);
+    expect(states).toEqual([expect.objectContaining({ state: "listening" })]);
+
+    // Assert request is still pending (live events did not resolve it)
+    await expect(Promise.race([statusPromise, Promise.resolve("pending")])).resolves.toBe("pending");
+
+    // Answer the request
+    transport.respond({ protocolVersion: 1, requestId: statusRequest.requestId, ok: true, result: { type: "status", state: "idle" } });
+
+    // Assert request now resolves
+    await expect(statusPromise).resolves.toMatchObject({ type: "status", state: "idle" });
+    client.close();
+  });
+
+  it("fails the live session instead of forwarding a speech event with no time", async () => {
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+    await client.start();
+    const speeches: unknown[] = [];
+    const states: unknown[] = [];
+    client.on("live_speech", (event) => speeches.push(event));
+    client.on("live_state", (event) => states.push(event));
+
+    transport.respond({ protocolVersion: 1, event: "live_speech", sessionId: "session-1", utteranceId: "utterance-1", phase: "finished" });
+
+    expect(speeches).toEqual([]);
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_event_invalid" })]);
+    client.close();
+  });
+
+  it("fails the live session instead of forwarding a speech event whose time is not finite", async () => {
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+    await client.start();
+    const speeches: unknown[] = [];
+    const states: unknown[] = [];
+    client.on("live_speech", (event) => speeches.push(event));
+    client.on("live_state", (event) => states.push(event));
+
+    transport.respond({ protocolVersion: 1, event: "live_speech", sessionId: "session-1", utteranceId: "utterance-1", phase: "started", atMs: "soon" });
+
+    expect(speeches).toEqual([]);
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_event_invalid" })]);
+    client.close();
+  });
+
+  it("fails the live session instead of forwarding a speech event with a phase it cannot read", async () => {
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+    await client.start();
+    const speeches: unknown[] = [];
+    const states: unknown[] = [];
+    client.on("live_speech", (event) => speeches.push(event));
+    client.on("live_state", (event) => states.push(event));
+
+    // Anything that is not `started` closes the echo window and marks the
+    // sentence complete, so an unknown phase is as unsafe as a missing time.
+    transport.respond({ protocolVersion: 1, event: "live_speech", sessionId: "session-1", utteranceId: "utterance-1", phase: "interrupted", atMs: 10 });
+
+    expect(speeches).toEqual([]);
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_event_invalid" })]);
+    client.close();
+  });
+
+  it("fails the live session instead of forwarding a state it cannot read", async () => {
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+    await client.start();
+    const states: unknown[] = [];
+    client.on("live_state", (event) => states.push(event));
+
+    // A state this build does not know would be taken as "not failed" and
+    // leave the panel saying the session is fine.
+    transport.respond({ protocolVersion: 1, event: "live_state", sessionId: "session-1", state: "reconnecting" });
+
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_event_invalid" })]);
+    client.close();
+  });
+
+  it("fails the live session instead of forwarding a transcript event with no start or end", async () => {
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+    await client.start();
+    const transcripts: unknown[] = [];
+    const states: unknown[] = [];
+    client.on("live_transcript", (event) => transcripts.push(event));
+    client.on("live_state", (event) => states.push(event));
+
+    transport.respond({ protocolVersion: 1, event: "live_transcript", sessionId: "session-1", segmentId: "segment-1", text: "Hello", isFinal: true, startMs: 10 });
+    transport.respond({ protocolVersion: 1, event: "live_transcript", sessionId: "session-1", segmentId: "segment-2", text: "Hello", isFinal: true, startMs: 10, endMs: Number.NaN });
+
+    expect(transcripts).toEqual([]);
+    expect(states).toEqual([
+      expect.objectContaining({ state: "failed", reason: "live_event_invalid" }),
+      expect.objectContaining({ state: "failed", reason: "live_event_invalid" }),
+    ]);
+    client.close();
+  });
 });

@@ -14,19 +14,25 @@ public struct RecordCommand: Codable, Equatable, Sendable {
     public var includeAudio: Bool
     public var display: DisplayInfo
     public var appVersions: [String: String]
+    public var excludeProcessIds: [Int32]
+    public var live: LiveConfiguration?
 
     public init(
         sessionId: String,
         sessionDirectory: String,
         includeAudio: Bool,
         display: DisplayInfo,
-        appVersions: [String: String] = [:]
+        appVersions: [String: String] = [:],
+        excludeProcessIds: [Int32] = [],
+        live: LiveConfiguration? = nil
     ) {
         self.sessionId = sessionId
         self.sessionDirectory = sessionDirectory
         self.includeAudio = includeAudio
         self.display = display
         self.appVersions = appVersions
+        self.excludeProcessIds = excludeProcessIds
+        self.live = live
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -35,6 +41,8 @@ public struct RecordCommand: Codable, Equatable, Sendable {
         case includeAudio
         case display
         case appVersions
+        case excludeProcessIds
+        case live
     }
 
     public init(from decoder: Decoder) throws {
@@ -44,6 +52,8 @@ public struct RecordCommand: Codable, Equatable, Sendable {
         includeAudio = try container.decodeIfPresent(Bool.self, forKey: .includeAudio) ?? false
         display = try container.decode(DisplayInfo.self, forKey: .display)
         appVersions = try container.decodeIfPresent([String: String].self, forKey: .appVersions) ?? [:]
+        excludeProcessIds = try container.decodeIfPresent([Int32].self, forKey: .excludeProcessIds) ?? []
+        live = try container.decodeIfPresent(LiveConfiguration.self, forKey: .live)
     }
 }
 
@@ -114,10 +124,34 @@ public struct ElementSelector: Codable, Equatable, Sendable {
 public struct ActScreenshotCommand: Codable, Equatable, Sendable {
     public var outputPath: String
     public var displayId: UInt32?
+    public var excludeProcessIds: [Int32]
+    public var createDirectories: Bool
 
-    public init(outputPath: String, displayId: UInt32? = nil) {
+    public init(
+        outputPath: String,
+        displayId: UInt32? = nil,
+        excludeProcessIds: [Int32] = [],
+        createDirectories: Bool = true
+    ) {
         self.outputPath = outputPath
         self.displayId = displayId
+        self.excludeProcessIds = excludeProcessIds
+        self.createDirectories = createDirectories
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case outputPath
+        case displayId
+        case excludeProcessIds
+        case createDirectories
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        outputPath = try container.decode(String.self, forKey: .outputPath)
+        displayId = try container.decodeIfPresent(UInt32.self, forKey: .displayId)
+        excludeProcessIds = try container.decodeIfPresent([Int32].self, forKey: .excludeProcessIds) ?? []
+        createDirectories = try container.decodeIfPresent(Bool.self, forKey: .createDirectories) ?? true
     }
 }
 
@@ -333,6 +367,51 @@ public struct GuardrailsUnsubscribeCommand: Codable, Equatable, Sendable {
     public init() {}
 }
 
+/// Present on `record` when the user asked to talk to Replay during the
+/// recording. The sidecar starts live audio with the capture, or fails both.
+public struct LiveConfiguration: Codable, Equatable, Sendable {
+    /// BCP 47 locale for speech recognition. The system locale when absent.
+    public var locale: String?
+
+    public init(locale: String? = nil) {
+        self.locale = locale
+    }
+}
+
+/// Asks the sidecar to make sure the on-device speech model for `locale` is
+/// installed, without waiting for a first-run download. Valid with or
+/// without a recording active.
+public struct LivePrepareCommand: Codable, Equatable, Sendable {
+    /// BCP 47 locale for speech recognition. The system locale when absent.
+    public var locale: String?
+
+    public init(locale: String? = nil) {
+        self.locale = locale
+    }
+}
+
+public struct LiveSpeakCommand: Codable, Equatable, Sendable {
+    public var utteranceId: String
+    public var text: String
+
+    public init(utteranceId: String, text: String) {
+        self.utteranceId = utteranceId
+        self.text = text
+    }
+}
+
+public struct LiveStopSpeakingCommand: Codable, Equatable, Sendable {
+    public init() {}
+}
+
+public struct LiveSetPausedCommand: Codable, Equatable, Sendable {
+    public var paused: Bool
+
+    public init(paused: Bool) {
+        self.paused = paused
+    }
+}
+
 public enum SidecarCommand: Equatable, Sendable {
     case record(RecordCommand)
     case stop(StopCommand)
@@ -348,6 +427,10 @@ public enum SidecarCommand: Equatable, Sendable {
     case heartbeat(HeartbeatCommand)
     case guardrailsSubscribe(GuardrailsSubscribeCommand)
     case guardrailsUnsubscribe(GuardrailsUnsubscribeCommand)
+    case livePrepare(LivePrepareCommand)
+    case liveSpeak(LiveSpeakCommand)
+    case liveStopSpeaking(LiveStopSpeakingCommand)
+    case liveSetPaused(LiveSetPausedCommand)
 
     fileprivate var name: String {
         switch self {
@@ -365,6 +448,10 @@ public enum SidecarCommand: Equatable, Sendable {
         case .heartbeat: return "heartbeat"
         case .guardrailsSubscribe: return "guardrails_subscribe"
         case .guardrailsUnsubscribe: return "guardrails_unsubscribe"
+        case .livePrepare: return "live_prepare"
+        case .liveSpeak: return "live_speak"
+        case .liveStopSpeaking: return "live_stop_speaking"
+        case .liveSetPaused: return "live_set_paused"
         }
     }
 }
@@ -418,6 +505,11 @@ public struct SidecarCommandEnvelope: Codable, Equatable, Sendable {
             command = .guardrailsSubscribe(try GuardrailsSubscribeCommand(from: payloadDecoder))
         case "guardrails_unsubscribe":
             command = .guardrailsUnsubscribe(try GuardrailsUnsubscribeCommand(from: payloadDecoder))
+        case "live_prepare": command = .livePrepare(try LivePrepareCommand(from: payloadDecoder))
+        case "live_speak": command = .liveSpeak(try LiveSpeakCommand(from: payloadDecoder))
+        case "live_stop_speaking":
+            command = .liveStopSpeaking(try LiveStopSpeakingCommand(from: payloadDecoder))
+        case "live_set_paused": command = .liveSetPaused(try LiveSetPausedCommand(from: payloadDecoder))
         default: throw ProtocolError.unknownCommand(name)
         }
     }
@@ -444,6 +536,10 @@ public struct SidecarCommandEnvelope: Codable, Equatable, Sendable {
         case let .heartbeat(value): try value.encode(to: payloadEncoder)
         case let .guardrailsSubscribe(value): try value.encode(to: payloadEncoder)
         case let .guardrailsUnsubscribe(value): try value.encode(to: payloadEncoder)
+        case let .livePrepare(value): try value.encode(to: payloadEncoder)
+        case let .liveSpeak(value): try value.encode(to: payloadEncoder)
+        case let .liveStopSpeaking(value): try value.encode(to: payloadEncoder)
+        case let .liveSetPaused(value): try value.encode(to: payloadEncoder)
         }
     }
 }
@@ -458,6 +554,12 @@ public enum SidecarResultType: String, Codable, Equatable, Sendable {
     case heartbeat
     case guardrailsSubscribed = "guardrails_subscribed"
     case guardrailsUnsubscribed = "guardrails_unsubscribed"
+    case speechQueued = "speech_queued"
+    case speechStopped = "speech_stopped"
+    case livePaused = "live_paused"
+    case liveResumed = "live_resumed"
+    case livePreparing = "live_preparing"
+    case liveReady = "live_ready"
 }
 
 public enum SidecarRuntimeState: String, Codable, Equatable, Sendable {
@@ -565,6 +667,77 @@ public struct SidecarEventEnvelope: Codable, Equatable, Sendable {
     }
 }
 
+public enum SidecarLiveEventType: String, Codable, Equatable, Sendable {
+    case transcript = "live_transcript"
+    case speech = "live_speech"
+    case state = "live_state"
+}
+
+public enum SidecarLiveSpeechPhase: String, Codable, Equatable, Sendable {
+    case started
+    case finished
+    case cancelled
+}
+
+public enum SidecarLiveState: String, Codable, Equatable, Sendable {
+    case preparingModel = "preparing_model"
+    case listening
+    case paused
+    case failed
+}
+
+/// Unsolicited JSONL message emitted while a live session is running. Like the
+/// safety event envelope it carries no request id, which keeps it unambiguous
+/// from request and response traffic.
+public struct SidecarLiveEventEnvelope: Codable, Equatable, Sendable {
+    public var protocolVersion: Int
+    public var event: SidecarLiveEventType
+    public var sessionId: String
+    public var segmentId: String?
+    public var text: String?
+    public var isFinal: Bool?
+    public var startMs: Double?
+    public var endMs: Double?
+    public var utteranceId: String?
+    public var phase: SidecarLiveSpeechPhase?
+    public var state: SidecarLiveState?
+    public var reason: String?
+    /// For a `speech` event, the capture-relative milliseconds at which its
+    /// `phase` happened, on the same clock and conversion as `startMs`/
+    /// `endMs`. Nil for transcript and state events.
+    public var atMs: Double?
+
+    public init(
+        protocolVersion: Int = replayCaptureProtocolVersion,
+        event: SidecarLiveEventType,
+        sessionId: String,
+        segmentId: String? = nil,
+        text: String? = nil,
+        isFinal: Bool? = nil,
+        startMs: Double? = nil,
+        endMs: Double? = nil,
+        utteranceId: String? = nil,
+        phase: SidecarLiveSpeechPhase? = nil,
+        state: SidecarLiveState? = nil,
+        reason: String? = nil,
+        atMs: Double? = nil
+    ) {
+        self.protocolVersion = protocolVersion
+        self.event = event
+        self.sessionId = sessionId
+        self.segmentId = segmentId
+        self.text = text
+        self.isFinal = isFinal
+        self.startMs = startMs
+        self.endMs = endMs
+        self.utteranceId = utteranceId
+        self.phase = phase
+        self.state = state
+        self.reason = reason
+        self.atMs = atMs
+    }
+}
+
 public enum SidecarErrorCode: String, Codable, Equatable, Sendable {
     case invalidCommand = "invalid_command"
     case invalidState = "invalid_state"
@@ -575,6 +748,7 @@ public enum SidecarErrorCode: String, Codable, Equatable, Sendable {
     case captureFailed = "capture_failed"
     case ioFailed = "io_failed"
     case internalError = "internal_error"
+    case unsupported
 }
 
 public struct SidecarResponseError: Codable, Equatable, Sendable {

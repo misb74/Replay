@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { access } from "node:fs/promises";
 
 export interface SidecarResult {
-  type: "recording_started" | "recording_stopped" | "status" | "permissions" | "screenshot" | "action_completed" | "heartbeat" | "guardrails_subscribed" | "guardrails_unsubscribed";
+  type: "recording_started" | "recording_stopped" | "status" | "permissions" | "screenshot" | "action_completed" | "heartbeat" | "guardrails_subscribed" | "guardrails_unsubscribed" | "speech_queued" | "speech_stopped" | "live_paused" | "live_resumed" | "live_preparing" | "live_ready";
   state?: "idle" | "recording";
   sessionId?: string;
   eventCount?: number;
@@ -30,6 +30,35 @@ export interface SidecarEvent {
   event: "user_activity" | "kill_switch";
   timestampMs?: number;
   position?: { x: number; y: number };
+}
+
+export interface SidecarLiveTranscriptEvent {
+  protocolVersion: number;
+  event: "live_transcript";
+  sessionId: string;
+  segmentId: string;
+  text: string;
+  isFinal: boolean;
+  startMs: number;
+  endMs: number;
+}
+
+export interface SidecarLiveSpeechEvent {
+  protocolVersion: number;
+  event: "live_speech";
+  sessionId: string;
+  utteranceId: string;
+  phase: "started" | "finished" | "cancelled";
+  /** When the phase happened, in capture-relative milliseconds, on the clock of a transcript's `startMs` and `endMs`. */
+  atMs: number;
+}
+
+export interface SidecarLiveStateEvent {
+  protocolVersion: number;
+  event: "live_state";
+  sessionId: string;
+  state: "preparing_model" | "listening" | "paused" | "failed";
+  reason?: string;
 }
 
 interface PendingRequest {
@@ -131,7 +160,7 @@ export class SidecarClient {
     return result;
   }
 
-  on(event: "user_activity" | "kill_switch" | "exit", listener: (...arguments_: unknown[]) => void): () => void {
+  on(event: "user_activity" | "kill_switch" | "exit" | "live_transcript" | "live_speech" | "live_state", listener: (...arguments_: unknown[]) => void): () => void {
     this.#events.on(event, listener);
     return () => this.#events.off(event, listener);
   }
@@ -155,6 +184,25 @@ export class SidecarClient {
     if (value.event === "user_activity" || value.event === "user_mouse_moved" || value.event === "kill_switch") {
       const event = value.event === "user_mouse_moved" ? "user_activity" : value.event;
       this.#events.emit(event, { ...value, event } as unknown as SidecarEvent);
+      return;
+    }
+    if (value.event === "live_transcript" || value.event === "live_speech" || value.event === "live_state") {
+      if (!isUsableLiveEvent(value)) {
+        // A line this build cannot read would not fail loudly: it would be
+        // read as a missing time, an unstarted sentence, or a session that is
+        // fine — each of which quietly weakens the guard that keeps the tutor
+        // from answering itself. The live session fails visibly instead of
+        // running on half-safe.
+        this.#events.emit("live_state", {
+          protocolVersion: 1,
+          event: "live_state",
+          sessionId: typeof value.sessionId === "string" ? value.sessionId : "",
+          state: "failed",
+          reason: "live_event_invalid",
+        } satisfies SidecarLiveStateEvent);
+        return;
+      }
+      this.#events.emit(value.event, value as unknown as SidecarLiveTranscriptEvent | SidecarLiveSpeechEvent | SidecarLiveStateEvent);
       return;
     }
     if (typeof value.requestId !== "string" || typeof value.ok !== "boolean") return;
@@ -276,4 +324,29 @@ function childProcessTransport(child: ChildProcessWithoutNullStreams): SidecarTr
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether a live event says something this build can act on: a transcript's
+ * capture-relative `startMs` and `endMs`, a speech report's `atMs` and one of
+ * the three phases, and one of the four states.
+ *
+ * The times are how the conversation tells the tutor's own voice from the
+ * user's. The phase is read the same way, and anything that is not `started`
+ * closes the stretch the tutor could be heard in and marks a sentence
+ * complete that no transcript segment was ever written for. A state this
+ * build does not know would be read as "not failed", leaving the panel saying
+ * the session is fine while it is not.
+ */
+function isUsableLiveEvent(value: Record<string, unknown>): boolean {
+  if (value.event === "live_transcript") return isFiniteNumber(value.startMs) && isFiniteNumber(value.endMs);
+  if (value.event === "live_speech") {
+    return isFiniteNumber(value.atMs)
+      && (value.phase === "started" || value.phase === "finished" || value.phase === "cancelled");
+  }
+  return value.state === "preparing_model" || value.state === "listening" || value.state === "paused" || value.state === "failed";
+}
+
+function isFiniteNumber(value: unknown): boolean {
+  return typeof value === "number" && Number.isFinite(value);
 }

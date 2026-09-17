@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   BranchPathView,
   CompileResultView,
+  LiveAvailability,
+  LiveTranscriptSegmentView,
+  LiveUpdate,
   PermissionName,
   PermissionStatus,
   ProcessingUpdate,
@@ -14,6 +17,7 @@ import type {
   StepView,
   WorkflowView,
 } from "../shared/contracts.js";
+import { liveStatusLabel, recordControlState } from "./live-state.js";
 import { createMockApi } from "./mock-api.js";
 import { activeRecording, buildableRecording, latestUnprocessedRecording } from "./recording-state.js";
 import { editWorkflow, isWorkflowReviewValid, type WorkflowEdit } from "./workflow-state.js";
@@ -47,12 +51,21 @@ export function App() {
   const [captured, setCaptured] = useState<SessionSummary>();
   const [processing, setProcessing] = useState<ProcessingUpdate>();
   const [run, setRun] = useState<RunUpdate>();
+  const [liveAvailability, setLiveAvailability] = useState<LiveAvailability>({ available: false });
+  const [liveUpdate, setLiveUpdate] = useState<LiveUpdate>();
   const [error, setError] = useState<string>();
   const [loaded, setLoaded] = useState(false);
   const dismissedSessions = useRef(new Set<string>());
   const recording = activeRecording(sessions);
 
   const refresh = useCallback(async () => {
+    // Of the three availability checks, the microphone permission is the one
+    // that can plausibly change without a relaunch — granted mid-session
+    // through the same System Settings flow that re-polls `permissions`
+    // below. Fetched alongside it, with its own silent catch kept exactly as
+    // it was: an availability check failing is not worth an error banner
+    // over, unlike a failure to load permissions, workflows or sessions.
+    void api.getLiveAvailability().then(setLiveAvailability).catch(() => undefined);
     try {
       const [nextPermissions, nextWorkflows, nextSessions] = await Promise.all([api.getPermissions(), api.listWorkflows(), api.listSessions()]);
       setPermissions(nextPermissions);
@@ -72,9 +85,11 @@ export function App() {
     }
   }, [api]);
 
+  // Fetches live availability too, so mount is covered without a second effect.
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => api.onProcessingUpdate(setProcessing), [api]);
   useEffect(() => api.onRunUpdate(setRun), [api]);
+  useEffect(() => api.onLiveUpdate(setLiveUpdate), [api]);
 
   const receiveWorkflow = useCallback((workflow: WorkflowView) => {
     setSelected(workflow);
@@ -89,7 +104,7 @@ export function App() {
     return <PermissionSetup api={api} permissions={permissions} error={error} onRefresh={refresh} />;
   }
 
-  async function toggleRecording(microphone: boolean) {
+  async function toggleRecording(microphone: boolean, live: boolean) {
     try {
       setError(undefined);
       if (recording?.state === "recording") {
@@ -100,11 +115,15 @@ export function App() {
           setError("The recording was interrupted before it finished, so Replay will not offer it for building. Please make a new recording.");
         }
       } else {
-        const started = await api.startRecording({ microphone });
+        setLiveUpdate(undefined);
+        const started = await api.startRecording({ microphone: microphone || live, live });
         setSessions((items) => [started, ...items.filter((item) => item.id !== started.id)]);
       }
     } catch (cause) {
       setError(messageOf(cause));
+      // A start that never reached a recording leaves no live conversation
+      // behind, so its "preparing" note must not linger on the card.
+      if (recording?.state !== "recording") setLiveUpdate(undefined);
       try {
         setSessions(await api.listSessions());
       } catch {
@@ -160,6 +179,8 @@ export function App() {
         workflows={workflows}
         selectedId={selected?.id}
         recording={recording}
+        liveAvailability={liveAvailability}
+        liveUpdate={liveUpdate}
         onSelect={(workflow) => setSelected(workflow)}
         onRecord={toggleRecording}
       />
@@ -180,7 +201,7 @@ export function App() {
               onRunChange={setRun}
               onWorkflowRefresh={receiveWorkflow}
             />
-          : <EmptyWorkspace onRecord={() => void toggleRecording(true)} />}
+          : <EmptyWorkspace onRecord={() => void toggleRecording(true, false)} />}
       </main>
     </div>
   );
@@ -190,22 +211,50 @@ function Sidebar(props: {
   workflows: WorkflowView[];
   selectedId: string | undefined;
   recording: SessionSummary | undefined;
+  liveAvailability: LiveAvailability;
+  liveUpdate: LiveUpdate | undefined;
   onSelect: (workflow: WorkflowView) => void;
-  onRecord: (microphone: boolean) => Promise<void>;
+  onRecord: (microphone: boolean, live: boolean) => Promise<void>;
 }) {
   const [microphone, setMicrophone] = useState(false);
+  const [live, setLive] = useState(false);
+  const controls = recordControlState(props.liveAvailability, live);
   const isRecording = props.recording?.state === "recording";
+  const liveStatus = liveStatusLabel(props.liveUpdate, props.recording?.id);
   return (
     <aside className="sidebar">
       <div className="app-brand"><BrandLockup /></div>
       <section className={`record-card ${isRecording ? "active" : ""}`}>
-        <button className="record-button" onClick={() => void props.onRecord(microphone)}>
+        <button className="record-button" onClick={() => void props.onRecord(microphone, live)}>
           <span className="record-dot" />
           {isRecording ? "Stop recording" : "Record a workflow"}
         </button>
         {isRecording
           ? <RecordingClock startedAt={props.recording!.startedAt} />
-          : <label className="mic-toggle"><input type="checkbox" checked={microphone} onChange={(event) => setMicrophone(event.target.checked)} /><span>Include narration</span></label>}
+          : <>
+              <label className="mic-toggle">
+                <input
+                  type="checkbox"
+                  checked={microphone || controls.narrationLocked}
+                  disabled={controls.narrationLocked}
+                  onChange={(event) => setMicrophone(event.target.checked)}
+                />
+                <span>Include narration</span>
+              </label>
+              <label className="mic-toggle">
+                <input
+                  type="checkbox"
+                  checked={live}
+                  disabled={!controls.liveEnabled}
+                  aria-describedby={controls.note ? "live-availability-note" : undefined}
+                  onChange={(event) => setLive(event.target.checked)}
+                />
+                <span>Talk to Replay while recording</span>
+              </label>
+              {controls.note ? <small className="live-note" id="live-availability-note">{controls.note}</small> : undefined}
+            </>}
+        {/* Also shown before the recording exists, while the speech model is prepared. */}
+        {liveStatus ? <div className="live-status">{liveStatus}</div> : undefined}
       </section>
       <nav className="workflow-nav" aria-label="Workflows">
         <div className="nav-heading"><span>Workflows</span><span className="count">{props.workflows.length}</span></div>
@@ -242,6 +291,7 @@ function ReviewWorkspace(props: {
   const [exportOpen, setExportOpen] = useState(false);
   const [runOpen, setRunOpen] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [conversation, setConversation] = useState<LiveTranscriptSegmentView[]>([]);
   const dirty = JSON.stringify(draft) !== JSON.stringify(props.workflow);
   const lowConfidence = draft.steps.flatMap((step) => step.decisions).filter((decision) => decision.confidence === "low").length;
   const reviewValid = isWorkflowReviewValid(draft);
@@ -255,11 +305,26 @@ function ReviewWorkspace(props: {
     refreshHistory();
     void props.api.getWorkflow(props.workflow.id).then(props.onWorkflowRefresh).catch(() => undefined);
   }, [props.run?.status, props.api, props.workflow.id, props.onWorkflowRefresh, refreshHistory]);
+  useEffect(() => {
+    const sessionId = props.workflow.sessionId;
+    if (!sessionId) { setConversation([]); return; }
+    // A newer effect run's cleanup marks this one stale before the next fetch
+    // starts, so a slow response for a session the operator has since left
+    // can never overwrite the conversation that's on screen now.
+    let stale = false;
+    void props.api.getLiveTranscript(sessionId)
+      .then((segments) => { if (!stale) setConversation(segments); })
+      .catch(() => { if (!stale) setConversation([]); });
+    return () => { stale = true; };
+  }, [props.api, props.workflow.sessionId]);
 
   function apply(edit: WorkflowEdit) { setDraft((workflow) => editWorkflow(workflow, edit)); }
+  function seekVideo(seconds: number) {
+    if (videoRef.current) videoRef.current.currentTime = seconds;
+  }
   function selectStep(step: StepView) {
     setSelectedStepId(step.id);
-    if (videoRef.current) videoRef.current.currentTime = step.time.startMs / 1_000;
+    seekVideo(step.time.startMs / 1_000);
   }
   function followVideo() {
     const timeMs = (videoRef.current?.currentTime ?? 0) * 1_000;
@@ -319,6 +384,18 @@ function ReviewWorkspace(props: {
           </div>
           <Timeline steps={draft.steps} selectedId={selectedStepId} onSelect={selectStep} />
           <div className="evidence-note"><span>⌁</span><p><strong>Every step stays linked to evidence.</strong><br />Select a step to jump to the moment it came from.</p>{runEvidenceUrl && <button onClick={() => setRunEvidenceUrl(undefined)}>Back to recording</button>}</div>
+          {conversation.length > 0
+            ? <section className="live-conversation" aria-label="Live conversation">
+                <h3>Conversation</h3>
+                {conversation.map((segment) => (
+                  <button key={segment.id} className={`live-line ${segment.speaker ?? "user"}`} onClick={() => seekVideo(segment.startMs / 1_000)}>
+                    <span className="live-line-time">{formatTime(segment.startMs)}</span>
+                    <span className="live-line-who">{segment.speaker === "assistant" ? "Replay" : "You"}</span>
+                    <span className="live-line-text">{segment.text}</span>
+                  </button>
+                ))}
+              </section>
+            : undefined}
         </div>
         <div className="editor-pane">
           <div className="tabs" role="tablist">

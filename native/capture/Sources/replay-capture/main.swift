@@ -20,6 +20,10 @@ struct ReplayCaptureMain {
             safetyInterlock: safetyInterlock,
             safetyEventSink: { event in
                 await output.write(event)
+            },
+            liveAudio: makeLiveAudioProvider(),
+            liveEventSink: { event in
+                await output.write(event)
             }
         )
 

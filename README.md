@@ -79,7 +79,7 @@ The film is a deterministic HTML timeline with an original, locally synthesised 
 
 **Requirements**
 
-- macOS 14 or newer
+- macOS 14 or newer (macOS 26 for the live tutor; everything else keeps the macOS 14 floor)
 - Node.js `^22.12.0 || ^24.0.0 || >=26.0.0` and npm
 - Swift 6
 - Screen Recording, Accessibility, and Input Monitoring permission for real capture; Microphone permission only when narration is enabled
@@ -118,6 +118,8 @@ cp .env.example .env   # set ANTHROPIC_API_KEY
 
 **What can reach the model, and only after you press Build or Run.** Redacted condensed actions, narration text, the frame plan, selected full-screen frames, and workflow context. During a run, fresh screenshots and step text are sent for verification, decisions, re-grounding, or a bounded action proposal. Selected frames and run screenshots are ordinary screenshots and are **not** visually redacted. The [privacy boundary](docs/architecture.md#privacy-boundary) documents exactly what crosses in each direction.
 
+**While the live tutor is on.** Ticking "Talk to Replay while recording" starts a spoken conversation with Claude during the recording. Your speech is recognised on your Mac and never uploaded as audio. When you finish speaking, and when the tutor decides to ask about something you just did, Replay sends a screenshot of the recorded display, your words as text, the last few redacted action lines, and the recent conversation. Replay's own windows, including the tutor panel, are excluded from the recording and from those screenshots. The tutor can look and talk; it can never click, type, or navigate. Pause stops it sending anything, and narration keeps recording. Requires macOS 26 and an `ANTHROPIC_API_KEY`. The [privacy boundary](docs/architecture.md#privacy-boundary) table covers Live too.
+
 **Guardrails during a run**
 
 <img src="docs/media/replay-run-modes.png" alt="The Run this workflow dialog: an invoice_number input, with Test run selected, Supervised available, and Autonomous disabled until a clean test run passes." width="420" align="right">
@@ -136,6 +138,15 @@ cp .env.example .env   # set ANTHROPIC_API_KEY
 Transcription is local and pluggable. Set `REPLAY_TRANSCRIBE_COMMAND` to an absolute executable that accepts `--input <audio.m4a> --output-json -` and returns the timestamped transcript shape in [`packages/fixtures/recordings/invoice-match/transcript.json`](packages/fixtures/recordings/invoice-match/transcript.json). A pre-generated `transcript.json` beside a session is also accepted. Without either, non-narrated recordings work normally, and narrated recordings are stored until a transcriber is configured.
 
 On Apple Silicon, [`scripts/transcribe-whisper.mjs`](scripts/transcribe-whisper.mjs) is the included offline adapter. It defaults to Homebrew paths for `ffmpeg`, `whisper-cli`, and the whisper.cpp base model, and [`.env.example`](.env.example) documents the overrides. The adapter suppresses tool output, uses owner-only files, and removes temporary transcription data after success, failure, or cancellation.
+
+</details>
+
+<details>
+<summary><b>The live tutor</b></summary>
+
+<br>
+
+The first time you tick the box, Replay prepares Apple's on-device speech model before the recording starts; the record card shows "Preparing speech model" while it downloads, so a first run never blocks or interrupts a recording already under way. By default the tutor stops listening while it's speaking and for a moment afterwards, since echo cancellation on real hardware is still unverified — press Pause to interrupt it rather than talking over it. `REPLAY_LIVE_FULL_DUPLEX=1` lets you talk over it instead, but treat it as experimental until that's confirmed. A change to your Mac's audio hardware's channel count or sample rate — connecting a Bluetooth headset, say, or switching to an input device running at a different rate — ends the live conversation; the panel says why, and the recording carries on. Plugging in ordinary wired headphones may not be enough to trigger it, so don't rely on that alone to stop the tutor listening — use Pause or End Live instead. The conversation is saved beside the recording as `transcript.json`, which Build reads instead of transcribing the audio.
 
 </details>
 

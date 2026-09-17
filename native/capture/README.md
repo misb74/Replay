@@ -32,16 +32,17 @@ typed `result` or a safe error. Commands are:
   `act_drag`, and `act_navigate`
 - `heartbeat`
 - `guardrails_subscribe` and `guardrails_unsubscribe`
+- `live_prepare`, `live_speak`, `live_stop_speaking`, and `live_set_paused`
 
 The canonical payload fields are:
 
 | Command | Payload |
 | --- | --- |
-| `record` | `sessionId`, `sessionDirectory`, `display`; optional `includeAudio`, `appVersions` |
+| `record` | `sessionId`, `sessionDirectory`, `display`; optional `includeAudio`, `appVersions`, `excludeProcessIds`, `live` |
 | `stop` | optional `sessionId` |
 | `status` | empty object |
 | `permissions` | `operation`; `permission` for `request` or `open_settings` |
-| `act_screenshot` | `outputPath`; optional `displayId` |
+| `act_screenshot` | `outputPath`; optional `displayId`, `excludeProcessIds`, `createDirectories` |
 | `act_click` | `position` and/or semantic `target`; optional `button`, `clickCount` |
 | `act_type` | `text`; optional semantic `target` |
 | `act_key` | macOS virtual `keyCode`; optional `modifiers`, `repeatCount` |
@@ -51,17 +52,54 @@ The canonical payload fields are:
 | `heartbeat` | optional `nonce` |
 | `guardrails_subscribe` | optional `killSwitch`, `mouseMovementThreshold` |
 | `guardrails_unsubscribe` | empty object |
+| `live_prepare` | optional BCP 47 `locale` |
+| `live_speak` | `utteranceId`, `text` |
+| `live_stop_speaking` | empty object |
+| `live_set_paused` | `paused` |
 
 Points use the macOS global display coordinate space. Modifier names are
 `command`, `control`, `option`, `shift`, `caps_lock`, and `function`.
 
-After a guardrail subscription, the sidecar may emit messages without a
-request ID:
+`excludeProcessIds` names processes whose windows must not be captured, so
+Replay's own windows stay out of the recording and out of its screenshots.
+`record`'s `live` object, with an optional `locale`, asks for a live tutor
+session alongside the recording; it requires `includeAudio`, and it is
+refused with `unsupported` on a system without on-device streaming speech.
+
+A successful `result` carries a `type`, one of:
+
+`recording_started`, `recording_stopped`, `status`, `permissions`,
+`screenshot`, `action_completed`, `heartbeat`, `guardrails_subscribed`,
+`guardrails_unsubscribed`, `speech_queued`, `speech_stopped`, `live_paused`,
+`live_resumed`, `live_preparing`, and `live_ready`.
+
+An error `code` is one of `invalid_command`, `invalid_state`,
+`permission_denied`, `secure_field_requires_human_input`,
+`safety_interlock_engaged`, `target_not_found`, `capture_failed`,
+`io_failed`, `internal_error`, and `unsupported`.
+
+The sidecar also emits messages that answer no request, and so carry no
+request ID. A guardrail subscription produces these:
 
 ```json
 {"protocolVersion":1,"event":"kill_switch","timestampMs":1200}
 {"protocolVersion":1,"event":"user_mouse_moved","timestampMs":1250,"position":{"x":640,"y":480}}
 ```
+
+A live session produces these, until it is stopped:
+
+```json
+{"protocolVersion":1,"event":"live_transcript","sessionId":"s1","segmentId":"segment-1","text":"open the invoice","isFinal":false,"startMs":2500,"endMs":4000}
+{"protocolVersion":1,"event":"live_speech","sessionId":"s1","utteranceId":"u1","phase":"started","atMs":4200}
+{"protocolVersion":1,"event":"live_state","sessionId":"s1","state":"listening"}
+```
+
+A `live_speech` `phase` is `started`, `finished`, or `cancelled`, and every
+one carries `atMs`, the moment that phase was decided. A `live_state` `state`
+is `preparing_model`, `listening`, `paused`, or `failed`, and a `failed`
+carries a `reason`. All of these times, like a transcript's `startMs` and
+`endMs`, are milliseconds from the capture origin — the same clock
+`events.jsonl` uses.
 
 The protocol default emergency shortcut is Control-Option-Command-Escape; the
 Replay desktop host explicitly configures Command-Shift-Escape to match its
@@ -119,3 +157,61 @@ Before shipping a signed app bundle, manually verify on a clean macOS account:
 
 These checks require real TCC grants and cannot be made reliable in a headless
 unit-test process.
+
+### Live tutor (macOS 26 or newer)
+
+Run these on a clean account before distributing a signed build. None of
+them can be automated, because the suite has no microphone.
+
+- [ ] Echo: with Live on, speak, let the tutor reply, and confirm its own
+      words never appear in `transcript.json`.
+- [ ] Barge-in: speak while the tutor is speaking; it stops within about a
+      second and the transcript keeps only what was actually said.
+- [ ] Pause and resume: on pause, transcripts and speech both stop while
+      `audio.m4a` keeps growing; on resume, the panel says it is listening
+      again and a new sentence is transcribed.
+- [ ] Stop: the session finalises and `audio.m4a` plays back.
+- [ ] Stop mid-sentence: press Stop while the tutor is speaking. The
+      session still finalises, the panel closes, and `transcript.json`
+      keeps only the utterances that reached `finished` — the one that was
+      cut off is not in it.
+- [ ] Narration still lines up: for a live recording, play `video.mp4` and
+      `audio.m4a` together and confirm speech lands where it was spoken,
+      then run `scripts/transcribe-whisper.mjs` over `audio.m4a` and
+      confirm it still produces segments. A live recording writes that file
+      through the live audio tap rather than the recorder's own
+      `AVAudioRecorder`, and Build falls back to transcribing it whenever
+      `transcript.json` is absent.
+- [ ] Exclusion: with Live on, record a few seconds, then click Pause and
+      End Live on the panel itself. Confirm `video.mp4` shows neither the
+      panel nor the main window, that `events.jsonl` contains no click at
+      the panel's coordinates, and that clicking back into the recorded
+      application afterwards produces no `app_switch`. Nothing automated
+      covers this end to end, and it fails open: if exclusion silently
+      stopped working, every recording would quietly include Replay.
+- [ ] Audio failure: while recording with Live on, change the audio
+      hardware's format — connect a Bluetooth headset, or switch the input
+      device in Sound settings to one running at a different sample rate.
+      It has to be a change of channel count or sample rate: that is what
+      `AVAudioEngineConfigurationChange` is posted for. Plugging in
+      analogue headphones may or may not qualify, depending on the Mac and
+      on what the device reports, so use a Bluetooth headset or an input
+      device at a different rate to be sure of triggering it. The panel
+      stops saying it is listening and shows the failure with the reason
+      `audio_route_changed`. **Time that delay and write it down**: the
+      failure is only sent after the whole engine is torn down, including
+      finalising the analyser's stream, and nobody has measured how long
+      that takes. The recording itself
+      carries on — the timer keeps running, `video.mp4` is unaffected, and
+      `audio.m4a` simply ends early. The tutor does not come back on its
+      own; stopping and starting again is what restarts it.
+- [ ] First run: the speech model downloads and the panel shows
+      "Preparing speech model" while it does.
+- [ ] macOS 15: the "Talk to Replay while recording" checkbox is disabled
+      and explains that it needs macOS 26.
+
+Known and deferred, so not a new bug if it shows up: the panel's "hearing"
+line can keep a stale partial. When the recogniser revokes a volatile
+result it sends an empty string, which is forwarded as an ordinary
+transcript event rather than as a revocation, so the last non-empty partial
+stays on screen.

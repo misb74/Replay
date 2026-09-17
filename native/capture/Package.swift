@@ -44,7 +44,8 @@ let package = Package(
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreGraphics"),
-                .linkedFramework("ScreenCaptureKit")
+                .linkedFramework("ScreenCaptureKit"),
+                .linkedFramework("Speech")
             ]
         ),
         .executableTarget(
