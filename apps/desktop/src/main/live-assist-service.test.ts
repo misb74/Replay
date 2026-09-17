@@ -1476,9 +1476,14 @@ describe("when the tutor may speak first", () => {
   });
 
   it("checks each committed action at most once", async () => {
+    const log = actionLog();
     const { transport, checks } = checkingTransport(() => ({ ask: false }));
-    const harness = await makeHarness({ transport, events: eventLog([committedClick]) });
+    const harness = await makeHarness({ transport, events: log.events });
 
+    // Checked at forty-five seconds, and still under a minute old at the next
+    // chance, at sixty-five.
+    await harness.at(10_000);
+    log.act(committedClick);
     await harness.at(120_000);
 
     expect(checks.map((check) => check.trigger)).toEqual([committedClick.description]);
