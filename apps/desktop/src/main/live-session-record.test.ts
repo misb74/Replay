@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertValidTranscript, type TimestampedTranscript } from "@replay/pipeline";
@@ -127,17 +127,6 @@ describe("LiveSessionRecord transcript", () => {
     ]);
   });
 
-  it("sweeps the temporary files a crash left behind, and nothing else", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "replay-live-record-"));
-    await writeFile(join(directory, `transcript.json.${randomUUID()}.tmp`), "half a fi");
-    await writeFile(join(directory, "transcript.json"), '{"version":1,"segments":[]}\n');
-    await writeFile(join(directory, "notes.tmp"), "not ours");
-
-    const record = new LiveSessionRecord({ directory, startedAt: 0, now: () => 0 });
-    await record.flush();
-
-    expect((await readdir(directory)).sort()).toEqual(["notes.tmp", "transcript.json"]);
-  });
 });
 
 describe("LiveSessionRecord log", () => {

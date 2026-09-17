@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { appendFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { TimestampedTranscript, TranscriptSegment } from "@replay/pipeline";
 
 /** One segment of `transcript.json`: what one side said, on the capture clock. */
 export interface LiveSegment extends TranscriptSegment {
-  /** What Task 19's prompts read to tell the two sides apart. */
+  /** Which side said it, which is how the prompts built from this transcript tell them apart. */
   speaker: "user" | "assistant";
 }
 
@@ -23,17 +23,16 @@ const TRANSCRIPT_FILE = "transcript.json";
 
 const LOG_FILE = "live.jsonl";
 
-/** A file `#persist` wrote but never renamed, which only a crash leaves behind. */
-const TEMPORARY_FILE = /^transcript\.json\.[0-9a-f-]{36}\.tmp$/u;
-
 /**
- * What one live session leaves in its session directory (spec §5.6), and the
- * only thing that writes there.
+ * What one live session leaves in its session directory (spec §5.6, in
+ * `docs/design/live-tutor.md`), and the only thing that writes there.
  *
  * `transcript.json` is what Build reads: each change rewrites it whole and
  * renames it into place, so a crash mid-write leaves the last complete file
- * rather than a truncated one, and a crash between the two leaves a temporary
- * file that the next session sweeps. Build refuses a recording whose
+ * rather than a truncated one. A crash between the write and the rename
+ * leaves a `transcript.json.<uuid>.tmp` beside it, which nothing sweeps: the
+ * transcript itself is whole, every session directory is new, and no later
+ * session ever opens that one again. Build refuses a recording whose
  * transcript it cannot read, so every rule that keeps the file valid lives
  * here rather than with each caller: a segment with no words, or whose start
  * is not a usable time, is not recorded at all; a start before the capture
@@ -62,9 +61,6 @@ export class LiveSessionRecord {
 
   constructor(options: LiveSessionRecordOptions) {
     this.#options = { now: () => Date.now(), ...options };
-    // Queued ahead of this session's own writes, so it can only ever remove a
-    // temporary file some earlier session left behind.
-    this.#queueWrite(() => this.#sweep());
   }
 
   /**
@@ -135,13 +131,6 @@ export class LiveSessionRecord {
       await writeFile(temporary, body, { encoding: "utf8", mode: 0o600 });
       await rename(temporary, path);
     });
-  }
-
-  async #sweep(): Promise<void> {
-    const names = await readdir(this.#options.directory);
-    await Promise.all(names
-      .filter((name) => TEMPORARY_FILE.test(name))
-      .map((name) => unlink(join(this.#options.directory, name)).catch(() => undefined)));
   }
 
   #queueWrite(write: () => Promise<void>): void {

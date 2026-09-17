@@ -62,7 +62,7 @@ interface Harness {
 }
 
 /** A sidecar command whose reply a test can hold back, to act while the service awaits it. */
-type HeldCommand = "screenshot" | "speak" | "setPaused";
+type HeldCommand = "screenshot" | "speak" | "setPaused" | "stopSpeaking";
 
 class FakeSidecar implements LiveSidecar {
   spoken: Array<{ utteranceId: string; text: string }> = [];
@@ -119,23 +119,26 @@ class FakeSidecar implements LiveSidecar {
   async stopSpeaking() {
     this.stopSpeakingCount += 1;
     this.commands.push("stopSpeaking");
+    await this.#reply("stopSpeaking");
   }
   async setPaused(paused: boolean) {
     this.paused.push(paused);
     this.commands.push(`setPaused ${paused}`);
     await this.#reply("setPaused");
   }
+  // Each listener is really removed when the service detaches, so a service
+  // that forgot to detach would go on hearing the sidecar here too.
   onTranscript(listener: (event: LiveTranscriptSignal) => void) {
     this.transcriptListeners.push(listener);
-    return () => {};
+    return () => { this.transcriptListeners = this.transcriptListeners.filter((item) => item !== listener); };
   }
   onSpeech(listener: (event: LiveSpeechSignal) => void) {
     this.speechListeners.push(listener);
-    return () => {};
+    return () => { this.speechListeners = this.speechListeners.filter((item) => item !== listener); };
   }
   onState(listener: (event: LiveStateSignal) => void) {
     this.stateListeners.push(listener);
-    return () => {};
+    return () => { this.stateListeners = this.stateListeners.filter((item) => item !== listener); };
   }
 
   async #reply(command: HeldCommand) {
@@ -232,7 +235,6 @@ async function makeHarness(overrides: HarnessOverrides = {}): Promise<Harness> {
     },
   });
   await service.start();
-  let segment = 0;
   return {
     service,
     sidecar,
@@ -240,11 +242,8 @@ async function makeHarness(overrides: HarnessOverrides = {}): Promise<Harness> {
     directory,
     removedImages,
     emitTranscript(text, isFinal, audio) {
-      segment += 1;
       const { startMs, endMs } = audio ?? { startMs: captureNow(), endMs: captureNow() };
-      for (const listener of sidecar.transcriptListeners) {
-        listener({ segmentId: `segment-${segment}`, text, isFinal, startMs, endMs });
-      }
+      for (const listener of sidecar.transcriptListeners) listener({ text, isFinal, startMs, endMs });
     },
     finishUtterances(atMs = captureNow()) {
       for (const { utteranceId } of sidecar.spoken) {
@@ -412,38 +411,23 @@ function actionLog() {
 }
 
 const committedClick: ObservedAction = {
-  kind: "click",
   description: 'clicked "Flag for follow-up" in Northstar Ledger',
-  timestampMs: 1_000,
   committed: true,
-  role: "AXButton",
 };
 
 /** Clicks on rows `from` to `to`, oldest first. */
 function rowClicks(from: number, to: number): ObservedAction[] {
   return Array.from({ length: to - from + 1 }, (_, offset) => ({
-    kind: "click",
     description: `clicked "Row ${from + offset}" in Northstar Ledger`,
-    timestampMs: (from + offset) * 1_000,
     committed: false,
   }));
 }
 
-const typing: ObservedAction = {
-  kind: "key",
-  description: "key",
-  timestampMs: 1_000,
-  committed: false,
-};
+const typing: ObservedAction = { description: "typed", committed: false };
 
 /** One scroll gesture, which the input monitor reports once per scroll-wheel event. */
 function scrolls(times: number): ObservedAction[] {
-  return Array.from({ length: times }, (_, index) => ({
-    kind: "scroll",
-    description: "scrolled in Northstar Ledger",
-    timestampMs: 2_000 + index * 16,
-    committed: false,
-  }));
+  return Array.from({ length: times }, () => ({ description: "scrolled in Northstar Ledger", committed: false }));
 }
 
 beforeEach(() => { vi.useFakeTimers(); });
@@ -623,6 +607,23 @@ describe("LiveAssistService turns", () => {
     expect(spokenTexts(harness)).toEqual(["I can't help with that one."]);
   });
 
+  it("says the plain line after whatever the model had already said before it refused", async () => {
+    const harness = await makeHarness({
+      transport: transportYielding([
+        { kind: "text", text: "The first two match. The password on screen is" },
+        { kind: "refusal" },
+      ]),
+    });
+
+    harness.emitTranscript("Read me that password.", true);
+    await vi.advanceTimersByTimeAsync(700);
+
+    // The transport reports the refusal only once the stream has drained, so
+    // a sentence that was already complete has been said; only the tail the
+    // refusal cut off is dropped.
+    expect(spokenTexts(harness)).toEqual(["The first two match.", "I can't help with that one."]);
+  });
+
   it("goes back to listening when the sidecar cannot queue a sentence", async () => {
     const harness = await makeHarness({ transport: transportYielding([{ kind: "text", text: "Answer." }]) });
     harness.sidecar.speak = async () => { throw new Error("The capture sidecar did not answer."); };
@@ -742,6 +743,33 @@ describe("LiveAssistService screenshots", () => {
     await harness.service.end();
 
     expect(existsSync(directory)).toBe(false);
+  });
+
+  it("removes the screenshots without waiting for the tutor to fall silent", async () => {
+    const harness = await makeHarness({ transport: transportYielding([{ kind: "text", text: "A long answer." }]) });
+
+    harness.emitTranscript("Question?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    const directory = dirname(harness.sidecar.screenshots[0]!);
+    expect(harness.service.state).toBe("speaking");
+
+    // The sidecar is slow to acknowledge the stop, as it can be while the
+    // process is quitting; the writes are reached all the same.
+    harness.sidecar.hold("stopSpeaking");
+    let entered = () => {};
+    const flushing = new Promise<void>((resolve) => { entered = resolve; });
+    let goneWhenWritesWaited: boolean | undefined;
+    harness.service.flush = async () => {
+      goneWhenWritesWaited = !existsSync(directory);
+      entered();
+    };
+
+    const ending = harness.service.end();
+    await flushing;
+
+    expect(goneWhenWritesWaited).toBe(true);
+    harness.sidecar.release("stopSpeaking");
+    await ending;
   });
 
   it("removes the screenshots before it waits for the last writes to land", async () => {
@@ -1015,6 +1043,28 @@ describe("LiveAssistService interleavings", () => {
 
     expect(harness.updates.slice(stoppedFrom).map((update) => update.state)).not.toContain("speaking");
     expect(harness.service.state).toBe("listening");
+  });
+
+  it("hears nothing from the sidecar once it has ended", async () => {
+    const harness = await makeHarness({ transport: transportYielding([{ kind: "text", text: "Answer." }]) });
+
+    harness.emitTranscript("Question?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    await harness.service.end();
+    const published = harness.updates.length;
+
+    harness.emitTranscript("Anyone there?", true);
+    harness.emitSpeech("an-utterance", "finished");
+    harness.emitSidecarState("failed", "live_audio_failed");
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // Detached, not merely ignored: nothing of the sidecar reaches the
+    // conversation at all once it has ended.
+    expect(harness.sidecar.transcriptListeners).toEqual([]);
+    expect(harness.sidecar.speechListeners).toEqual([]);
+    expect(harness.sidecar.stateListeners).toEqual([]);
+    expect(harness.updates).toHaveLength(published);
+    expect(harness.service.state).toBe("ended");
   });
 
   it("stays failed when live audio fails mid-reply", async () => {
@@ -1538,6 +1588,41 @@ describe("not hearing itself", () => {
     hearLater(harness);
     harness.emitTranscript("invoice total", false, { startMs: 1_000, endMs: 1_400 });
     expect(harness.updates.at(-1)?.heard).toEqual({ text: "invoice total", final: false });
+  });
+
+  it("hears the user again once the audio has run past a sentence the sidecar never reported ending", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport });
+
+    harness.emitTranscript("Which total should I use?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    model.release({ kind: "text", text: "Use the invoice total." });
+    model.finish();
+    await harness.settle();
+
+    // The sidecar reported the sentence started at 0.7 s, and the report that
+    // it ended is lost. Pausing silences the tutor, but nothing closes the
+    // stretch its voice was heard in, so the user goes unheard.
+    await harness.service.setPaused(true);
+    await harness.service.setPaused(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    harness.emitTranscript("Are you there?", true, { startMs: 2_700, endMs: 3_000 });
+    expect(harness.updates.at(-1)?.heard).toEqual({ text: "Which total should I use?", final: true });
+
+    // Half a minute on, the words that went unheard have taken the audio past
+    // the stretch, which is let go: a report the sidecar loses costs the user
+    // that long, not the rest of the recording.
+    await vi.advanceTimersByTimeAsync(30_000);
+    harness.emitTranscript("Hello?", true, { startMs: 31_900, endMs: 32_400 });
+    await vi.advanceTimersByTimeAsync(1_000);
+    harness.emitTranscript("Are you still there?", true, { startMs: 33_400, endMs: 33_900 });
+
+    expect(harness.updates.at(-1)?.heard).toEqual({ text: "Are you still there?", final: true });
+    await vi.advanceTimersByTimeAsync(700);
+    expect(model.requests.map((request) => request.userText)).toEqual([
+      "Which total should I use?",
+      "Are you still there?",
+    ]);
   });
 
   it("still forgets where its voice was after a report that carries no usable time", async () => {
@@ -2475,7 +2560,7 @@ describe("what a check is told", () => {
     log.act(committedClick);
     await harness.at(50_000);
     expect(checks).toHaveLength(1);
-    log.act({ ...committedClick, timestampMs: 50_000 });
+    log.act({ ...committedClick });
     await harness.at(65_000);
 
     expect(checks.map((check) => check.trigger)).toEqual([committedClick.description, committedClick.description]);
@@ -2912,6 +2997,34 @@ describe("keeping the conversation", () => {
     expect(JSON.stringify(lines)).not.toContain("ZmFrZS1qcGVn");
   });
 
+  it("logs what a check of its own cost, which the user never asked to spend", async () => {
+    const harness = await makeHarness({
+      transport: {
+        async *reply() {},
+        async check() {
+          return {
+            ask: false,
+            usage: { model: "claude-opus-5-20260401", inputTokens: 900, outputTokens: 12, cacheReadTokens: 800 },
+          };
+        },
+      },
+      events: eventLog([committedClick]),
+    });
+
+    await harness.at(45_000);
+
+    expect(await loggedEntries(harness, "request")).toEqual([
+      {
+        t: expect.any(Number),
+        type: "request",
+        model: "claude-opus-5-20260401",
+        inputTokens: 900,
+        outputTokens: 12,
+        cacheReadTokens: 800,
+      },
+    ]);
+  });
+
   it("logs the failure that ends the session, as it logs any other", async () => {
     const harness = await makeHarness();
 
@@ -3094,6 +3207,66 @@ describe("when Claude cannot be reached", () => {
       "I can't reach Claude right now.",
       "I can't reach Claude right now.",
     ]);
+  });
+
+  it("counts a turn that reached Claude as no failure, though the user spoke over its last word", async () => {
+    let failure: LiveModelErrorCode | undefined = "unavailable";
+    const model = transportFailing(() => failure);
+    const harness = await makeHarness({ transport: model.transport, fullDuplex: true });
+    const ask = async (words: string) => {
+      harness.emitTranscript(words, true);
+      await vi.advanceTimersByTimeAsync(700);
+      harness.finishUtterances();
+      await vi.advanceTimersByTimeAsync(1_000);
+    };
+
+    await ask("One?");
+    await ask("Two?");
+
+    // The third turn's answer streams to its end, and the user talks over its
+    // only sentence before the reply has noticed that Claude answered at all.
+    failure = undefined;
+    harness.sidecar.hold("speak");
+    harness.emitTranscript("Three?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(spokenTexts(harness).at(-1)).toBe("Both totals match.");
+    harness.emitTranscript("Four?", true);
+    harness.sidecar.release("speak");
+    await harness.settle();
+
+    // Claude answered, so the two failures before it were no run: the turn
+    // the user interrupted it with is the first failure of a fresh one.
+    failure = "unavailable";
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(harness.service.state).not.toBe("paused");
+  });
+
+  it("takes a check that reached Claude as proof enough that the network is back", async () => {
+    const harness = await makeHarness({
+      transport: {
+        async *reply() { throw new LiveModelError("unavailable"); },
+        async check() { return { ask: false }; },
+      },
+      events: eventLogRepeating(committedClick),
+      proactive: { speechGapMs: 0, checkIntervalMs: 0 },
+    });
+
+    // A turn of the user's fails between each check of the tutor's own, which
+    // the poll runs in the quiet after the apology has been heard to the end.
+    for (let turn = 1; turn <= 4; turn += 1) {
+      const at = turn * 6_000;
+      await harness.at(at);
+      harness.emitTranscript(`Question ${turn}?`, true);
+      await harness.at(at + 700);
+      harness.finishUtterances();
+      await harness.at(at + 1_000);
+    }
+
+    // Every failure is the first of a fresh run, so the tutor says so each
+    // time rather than falling silent and pausing itself.
+    expect(spokenTexts(harness)).toEqual(Array.from({ length: 4 }, () => "I can't reach Claude right now."));
+    expect(harness.service.state).toBe("listening");
   });
 
   it("keeps the reason a session failed when listening resumes, since that one is final", async () => {

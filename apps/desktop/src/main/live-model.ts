@@ -44,14 +44,24 @@ export interface LiveCheckRequest {
   signal: AbortSignal;
 }
 
+/** What one request to Claude cost, and which model answered it. */
+export interface LiveUsage {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+}
+
 export type LiveReplyChunk =
   | { kind: "text"; text: string }
   | { kind: "refusal" }
-  | { kind: "usage"; model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number };
+  | ({ kind: "usage" } & LiveUsage);
 
 export interface LiveCheckResult {
   ask: boolean;
   question?: string;
+  /** What the check cost, when the transport could tell. A check the user never asked for still spends tokens. */
+  usage?: LiveUsage;
 }
 
 export interface LiveModelTransport {
@@ -144,18 +154,22 @@ export interface LiveUsageMessage {
 }
 
 /**
- * What one finished reply cost. The model named is the one the API answered
+ * What one finished request cost. The model named is the one the API answered
  * with, not the one asked for: an alias such as `claude-opus-5` resolves to a
  * dated model at the API, and the session's log should say which actually ran.
  */
-export function liveUsageChunk(message: LiveUsageMessage): LiveReplyChunk {
+export function liveUsage(message: LiveUsageMessage): LiveUsage {
   return {
-    kind: "usage",
     model: message.model,
     inputTokens: message.usage.input_tokens,
     outputTokens: message.usage.output_tokens,
     cacheReadTokens: message.usage.cache_read_input_tokens ?? 0,
   };
+}
+
+/** `liveUsage` as the last chunk of a streamed reply. */
+export function liveUsageChunk(message: LiveUsageMessage): LiveReplyChunk {
+  return { kind: "usage", ...liveUsage(message) };
 }
 
 /**
@@ -254,7 +268,9 @@ export function createClaudeLiveTransport(options: ClaudeLiveTransportOptions): 
           },
           { signal: request.signal },
         );
-        return parseLiveCheckResult(message);
+        // A check is a request the user did not ask for, so what it cost is
+        // reported beside its answer, whatever it decided.
+        return { ...parseLiveCheckResult(message), usage: liveUsage(message) };
       } catch (cause) {
         throw new LiveModelError(classifyLiveModelError(cause));
       }

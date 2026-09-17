@@ -1,12 +1,15 @@
 import { open, type FileHandle } from "node:fs/promises";
 
+/**
+ * One thing the user did, as a request will tell it. Nothing of the event
+ * survives here but the line a request carries and whether it may prompt a
+ * question: the role, application, window title and key text that decided
+ * those are read once, in `toAction`, and not kept, so nothing the
+ * conversation holds in memory says more about the user's screen than the
+ * request it sends does.
+ */
 export interface ObservedAction {
-  kind: string;
   description: string;
-  role?: string;
-  application?: string;
-  windowTitle?: string;
-  timestampMs: number;
   /** True for a click on a control that commits, or a switch to another application. */
   committed: boolean;
   /**
@@ -157,7 +160,6 @@ function toAction(line: string): ObservedAction | undefined {
   const event = value as Record<string, unknown>;
   const kind = typeof event.type === "string" ? event.type : undefined;
   if (kind === undefined) return undefined;
-  const timestampMs = typeof event.timestampMs === "number" ? event.timestampMs : 0;
   const target = (typeof event.target === "object" && event.target !== null ? event.target : {}) as Record<string, unknown>;
   const role = typeof target.role === "string" ? target.role : undefined;
   const label = typeof target.label === "string" ? target.label : undefined;
@@ -169,27 +171,16 @@ function toAction(line: string): ObservedAction | undefined {
   // deliberately excluded below by not matching this branch or the "click
   // on a committing role" rule that sets `committed`.
   if (kind === "app_switch") {
-    return {
-      kind,
-      description: `switched to ${windowTitle ?? application ?? "another application"}`,
-      ...(role === undefined ? {} : { role }),
-      ...(application === undefined ? {} : { application }),
-      ...(windowTitle === undefined ? {} : { windowTitle }),
-      timestampMs,
-      committed: true,
-    };
+    return { description: `switched to ${windowTitle ?? application ?? "another application"}`, committed: true };
   }
 
   const verb = VERBS_BY_KIND[kind] ?? kind;
   const what = label ? ` "${label}"` : "";
   const where = windowTitle ? ` in ${windowTitle}` : "";
+  // The label names the control, never what was typed into it: a key event's
+  // own text is not read here at all (spec §7).
   return {
-    kind,
     description: `${verb}${what}${where}`,
-    ...(role === undefined ? {} : { role }),
-    ...(application === undefined ? {} : { application }),
-    ...(windowTitle === undefined ? {} : { windowTitle }),
-    timestampMs,
     committed: kind === "click" && role !== undefined && COMMITTING_ROLES.has(role),
   };
 }

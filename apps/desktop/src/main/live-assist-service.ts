@@ -8,9 +8,9 @@ import { LiveModelError, type LiveHistoryItem, type LiveModelTransport, type Liv
 import { LiveSessionRecord, type LiveSegment } from "./live-session-record.js";
 
 export interface LiveTranscriptSignal {
-  segmentId: string;
   text: string;
   isFinal: boolean;
+  /** Where the words were heard on the capture clock, which a transcript segment is timed by. */
   startMs: number;
   endMs: number;
 }
@@ -295,6 +295,8 @@ interface SpeechWindow {
 }
 
 /**
+ * Every section number here and below is `docs/design/live-tutor.md`'s.
+ *
  * Assembles turns from streamed speech, sends one request per turn, speaks
  * the reply sentence by sentence, and yields to the user the moment they are
  * heard again. After a committed action, once the user and the tutor have
@@ -393,10 +395,13 @@ interface SpeechWindow {
  *    a pause cannot deafen later speech; one still open goes on dropping the
  *    audio after it, a pause and resume included, until its terminal report
  *    closes it. Stretches are let go once the audio heard is
- *    `SPEECH_WINDOW_RETENTION_MS` past them. When either judgement holds,
- *    `#onTranscript` drops the event before it changes anything: not the
- *    words heard, the turn or its timer and segment, the reply, the speech,
- *    or when the user was last heard. Only reports about outstanding
+ *    `SPEECH_WINDOW_RETENTION_MS` past where they began, closed or not, so a
+ *    terminal report the sidecar never sends costs the user that long and no
+ *    more, rather than every word for the rest of the recording. When
+ *    either judgement holds, `#onTranscript` drops the event before it
+ *    changes anything: not the words heard, the turn or its timer and
+ *    segment, the reply, the speech, or when the user was last heard. Only
+ *    reports about outstanding
  *    sentences reach state and history, so a sentence a stop has already
  *    forgotten (invariant 2) starts no arrival tail when it is reported
  *    late, and a pause ends any arrival tail, so listening resumes without
@@ -415,7 +420,9 @@ interface SpeechWindow {
  *     cannot take a screenshot or a sentence, and a check of the tutor's own
  *     are reported at most. The tutor says once that it cannot reach Claude,
  *     pauses itself after `FAILURES_BEFORE_PAUSE` such failures in a row, and
- *     pauses at once when the key is rejected. Resuming begins a fresh run,
+ *     pauses at once when the key is rejected. Any request that does reach
+ *     Claude ends the run, a check of the tutor's own included, though only
+ *     the user's own turns ever count towards it. Resuming begins a fresh run,
  *     and takes the reason for the last one off the panel. Its apology
  *     answers nothing, so it is part of no turn, and a user who talks over
  *     one is still in the turn it failed to answer.
@@ -429,6 +436,12 @@ export class LiveAssistService {
   #paused = false;
   #ended = false;
   #failed = false;
+  /**
+   * Defensive. The speech model is installed before a recording starts, and
+   * the panel is told so by whoever waits for it, before this class exists;
+   * a sidecar that reported preparing once the conversation was under way
+   * would be shown all the same.
+   */
   #preparingModel = false;
   #heard: { text: string; final: boolean } | undefined;
   #said: string | undefined;
@@ -620,22 +633,23 @@ export class LiveAssistService {
    * starting, for every reply to unwind, and for every write those replies
    * queued as they did, but never fails because one of them did.
    *
-   * The screenshot directory is removed whole as soon as the replies have
-   * unwound, which also sweeps a screenshot the sidecar finished writing
-   * after its request had stopped waiting for it. It comes before the wait
-   * for the writes, not after: a quit gives `end()` only a few seconds before
-   * the process exits, and pictures of the user's screen must not be what a
-   * slow write leaves behind. Nothing about them depends on the writes, which
-   * go to the session directory instead. Only the unwinding has to come
-   * first, because a reply still in flight may be reading a screenshot.
+   * The screenshot directory is removed whole as soon as starting and every
+   * reply have unwound, which also sweeps a screenshot the sidecar finished
+   * writing after its request had stopped waiting for it. Only those two have
+   * to come first: starting is what makes the directory, and a reply still in
+   * flight may be reading a screenshot. Silencing the tutor and the writes to
+   * the session directory have nothing to do with pictures of the user's
+   * screen, and both can outlast the few seconds a quit gives `end()` — the
+   * sidecar's own client waits fifteen for a command — so neither is waited
+   * for first.
    */
   async #finishEnding(stopping: Promise<void> | undefined): Promise<void> {
-    await Promise.allSettled([stopping, this.#starting, ...this.#running]);
+    await Promise.allSettled([this.#starting, ...this.#running]);
     if (this.#screenshotDirectory !== undefined) {
       // Nothing is left to report a failed removal to.
       await rm(this.#screenshotDirectory, { recursive: true, force: true }).catch(() => undefined);
     }
-    await this.flush();
+    await Promise.allSettled([stopping, this.flush()]);
   }
 
   #onTranscript(event: LiveTranscriptSignal): void {
@@ -722,18 +736,27 @@ export class LiveAssistService {
 
   /**
    * Takes `ms` as audio the session has reached, and lets go of any stretch
-   * of the tutor's voice that ended well before it. A stretch with no end
-   * yet is kept, because the sentence may still be playing. A time that is
-   * not a finite number is no news about the audio at all: taken as one it
-   * would leave the mark unknowable, and no stretch would ever be let go
-   * again.
+   * of the tutor's voice that began well before it.
+   *
+   * A stretch is judged by where it began, not where it ended, because one
+   * whose end never came would otherwise be kept for the rest of the
+   * session: the sidecar sends one terminal report per sentence, and a
+   * report it loses would leave the stretch open, and every later event
+   * overlapping it, for good — the tutor deaf while the panel still said it
+   * was listening. A sentence really still playing is covered meanwhile by
+   * the arrival rules, which hold while the service waits on it, so nothing
+   * it says goes unguarded by this bound.
+   *
+   * A time that is not a finite number is no news about the audio at all:
+   * taken as one it would leave the mark unknowable, and no stretch would
+   * ever be let go again.
    */
   #noteAudioUpTo(ms: number): void {
     if (!Number.isFinite(ms)) return;
     this.#newestAudioMs = Math.max(this.#newestAudioMs, ms);
     const oldest = this.#newestAudioMs - SPEECH_WINDOW_RETENTION_MS;
     for (const [utteranceId, window] of this.#speechWindows) {
-      if (window.untilMs < oldest) this.#speechWindows.delete(utteranceId);
+      if (window.fromMs < oldest) this.#speechWindows.delete(utteranceId);
     }
   }
 
@@ -876,7 +899,9 @@ export class LiveAssistService {
           if (!this.#shouldContinue(reply)) return;
         }
       } else if (chunk.kind === "refusal") {
-        // Whatever the model began before refusing is never said.
+        // Only the tail goes. The transport reports a refusal once the stream
+        // has drained, so any sentence that was already complete has been
+        // said; what the model had begun and not finished never is.
         buffer = "";
         await this.#speak(reply, REFUSAL_REPLY);
         if (!this.#shouldContinue(reply)) return;
@@ -885,11 +910,22 @@ export class LiveAssistService {
         this.#record.log({ type: "request", model, inputTokens, outputTokens, cacheReadTokens });
       }
     }
+    this.#noteClaudeAnswered();
     if (!this.#shouldContinue(reply)) return;
     await this.#speak(reply, buffer.trim());
     if (!this.#shouldContinue(reply)) return;
     this.#error = undefined;
-    // Claude answered, so whatever failed before it is no longer a run.
+  }
+
+  /**
+   * The stream ran to its end, or the check came back, so Claude is reachable
+   * and whatever failed before it was no run of failures after all (spec §8).
+   * That is true whoever holds the floor by the time it is known, like the
+   * actions a superseded read returns (invariant 7), so a reply the user has
+   * talked over still clears it. Only the panel's error is left to the reply
+   * that still holds the floor, because publishing is an act.
+   */
+  #noteClaudeAnswered(): void {
     this.#consecutiveFailures = 0;
   }
 
@@ -1001,7 +1037,11 @@ export class LiveAssistService {
       trigger: check.trigger.description,
       signal: check.controller.signal,
     });
+    this.#noteClaudeAnswered();
     if (!this.#shouldContinue(check)) return;
+    // A check spends tokens the user never asked to spend, so what it cost is
+    // logged beside the screenshot it took, as a turn's request is.
+    if (result.usage !== undefined) this.#record.log({ type: "request", ...result.usage });
     const question = result.ask ? result.question : undefined;
     // Logged where the decision is made, so the log holds one line per check
     // that reached one. A check cancelled before then decided nothing.

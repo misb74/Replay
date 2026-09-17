@@ -48,10 +48,10 @@ describe("classifyLiveModelError", () => {
     expect(Object.keys(error)).not.toContain("response");
   });
 
-  // The cases above are the brief's own; the ones below round out coverage of
-  // every branch classifyLiveModelError can take, since Task 11-14 depend on
-  // each failure path (network error, 401/403, 429, 5xx, abort) mapping to
-  // the right LiveModelErrorCode.
+  // The cases below round out every branch classifyLiveModelError can take:
+  // the conversation's error policy turns on each failure path (network
+  // error, 401/403, 429, 5xx, abort) mapping to the right code, since only a
+  // rejected key pauses it at once.
 
   it("classifies 403 as unauthenticated alongside 401", () => {
     expect(classifyLiveModelError({ status: 403 })).toBe("unauthenticated");

@@ -14,21 +14,13 @@ const clickLine = (id: string, label: string, role = "AXButton") => JSON.stringi
 }) + "\n";
 
 const clicked = (label: string, committed = true): ObservedAction => ({
-  kind: "click",
   description: `clicked "${label}" in Northstar Ledger`,
-  role: committed ? "AXButton" : "AXStaticText",
-  timestampMs: 1_000,
   committed,
 });
 
 /** One scroll gesture, which the input monitor reports once per scroll-wheel event. */
 const scrolled = (times: number): ObservedAction[] =>
-  Array.from({ length: times }, (_, index) => ({
-    kind: "scroll",
-    description: "scrolled in Northstar Ledger",
-    timestampMs: 2_000 + index * 16,
-    committed: false,
-  }));
+  Array.from({ length: times }, () => ({ description: "scrolled in Northstar Ledger", committed: false }));
 
 describe("LiveEventsTail", () => {
   it("returns only events appended since the previous read", async () => {
@@ -95,6 +87,28 @@ describe("LiveEventsTail", () => {
 
     expect(actions).toHaveLength(2);
     expect(actions.filter((action) => action.committed)).toEqual([]);
+  });
+
+  it("says only that a key was typed, never what was typed", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "replay-tail-key-"));
+    const path = join(directory, "events.jsonl");
+    await writeFile(path, JSON.stringify({
+      schemaVersion: 1,
+      id: "event-1",
+      sessionId: "session-1",
+      timestampMs: 5_000,
+      type: "key",
+      key: { keyCode: 4, text: "hunter2", modifiers: [], redacted: false },
+      target: { role: "AXTextField", label: "Password", bundleId: "com.example.ledger", windowTitle: "Northstar Ledger" },
+    }) + "\n");
+    const tail = new LiveEventsTail(path);
+
+    const actions = await tail.read();
+
+    // Spec §7: the recent actions a request carries name the control, never
+    // the text the user put into it, whether or not the recorder redacted it.
+    expect(actions.map((action) => action.description)).toEqual(['typed "Password" in Northstar Ledger']);
+    expect(JSON.stringify(actions)).not.toContain("hunter2");
   });
 
   it("returns an empty list when the file does not exist yet", async () => {
@@ -184,8 +198,7 @@ describe("LiveEventsTail", () => {
       'clicked "Add note" in Northstar Ledger',
       'clicked "Flag for follow-up" in Northstar Ledger',
     ]);
-    // A merged entry is the newest of the actions it stands for.
-    expect(afterSecond[0]).toMatchObject({ timestampMs: secondRead[17]!.timestampMs, count: 23 });
+    expect(afterSecond[0]).toMatchObject({ description: "scrolled in Northstar Ledger", count: 23 });
     expect(afterFirst).toHaveLength(2);
     expect(firstRead).toHaveLength(6);
     expect(firstRead.every((action) => action.count === undefined)).toBe(true);
