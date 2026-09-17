@@ -47,7 +47,7 @@ export interface LiveCheckRequest {
 export type LiveReplyChunk =
   | { kind: "text"; text: string }
   | { kind: "refusal" }
-  | { kind: "usage"; inputTokens: number; outputTokens: number; cacheReadTokens: number };
+  | { kind: "usage"; model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number };
 
 export interface LiveCheckResult {
   ask: boolean;
@@ -134,6 +134,31 @@ export function parseLiveCheckResult(message: LiveCheckMessage): LiveCheckResult
 }
 
 /**
+ * The minimal shape of a finished reply that `liveUsageChunk` needs, kept
+ * separate from `Anthropic.Message` for the same reason `LiveCheckMessage` is:
+ * so it can be constructed and tested without a network.
+ */
+export interface LiveUsageMessage {
+  model: string;
+  usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number | null };
+}
+
+/**
+ * What one finished reply cost. The model named is the one the API answered
+ * with, not the one asked for: an alias such as `claude-opus-5` resolves to a
+ * dated model at the API, and the session's log should say which actually ran.
+ */
+export function liveUsageChunk(message: LiveUsageMessage): LiveReplyChunk {
+  return {
+    kind: "usage",
+    model: message.model,
+    inputTokens: message.usage.input_tokens,
+    outputTokens: message.usage.output_tokens,
+    cacheReadTokens: message.usage.cache_read_input_tokens ?? 0,
+  };
+}
+
+/**
  * The messages for a reply or a check, both built here: the history, then the
  * newest user message, which carries the screenshot, the recent actions, and
  * `closing`.
@@ -205,12 +230,7 @@ export function createClaudeLiveTransport(options: ClaudeLiveTransportOptions): 
         if (message.stop_reason === "refusal") {
           yield { kind: "refusal" };
         }
-        yield {
-          kind: "usage",
-          inputTokens: message.usage.input_tokens,
-          outputTokens: message.usage.output_tokens,
-          cacheReadTokens: message.usage.cache_read_input_tokens ?? 0,
-        };
+        yield liveUsageChunk(message);
       } catch (cause) {
         throw new LiveModelError(classifyLiveModelError(cause));
       }

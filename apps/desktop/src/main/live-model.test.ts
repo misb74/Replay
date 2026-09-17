@@ -3,10 +3,34 @@ import {
   classifyLiveModelError,
   LiveModelError,
   liveMessages,
+  liveUsageChunk,
   parseLiveCheckResult,
   type LiveCheckRequest,
   type LiveHistoryItem,
 } from "./live-model.js";
+
+describe("liveUsageChunk", () => {
+  it("names the model that answered, which an alias resolves to only at the API", () => {
+    const chunk = liveUsageChunk({
+      model: "claude-opus-5-20260401",
+      usage: { input_tokens: 1_700, output_tokens: 30, cache_read_input_tokens: 900 },
+    });
+
+    expect(chunk).toEqual({
+      kind: "usage",
+      model: "claude-opus-5-20260401",
+      inputTokens: 1_700,
+      outputTokens: 30,
+      cacheReadTokens: 900,
+    });
+  });
+
+  it("counts a reply that read no cache as having read none", () => {
+    const chunk = liveUsageChunk({ model: "claude-opus-5", usage: { input_tokens: 12, output_tokens: 3 } });
+
+    expect(chunk).toMatchObject({ cacheReadTokens: 0 });
+  });
+});
 
 describe("classifyLiveModelError", () => {
   it("separates retryable failures from permanent ones", () => {

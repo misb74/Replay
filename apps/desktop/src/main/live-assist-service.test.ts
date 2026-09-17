@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { assertValidTranscript, type TimestampedTranscript } from "@replay/pipeline";
@@ -471,7 +471,7 @@ describe("LiveAssistService turns", () => {
       transport: transportYielding([
         { kind: "text", text: "Both totals match. " },
         { kind: "text", text: "You can approve it." },
-        { kind: "usage", inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
+        { kind: "usage", model: "claude-opus-5", inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
       ]),
     });
 
@@ -1743,6 +1743,10 @@ describe("what the tutor is told", () => {
     expect(spokenTexts(harness)).toEqual(["Answer.", "Answer.", "Answer."]);
     expect(harness.updates.filter((update) => update.error !== undefined)).toEqual([]);
     expect(harness.service.state).toBe("listening");
+    // Recorded all the same, under a type of its own so that it can never be
+    // read as one of spec §8's failures to reach Claude.
+    expect(await loggedEntries(harness, "event_log_unread")).toHaveLength(3);
+    expect(await loggedEntries(harness, "error")).toEqual([]);
   });
 
   it("tells the model the conversation so far, with the time each screenshot was taken", async () => {
@@ -2638,7 +2642,6 @@ describe("keeping the conversation", () => {
     ]);
     // Build refuses a recording whose transcript it cannot accept.
     expect(() => { assertValidTranscript(transcript); }).not.toThrow();
-    expect((await stat(join(harness.directory, "transcript.json"))).mode & 0o777).toBe(0o600);
   });
 
   it("times each segment by the capture clock its signals carry, not by its own", async () => {
@@ -2668,22 +2671,40 @@ describe("keeping the conversation", () => {
     ]);
   });
 
-  it("stays a file Build accepts whatever times the recogniser gives its words", async () => {
-    const harness = await makeHarness({ transport: transportYielding([{ kind: "text", text: "They match." }]) });
+  it("records no sentence whose start the sidecar could not give, and leaves the file valid", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport });
+    // The sidecar reports nothing of its own, as a coordinator that lost a
+    // sentence's start does, so its terminal report is the only time there is.
+    harness.sidecar.speak = async (utteranceId, text) => { harness.sidecar.spoken.push({ utteranceId, text }); };
 
-    // A recogniser that sends a final with no words in it, places words
-    // before the capture origin, and revises a final backwards must still
-    // leave a transcript Build can read.
-    harness.emitTranscript("   ", true, { startMs: -400, endMs: -200 });
-    harness.emitTranscript("Do the totals", true, { startMs: -100, endMs: 200 });
-    harness.emitTranscript("match?", true, { startMs: 100, endMs: 150 });
+    harness.emitTranscript("Do the totals match?", true, { startMs: 0, endMs: 600 });
     await vi.advanceTimersByTimeAsync(700);
-    harness.finishUtterances();
+    model.release({ kind: "text", text: "They match." });
+    model.finish();
+    await harness.settle();
+    const [sentence] = harness.sidecar.spoken;
+    harness.emitSpeech(sentence!.utteranceId, "finished", Number.NaN);
+
+    // One bad number must never cost the whole recording: Build refuses a
+    // transcript it cannot read.
+    const transcript = await readTranscript(harness);
+    expect(() => { assertValidTranscript(transcript); }).not.toThrow();
+    expect(segmentLines(transcript)).toEqual(["user: Do the totals match?"]);
+  });
+
+  it("keeps a turn's segment valid when a later final carries no usable time", async () => {
+    const harness = await makeHarness();
+
+    harness.emitTranscript("Do the totals", true, { startMs: 100, endMs: 600 });
+    harness.emitTranscript("match?", true, { startMs: 700, endMs: Number.NaN });
+    await vi.advanceTimersByTimeAsync(700);
 
     const transcript = await readTranscript(harness);
     expect(() => { assertValidTranscript(transcript); }).not.toThrow();
-    expect(segmentLines(transcript)).toEqual(["user: Do the totals match?", "assistant: They match."]);
-    expect(transcript.segments[0]).toMatchObject({ startMs: 0, endMs: 200 });
+    expect(transcript.segments).toEqual([
+      { id: "live-1", speaker: "user", text: "Do the totals match?", startMs: 100, endMs: 600 },
+    ]);
   });
 
   it("orders the transcript by when the words were said, not by when it heard of them", async () => {
@@ -2737,25 +2758,6 @@ describe("keeping the conversation", () => {
         endMs: 1_800,
       },
     ]);
-  });
-
-  it("leaves no half-written transcript: every version is renamed into place", async () => {
-    const harness = await makeHarness();
-    const path = join(harness.directory, "transcript.json");
-
-    harness.emitTranscript("Do the totals", true);
-    await harness.service.flush();
-    const first = await stat(path);
-
-    harness.emitTranscript("match?", true);
-    await harness.service.flush();
-    const second = await stat(path);
-
-    // Rewriting the file in place would keep it; renaming a whole new one over
-    // it is what keeps a crash mid-write from truncating what Build reads.
-    expect(second.ino).not.toBe(first.ino);
-    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ version: 1 });
-    expect((await readdir(harness.directory)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
 
   it("writes no transcript for a session nobody spoke in, so Build still has the audio", async () => {
@@ -2854,7 +2856,7 @@ describe("keeping the conversation", () => {
     const harness = await makeHarness({
       transport: transportYielding([
         { kind: "text", text: "Answer." },
-        { kind: "usage", inputTokens: 1_700, outputTokens: 30, cacheReadTokens: 900 },
+        { kind: "usage", model: "claude-opus-5-20260401", inputTokens: 1_700, outputTokens: 30, cacheReadTokens: 900 },
       ]),
     });
 
@@ -2865,13 +2867,39 @@ describe("keeping the conversation", () => {
     const lines = await readLog(harness);
     expect(lines.map((line) => line.type)).toEqual(["user_turn", "screenshot", "request", "assistant_turn"]);
     expect(lines[0]).toMatchObject({ type: "user_turn", text: "Question?" });
+    // The model named is the one that answered, which the transport reads off
+    // the reply rather than off what it asked for.
     expect(lines.find((line) => line.type === "request")).toMatchObject({
+      model: "claude-opus-5-20260401",
       inputTokens: 1_700,
       outputTokens: 30,
       cacheReadTokens: 900,
     });
     expect(lines.every((line) => typeof line.t === "number")).toBe(true);
     expect(JSON.stringify(lines)).not.toContain("ZmFrZS1qcGVn");
+  });
+
+  it("logs the failure that ends the session, as it logs any other", async () => {
+    const harness = await makeHarness();
+
+    harness.emitSidecarState("failed", "live_audio_failed");
+
+    expect(await loggedEntries(harness, "error")).toEqual([
+      { t: expect.any(Number), type: "error", code: "live_audio_failed" },
+    ]);
+  });
+
+  it("logs the end last, after the sentences that ending cut off", async () => {
+    const harness = await makeHarness({ transport: transportYielding([{ kind: "text", text: "A long answer." }]) });
+
+    harness.emitTranscript("Question?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(harness.service.state).toBe("speaking");
+    await harness.service.end();
+
+    const types = (await readLog(harness)).map((line) => line.type);
+    expect(types.at(-2)).toBe("assistant_turn");
+    expect(types.at(-1)).toBe("ended");
   });
 
   it("logs its question with the action behind it", async () => {
@@ -2975,6 +3003,74 @@ describe("when Claude cannot be reached", () => {
     expect(await loggedEntries(harness, "assistant_turn")).toEqual([
       expect.objectContaining({ text: "Both totals match.", interrupted: false }),
     ]);
+  });
+
+  it("sends the turn again when the user talks over the apology, which answered nothing", async () => {
+    let failure: LiveModelErrorCode | undefined = "unavailable";
+    const model = transportFailing(() => failure);
+    const harness = await makeHarness({ transport: model.transport, fullDuplex: true });
+    harness.sidecar.hold("speak");
+
+    harness.emitTranscript("Do the totals match?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(spokenTexts(harness)).toEqual(["I can't reach Claude right now."]);
+
+    // The user carries on while the sidecar still has the apology. Nothing of
+    // their turn was answered, so the turn goes on and is sent whole.
+    failure = undefined;
+    harness.emitTranscript("or are they different?", true);
+    harness.sidecar.release("speak");
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(model.requests.map((request) => request.userText)).toEqual([
+      "Do the totals match?",
+      "Do the totals match? or are they different?",
+    ]);
+    expect(harness.sidecar.stopSpeakingCount).toBe(1);
+    expect(segmentLines(await readTranscript(harness))).toEqual([
+      "user: Do the totals match? or are they different?",
+    ]);
+  });
+
+  it("forgets the failures, and the reason for them, when listening resumes", async () => {
+    let failure: LiveModelErrorCode | undefined = "unavailable";
+    const model = transportFailing(() => failure);
+    const harness = await makeHarness({ transport: model.transport });
+    const ask = async (words: string) => {
+      harness.emitTranscript(words, true);
+      await vi.advanceTimersByTimeAsync(700);
+      harness.finishUtterances();
+      await vi.advanceTimersByTimeAsync(1_000);
+    };
+
+    await ask("One?");
+    await ask("Two?");
+    await ask("Three?");
+    expect(harness.service.state).toBe("paused");
+
+    await harness.service.setPaused(false);
+    expect(harness.updates.at(-1)).toMatchObject({ state: "listening" });
+    expect(harness.updates.at(-1)?.error).toBeUndefined();
+
+    // The next turn to fail begins a fresh run: the tutor says so once more
+    // and goes on listening rather than pausing again at once.
+    await ask("Four?");
+
+    expect(harness.service.state).toBe("listening");
+    expect(spokenTexts(harness)).toEqual([
+      "I can't reach Claude right now.",
+      "I can't reach Claude right now.",
+    ]);
+  });
+
+  it("keeps the reason a session failed when listening resumes, since that one is final", async () => {
+    const harness = await makeHarness();
+
+    harness.emitSidecarState("failed", "live_audio_failed");
+    await harness.service.setPaused(true);
+    await harness.service.setPaused(false);
+
+    expect(harness.updates.at(-1)).toMatchObject({ state: "failed", error: "live_audio_failed" });
   });
 
   it("counts only failures in a row, so a turn that works clears the count", async () => {
