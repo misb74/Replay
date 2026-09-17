@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import Speech
 import Testing
 @testable import ReplayCaptureMac
 
@@ -9,6 +10,11 @@ import Testing
 /// opens the microphone or makes a sound, and
 /// `AVAudioEngineConfigurationChange` is only a name, which any object can
 /// be the subject of.
+///
+/// `MicrophoneTap` is reachable from here for the same reason: it opens an
+/// `AVAudioFile` and builds two `AVAudioConverter`s, none of which is a
+/// device. Given a buffer its converters were not built for, it must say
+/// so rather than record the failure and fall silent.
 ///
 /// What cannot be checked here is the other half — that AVFoundation
 /// really does post that notification when the audio route changes, and
@@ -107,6 +113,70 @@ private func connect(_ reporter: LiveAudioFailureReporter) -> ReportedReasons {
         await reasons.reasons.isEmpty,
         "tearing the session down is what stops the engine and ends the analyser's stream: neither is a failure"
     )
+}
+
+/// A buffer in a format neither of the tap's converters was built for.
+/// `AVAudioConverter` rejects it — cleanly, with an error, which is what
+/// makes this a usable stand-in for the real thing: an encoder that cannot
+/// take what the hardware is giving it fails on every buffer, for the
+/// length of the recording.
+@available(macOS 26, *)
+private func makeTapFedTheWrongFormat(
+    reporter: LiveAudioFailureReporter,
+    directory: URL
+) throws -> MicrophoneTap {
+    let tapFormat = try #require(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2))
+    let analyzerFormat = try #require(AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1))
+    // Only the continuation is kept. Nothing here may ever construct an
+    // `AnalyzerInput`: doing so traps in this process, which is why the
+    // buffer below is one both converters reject — a rejected buffer is
+    // never handed to the analyser — and why this tap is never asked to
+    // finish its analyser input, whose flush would build one.
+    let (_, analyzerInput) = AsyncStream<AnalyzerInput>.makeStream()
+    let tap = try MicrophoneTap(
+        // An origin in the future, so `receive` asks for no leading
+        // silence: this test is about the failure, not about the seconds
+        // of AAC that would otherwise be encoded first.
+        captureOriginUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds &+ 60_000_000_000,
+        audioURL: directory.appendingPathComponent("audio.m4a"),
+        tapFormat: tapFormat,
+        analyzerFormat: analyzerFormat,
+        analyzerInput: analyzerInput,
+        failureReporter: reporter
+    )
+    let wrongFormat = try #require(AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1))
+    let buffer = try #require(AVAudioPCMBuffer(pcmFormat: wrongFormat, frameCapacity: 1_024))
+    buffer.frameLength = 1_024
+    // `AVAudioTime(sampleTime:atRate:)` carries no host time, so `receive`
+    // reads the clock itself, as it does for a tap buffer that arrives
+    // without one.
+    tap.receive(buffer, at: AVAudioTime(sampleTime: 0, atRate: 44_100))
+    return tap
+}
+
+@Test func aTapThatCannotConvertWhatTheMicrophoneGivesItSaysSo() async throws {
+    guard #available(macOS 26, *) else { return }
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("replay-tap-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let reporter = LiveAudioFailureReporter()
+    let reasons = connect(reporter)
+    let tap = try makeTapFedTheWrongFormat(reporter: reporter, directory: directory)
+
+    #expect(
+        await waitUntil { await reasons.reasons == ["narration_write_failed"] },
+        "a narration conversion that fails must reach the coordinator, not just be recorded and forgotten"
+    )
+    // The same buffer fails the analyser's converter too — both are built
+    // from the one tap format, so no buffer can fail one and not the other
+    // — and its report is enqueued behind narration's on the same serial
+    // queue. The session is told once, by the first to arrive.
+    await allowAnyPendingReport()
+    #expect(await reasons.reasons.count == 1, "one failure ends the session; the second site must not report again")
+
+    tap.closeNarration()
 }
 
 @Test func anInstalledObserverDoesNotKeepTheReporterAlive() {

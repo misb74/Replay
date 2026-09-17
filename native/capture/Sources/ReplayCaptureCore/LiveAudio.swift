@@ -239,7 +239,10 @@ public protocol LiveAudioProviding: AnyObject, Sendable {
 /// for `listening` against `paused`/`stopped`, and for `failed` against a
 /// separate `stopCalled` flag, set only inside `stop()`: both failure
 /// paths set `stopped` themselves, so `stopped` alone cannot tell "did
-/// `stop()` run" from "did sending `failed` set this".
+/// `stop()` run" from "did sending `failed` set this". `start()`'s first
+/// event, `preparingModel`, has nothing before it to order it against, so
+/// it is guarded on `stopped` too — otherwise a failure reported before
+/// `start()` would be followed by it.
 ///
 /// Mechanism for 1, 5, 6's failure-path cases and 7: both failure paths —
 /// `start()`'s own and `reportFailure(reason:)` — set `stopped = true`
@@ -325,6 +328,13 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
     }
 
     public func start() async throws {
+        // Nothing may precede a `failed` that a failure reported before
+        // this call has already sent, and a coordinator that has stopped
+        // must not open a microphone. Unreachable today — every site that
+        // can report comes into existence inside `recogniser.start()`
+        // below, so nothing can report before this line — but one guard is
+        // cheaper than re-deriving that every time this file is read.
+        guard !stopped else { return }
         await emit(.init(event: .state, sessionId: sessionId, state: .preparingModel))
         do {
             try await recogniser.start { [weak self] segment in

@@ -265,13 +265,24 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
         // honestly; playing into a stopped engine would not.
         guard engine.isRunning else {
             // An engine that has run and is no longer running stopped by
-            // itself, and there is no notification for that on macOS: this
-            // check, which every utterance already makes, is the only
-            // signal short of polling. A route change reports itself
-            // sooner and more precisely; this catches whatever else can
-            // stop an engine, at the next thing the tutor tries to say.
-            // Before it ever ran, this is only speech queued while the
-            // session was still starting up, which is not a failure.
+            // itself. macOS posts no notification for that, and
+            // `isRunning` is not documented KVO-compliant, so this check —
+            // which every utterance already makes — is all there is short
+            // of polling.
+            //
+            // Be clear about how little it catches. The tutor only speaks
+            // in reply to a transcript, and a stopped engine produces no
+            // transcripts, so in the very case this exists for there is
+            // usually no next utterance to notice anything: the panel goes
+            // on saying "Listening" until the user gives up. It reports
+            // only when something was already queued, or when the engine
+            // stops between one reply and the next. The route change is
+            // what actually covers the common cause, and covers it at
+            // once. A Core Audio device-property listener is the thing
+            // that would close the rest; it is recorded as a follow-up.
+            //
+            // Before the engine ever ran, this is only speech queued while
+            // the session was still starting up, which is not a failure.
             if engineStarted { failureReporter.report("audio_engine_stopped") }
             return false
         }
@@ -603,7 +614,9 @@ final class SpeechPlayback: @unchecked Sendable {
 /// continuation, both of which the tap callback touches directly.
 /// `narrationQueue` owns the narration file: encoding AAC has no business
 /// in a realtime callback with an ~85ms budget, least of all the leading
-/// silence, which can be seconds of it.
+/// silence, which can be seconds of it. It is also where either half steps
+/// off the realtime thread to report a failure, which is not audio work
+/// but has no business in that callback either.
 @available(macOS 26, *)
 final class MicrophoneTap: @unchecked Sendable {
     /// A clock reading that made no sense would otherwise ask for an
@@ -625,6 +638,9 @@ final class MicrophoneTap: @unchecked Sendable {
     /// Guarded by `lock`.
     private var analyzerInput: AsyncStream<AnalyzerInput>.Continuation?
     private var firstBufferUptime: UInt64?
+    /// The failure that stopped the analyser being fed, and the reason the
+    /// session is only told once: after this is set, every later buffer
+    /// fails the same way and has nothing new to say.
     private var firstAnalyzerFailure: Error?
 
     /// The host uptime of the first buffer the microphone delivered, which
@@ -806,8 +822,26 @@ final class MicrophoneTap: @unchecked Sendable {
             // time.
             lock.replayWithLock { analyzerInput }?.yield(AnalyzerInput(buffer: converted))
         case let .failure(error):
-            lock.replayWithLock {
-                if firstAnalyzerFailure == nil { firstAnalyzerFailure = error }
+            // Both converters are built once, in `init`, from two fixed
+            // formats, so one that rejects a buffer rejects every buffer:
+            // the analyser is fed nothing more, the user talks, and
+            // nothing is transcribed. That is the same visible failure as
+            // the results stream throwing, so it carries the same code.
+            // One failure is already the right number to act on; a
+            // threshold would be arbitrary.
+            let isFirst: Bool = lock.replayWithLock {
+                guard firstAnalyzerFailure == nil else { return false }
+                firstAnalyzerFailure = error
+                return true
+            }
+            // Off the realtime thread before the reporter is told, exactly
+            // as `writeNarration` does with its own failure: reporting can
+            // schedule a task, which has no business in an audio callback.
+            // The flag above keeps this to one hop per session.
+            if isFirst {
+                narrationQueue.async { [failureReporter] in
+                    failureReporter.report("recogniser_failed")
+                }
             }
         }
     }

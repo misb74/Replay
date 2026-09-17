@@ -1212,10 +1212,16 @@ private actor CompletionFlag {
     )
 }
 
-@Test func aFailureThatLandsWhileStopIsStillTearingDownEmitsNothing() async throws {
+/// `stop()` sets `stopped` synchronously, before its first `await`, so a
+/// failure that lands at any point during its teardown is refused by
+/// `reportFailure`'s entry guard and never begins a teardown of its own.
+/// The interleaving that gets *past* that guard and has to be stopped by
+/// the `!stopCalled` check instead is the next test.
+@Test func aFailureLandingWhileStopIsTearingDownIsRefusedAtTheEntryGuard() async throws {
     let collector = EventCollector()
     let synthesiser = FakeSynthesiser()
-    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    let recogniser = FakeRecogniser()
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: synthesiser, collector: collector)
     try await coordinator.start()
     await synthesiser.setAutoCompletes(false)
 
@@ -1229,14 +1235,57 @@ private actor CompletionFlag {
     await synthesiser.setHoldStops(true)
     let stopTask = Task { await coordinator.stop() }
     #expect(await waitUntil { await synthesiser.stopCallCount == 1 })
+    let recogniserStopsBeforeTheFailure = await recogniser.stopCallCount
 
     await coordinator.reportFailure(reason: "audio_route_changed")
+
+    // Refused at the entry guard, not merely silent later: it never
+    // reached the recogniser.
+    #expect(
+        await recogniser.stopCallCount == recogniserStopsBeforeTheFailure,
+        "the failure must return at its entry guard, without starting a teardown stop() is already running"
+    )
 
     await synthesiser.releaseHeldStop()
     await stopTask.value
 
     let states = await collector.events.compactMap(\.state)
     #expect(states == [.preparingModel, .listening], "a failure landing while stop() is still tearing down must emit nothing")
+}
+
+@Test func aFailureAlreadyTearingDownWhenStopRunsEmitsNothing() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+    await synthesiser.setAutoCompletes(false)
+
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    // The failure gets in first: it passes its entry guard and is then
+    // held inside the synthesiser's stop, mid-teardown, with its `failed`
+    // still to come. This is the ordering the entry guard cannot catch,
+    // and the only thing left to stop it is the `!stopCalled` check the
+    // failure path makes after the drain.
+    await synthesiser.setHoldStops(true)
+    let failureTask = Task { await coordinator.reportFailure(reason: "audio_route_changed") }
+    #expect(await waitUntil { await synthesiser.stopCallCount == 1 })
+
+    // stop() runs to completion while that failure is still suspended
+    // (the hold is one-shot, so stop()'s own stopSpeaking resolves A and
+    // lets the drain quiesce).
+    await coordinator.stop()
+    let eventCountWhenStopReturned = await collector.events.count
+
+    await synthesiser.releaseHeldStop()
+    await failureTask.value
+
+    let states = await collector.events.compactMap(\.state)
+    #expect(states == [.preparingModel, .listening], "stop() already tore the coordinator down; no failed may follow it")
+    #expect(await collector.events.count == eventCountWhenStopReturned, "nothing may be sent once stop() has returned")
+    let aPhases = await collector.events.filter { $0.utteranceId == "A" }.compactMap(\.phase)
+    #expect(aPhases == [.started, .cancelled], "A must still end with exactly one terminal event")
 }
 
 @Test func twoFailuresReportOnlyTheFirst() async throws {
@@ -1275,6 +1324,23 @@ private actor CompletionFlag {
     let failures = await collector.events.filter { $0.state == .failed }
     #expect(failures.count == 1, "a start() failing after a failure was reported must not report a second one")
     #expect(failures.first?.reason == "audio_route_changed", "the reason that ended the session is the first one")
+}
+
+/// Not reachable through the Mac engine — every site that can report a
+/// failure comes into existence inside `recogniser.start()` — but the
+/// coordinator is a public type, and `start()`'s first event is the one
+/// emit with nothing before it to guard the order.
+@Test func aFailureBeforeStartLeavesStartWithNothingToSay() async throws {
+    let collector = EventCollector()
+    let recogniser = FakeRecogniser()
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: FakeSynthesiser(), collector: collector)
+
+    await coordinator.reportFailure(reason: "audio_route_changed")
+    try await coordinator.start()
+
+    let states = await collector.events.compactMap(\.state)
+    #expect(states == [.failed], "nothing may follow a failure, `preparingModel` included")
+    #expect(await recogniser.running == false, "a coordinator that has already failed must not start a recogniser")
 }
 
 @Test func aFailureWhilePausedIsStillReportedAndSpeechStaysRefused() async throws {
