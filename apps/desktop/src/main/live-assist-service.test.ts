@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LiveUpdate } from "../shared/contracts.js";
 import {
   boundHistory,
+  LIVE_PROACTIVE_DEFAULTS,
   LIVE_SYSTEM_PROMPT,
   LiveAssistService,
   splitSentences,
@@ -18,6 +19,8 @@ import {
 import type { ObservedAction } from "./live-events-tail.js";
 import {
   LiveModelError,
+  type LiveCheckRequest,
+  type LiveCheckResult,
   type LiveHistoryItem,
   type LiveModelTransport,
   type LiveReplyChunk,
@@ -38,6 +41,12 @@ interface Harness {
   whenUpdated: (listener: (update: LiveUpdate) => void) => void;
   /** Runs every callback already waiting on a promise, without moving the fake clock. */
   settle: () => Promise<void>;
+  /**
+   * Moves the fake clock on to `ms` after the session started. Fake timers move
+   * `Date.now()`, the service's clock, in step with the timers they fire, so
+   * each timer due on the way sees the moment it was due.
+   */
+  at: (ms: number) => Promise<void>;
 }
 
 /** A sidecar command whose reply a test can hold back, to act while the service awaits it. */
@@ -184,6 +193,7 @@ async function makeHarness(overrides: HarnessOverrides = {}): Promise<Harness> {
   const updates: LiveUpdate[] = [];
   const removedImages: string[] = [];
   const updateListeners: Array<(update: LiveUpdate) => void> = [];
+  const startedAt = Date.now();
   const service = new LiveAssistService({
     transport: transportYielding([]),
     events: { read: async () => [] },
@@ -230,6 +240,9 @@ async function makeHarness(overrides: HarnessOverrides = {}): Promise<Harness> {
     async settle() {
       await vi.advanceTimersByTimeAsync(0);
     },
+    async at(ms) {
+      await vi.advanceTimersByTimeAsync(startedAt + ms - Date.now());
+    },
   };
 }
 
@@ -238,8 +251,64 @@ function spokenTexts(harness: Harness): string[] {
 }
 
 /** Each turn of a request's history as `speaker: text`. */
-function historyLines(request: LiveReplyRequest | undefined): string[] {
+function historyLines(request: { history: readonly LiveHistoryItem[] } | undefined): string[] {
   return (request?.history ?? []).map((turn) => `${turn.speaker}: ${turn.text}`);
+}
+
+/**
+ * A transport that records every check and answers it with `decide`'s result.
+ * Its replies speak `answers`, one to each request, and then say nothing.
+ */
+function checkingTransport(
+  decide: (request: LiveCheckRequest) => LiveCheckResult | Promise<LiveCheckResult>,
+  answers: readonly string[] = [],
+) {
+  const checks: LiveCheckRequest[] = [];
+  const unanswered = [...answers];
+  const transport: LiveModelTransport = {
+    async *reply() {
+      const answer = unanswered.shift();
+      if (answer !== undefined) yield { kind: "text", text: answer };
+    },
+    async check(request) {
+      checks.push(request);
+      return decide(request);
+    },
+  };
+  return { transport, checks };
+}
+
+/**
+ * A transport whose checks wait until the test answers them. Like a request
+ * that is slow to notice its abort, an answer still arrives after the check it
+ * answers has been cancelled. Its replies say nothing.
+ */
+function heldChecks() {
+  const checks: LiveCheckRequest[] = [];
+  const answers: Array<(result: LiveCheckResult) => void> = [];
+  const transport: LiveModelTransport = {
+    async *reply() {},
+    check(request) {
+      checks.push(request);
+      return new Promise((resolve) => { answers.push(resolve); });
+    },
+  };
+  return {
+    transport,
+    checks,
+    /** Answers the newest check. */
+    answer: (result: LiveCheckResult) => { answers.at(-1)?.(result); },
+  };
+}
+
+/** An event log that yields each batch to one read, in order, and nothing after. */
+function eventLog(...batches: ObservedAction[][]): LiveAssistOptions["events"] {
+  return { read: async () => batches.shift() ?? [] };
+}
+
+/** An event log in which the user takes `action` again before every read. */
+function eventLogRepeating(action: ObservedAction): LiveAssistOptions["events"] {
+  return { read: async () => [{ ...action }] };
 }
 
 const committedClick: ObservedAction = {
@@ -256,6 +325,23 @@ function rowClicks(from: number, to: number): ObservedAction[] {
     kind: "click",
     description: `clicked "Row ${from + offset}" in Northstar Ledger`,
     timestampMs: (from + offset) * 1_000,
+    committed: false,
+  }));
+}
+
+const typing: ObservedAction = {
+  kind: "key",
+  description: "key",
+  timestampMs: 1_000,
+  committed: false,
+};
+
+/** One scroll gesture, which the input monitor reports once per scroll-wheel event. */
+function scrolls(times: number): ObservedAction[] {
+  return Array.from({ length: times }, (_, index) => ({
+    kind: "scroll",
+    description: "scrolled in Northstar Ledger",
+    timestampMs: 2_000 + index * 16,
     committed: false,
   }));
 }
@@ -1122,5 +1208,436 @@ describe("what the tutor remembers of an interrupted conversation", () => {
       "user: Which total should I use?",
       "assistant: Use the invoice total.",
     ]);
+  });
+});
+
+// Spec §5.5. The service considers asking every five seconds. Each test runs
+// the fake clock from the start of the session, when the tutor has said
+// nothing, and the tutor leaves the user the same forty-five seconds then as
+// after it has spoken.
+describe("speaking first", () => {
+  it("waits by default as long as the spec sets out", () => {
+    expect(LIVE_PROACTIVE_DEFAULTS).toEqual({ quietMs: 2_000, speechGapMs: 45_000, checkIntervalMs: 20_000 });
+  });
+
+  it("asks after a committed action once the quiet period has passed", async () => {
+    const harness = await makeHarness({
+      transport: checkingTransport(() => ({ ask: true, question: "Should a difference under $1.00 still count as a match?" })).transport,
+      events: eventLog([committedClick]),
+    });
+
+    await harness.at(46_000);
+
+    expect(harness.sidecar.spoken.map((item) => item.text)).toEqual([
+      "Should a difference under $1.00 still count as a match?",
+    ]);
+  });
+
+  it("stays quiet when the model says not to ask", async () => {
+    const harness = await makeHarness({
+      transport: checkingTransport(() => ({ ask: false })).transport,
+      events: eventLog([committedClick]),
+    });
+    await harness.at(46_000);
+    expect(harness.sidecar.spoken).toHaveLength(0);
+  });
+
+  it("never asks about typing or scrolling", async () => {
+    const harness = await makeHarness({
+      transport: checkingTransport(() => ({ ask: true, question: "Why?" })).transport,
+      events: eventLog([typing, ...scrolls(3)]),
+    });
+    await harness.at(46_000);
+    expect(harness.sidecar.spoken).toHaveLength(0);
+  });
+
+  it("waits out the quiet period after the user speaks", async () => {
+    const harness = await makeHarness({
+      transport: checkingTransport(() => ({ ask: true, question: "Why?" })).transport,
+      events: eventLog([committedClick]),
+    });
+
+    await harness.at(44_000);
+    harness.emitTranscript("hmm", false);
+    await harness.at(46_500);
+
+    expect(harness.sidecar.spoken).toHaveLength(0);
+  });
+
+  it("keeps at least forty-five seconds between its own questions", async () => {
+    let checks = 0;
+    const harness = await makeHarness({
+      transport: checkingTransport(() => { checks += 1; return { ask: true, question: `Question ${checks}?` }; }).transport,
+      events: eventLog([committedClick]),
+    });
+
+    await harness.at(46_000);
+    harness.finishUtterances();
+    await harness.at(67_000);
+
+    expect(harness.sidecar.spoken).toHaveLength(1);
+  });
+
+  it("drops a check the moment the user starts speaking", async () => {
+    let resolveCheck: ((value: { ask: boolean; question?: string }) => void) | undefined;
+    const harness = await makeHarness({
+      transport: {
+        async *reply() { yield { kind: "text", text: "Answer." }; },
+        check: () => new Promise((resolve) => { resolveCheck = resolve; }),
+      },
+      events: eventLog([committedClick]),
+    });
+
+    await harness.at(46_000);
+    harness.emitTranscript("wait", false);
+    resolveCheck?.({ ask: true, question: "Why?" });
+    await harness.at(46_100);
+
+    expect(harness.sidecar.spoken).toHaveLength(0);
+  });
+
+  it("shows the screen being shared while it checks, and goes on listening", async () => {
+    const held = heldChecks();
+    const harness = await makeHarness({ transport: held.transport, events: eventLog([committedClick]) });
+
+    await harness.at(45_000);
+    expect(held.checks).toHaveLength(1);
+    expect(harness.updates.at(-1)).toMatchObject({ state: "listening", sharing: true });
+
+    held.answer({ ask: false });
+    await harness.settle();
+
+    expect(harness.updates.at(-1)).toMatchObject({ state: "listening", sharing: false });
+  });
+
+  it("speaks its question sentence by sentence, and remembers it with the action behind it once heard", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({
+      transport: { ...model.transport, check: async () => ({ ask: true, question: "You flagged that one. Was it the amount?" }) },
+      events: eventLog([committedClick]),
+    });
+
+    await harness.at(45_000);
+    expect(spokenTexts(harness)).toEqual(["You flagged that one.", "Was it the amount?"]);
+    harness.finishUtterances();
+
+    harness.emitTranscript("Yes, it was forty cents over.", true);
+    await harness.at(45_700);
+
+    expect(model.requests[0]?.history).toEqual([
+      { speaker: "assistant", text: "You flagged that one. Was it the amount?", trigger: committedClick.description },
+    ]);
+  });
+
+  it("reports a check that fails, and says nothing", async () => {
+    const harness = await makeHarness({
+      transport: checkingTransport(() => { throw new LiveModelError("unavailable"); }).transport,
+      events: eventLog([committedClick]),
+    });
+
+    await harness.at(45_000);
+
+    expect(harness.sidecar.spoken).toEqual([]);
+    expect(harness.updates.at(-1)).toMatchObject({ state: "listening", sharing: false, error: "unavailable" });
+  });
+});
+
+// Each test holds every condition of spec §5.5 but one, and shows that one
+// alone keeps the tutor from checking.
+describe("when the tutor may speak first", () => {
+  it("leaves forty-five seconds from the moment it falls silent, whatever it last said", async () => {
+    const { transport, checks } = checkingTransport(() => ({ ask: false }), ["The third one."]);
+    const harness = await makeHarness({ transport, events: eventLogRepeating(committedClick) });
+
+    // The user asks, and the answer is still being heard at sixty seconds.
+    await harness.at(40_000);
+    harness.emitTranscript("Which column is the total?", true);
+    await harness.at(60_000);
+    expect(spokenTexts(harness)).toEqual(["The third one."]);
+    harness.finishUtterances();
+
+    await harness.at(100_000);
+    expect(checks).toHaveLength(0);
+    await harness.at(105_000);
+    expect(checks).toHaveLength(1);
+  });
+
+  it("leaves twenty seconds between one check and the next", async () => {
+    const { transport, checks } = checkingTransport(() => ({ ask: false }));
+    const harness = await makeHarness({ transport, events: eventLogRepeating(committedClick) });
+
+    await harness.at(45_000);
+    expect(checks).toHaveLength(1);
+    await harness.at(60_000);
+    expect(checks).toHaveLength(1);
+    await harness.at(65_000);
+    expect(checks).toHaveLength(2);
+  });
+
+  it("never checks while paused, and checks again once resumed", async () => {
+    const { transport, checks } = checkingTransport(() => ({ ask: false }));
+    const harness = await makeHarness({ transport, events: eventLogRepeating(committedClick) });
+
+    await harness.at(30_000);
+    await harness.service.setPaused(true);
+    await harness.at(90_000);
+    expect(checks).toHaveLength(0);
+
+    await harness.service.setPaused(false);
+    await harness.at(95_000);
+    expect(checks).toHaveLength(1);
+  });
+
+  it("never checks while it is working on an answer", async () => {
+    const model = heldTransport();
+    const { transport, checks } = checkingTransport(() => ({ ask: false }));
+    const harness = await makeHarness({
+      transport: { reply: model.transport.reply, check: transport.check },
+      events: eventLogRepeating(committedClick),
+    });
+
+    await harness.at(40_000);
+    harness.emitTranscript("Which column is the total?", true);
+    await harness.at(60_000);
+    expect(harness.service.state).toBe("thinking");
+    expect(checks).toHaveLength(0);
+
+    // The answer ends without a word, so nothing else holds the tutor back.
+    model.finish();
+    await harness.at(65_000);
+    expect(checks).toHaveLength(1);
+  });
+
+  it("never checks while the user's words wait for their turn to close", async () => {
+    const model = heldTransport();
+    const { transport, checks } = checkingTransport(() => ({ ask: false }));
+    const harness = await makeHarness({
+      transport: { reply: model.transport.reply, check: transport.check },
+      events: eventLogRepeating(committedClick),
+      proactive: { quietMs: 0 },
+    });
+
+    await harness.at(44_500);
+    harness.emitTranscript("Which column is the total?", true);
+    // The check at forty-five seconds comes while the turn is still open.
+    await harness.at(45_100);
+
+    expect(checks).toHaveLength(0);
+  });
+
+  it("never begins a check while another is under way", async () => {
+    const held = heldChecks();
+    const harness = await makeHarness({
+      transport: held.transport,
+      events: eventLogRepeating(committedClick),
+      proactive: { checkIntervalMs: 0 },
+    });
+
+    await harness.at(45_000);
+    expect(held.checks).toHaveLength(1);
+    await harness.at(60_000);
+    expect(held.checks).toHaveLength(1);
+  });
+
+  it("checks each committed action at most once", async () => {
+    const { transport, checks } = checkingTransport(() => ({ ask: false }));
+    const harness = await makeHarness({ transport, events: eventLog([committedClick]) });
+
+    await harness.at(120_000);
+
+    expect(checks.map((check) => check.trigger)).toEqual([committedClick.description]);
+  });
+});
+
+describe("what a check is told", () => {
+  it("is told what a reply is told, with the action in place of the user's words, and no turn nobody heard", async () => {
+    const { transport, checks } = checkingTransport(() => ({ ask: false }), ["The third one.", "It includes tax."]);
+    const harness = await makeHarness({ transport, events: eventLog([], [], [committedClick]) });
+
+    harness.emitTranscript("Which column is the total?", true);
+    await harness.at(700);
+    harness.finishUtterances();
+    // The user talks over the second answer before any of it is heard.
+    await harness.at(5_000);
+    harness.emitTranscript("And the tax?", true);
+    await harness.at(5_700);
+    expect(spokenTexts(harness)).toEqual(["The third one.", "It includes tax."]);
+    await harness.at(6_000);
+    harness.emitTranscript("hmm", false);
+
+    // Forty-five seconds after the tutor fell silent.
+    await harness.at(55_000);
+
+    expect(checks).toHaveLength(1);
+    expect(checks[0]).toMatchObject({
+      system: LIVE_SYSTEM_PROMPT,
+      actions: [committedClick.description],
+      screenshot: { base64: "ZmFrZS1qcGVn" },
+      trigger: committedClick.description,
+    });
+    expect(historyLines(checks[0])).toEqual([
+      "user: Which column is the total?",
+      "assistant: The third one.",
+      "user: And the tax?",
+    ]);
+    expect(harness.removedImages).toEqual(harness.sidecar.screenshots);
+  });
+
+  it("asks about a committed action that later actions have pushed out of the recent ones", async () => {
+    const { transport, checks } = checkingTransport(() => ({ ask: false }));
+    const harness = await makeHarness({ transport, events: eventLog([committedClick, ...rowClicks(1, 12)]) });
+
+    await harness.at(45_000);
+
+    expect(checks).toHaveLength(1);
+    expect(checks[0]?.trigger).toBe(committedClick.description);
+    expect(checks[0]?.actions).toEqual(rowClicks(3, 12).map((action) => action.description));
+  });
+
+  it("tells a run of identical actions as one, so a scroll never pushes out the click before it", async () => {
+    const { transport, checks } = checkingTransport(() => ({ ask: false }));
+    const harness = await makeHarness({ transport, events: eventLog([committedClick, ...scrolls(23)]) });
+
+    await harness.at(45_000);
+
+    expect(checks[0]?.actions).toEqual([committedClick.description, "scrolled in Northstar Ledger (23 times)"]);
+  });
+
+  it("still checks a second click on the same control, though the two are told as one", async () => {
+    const { transport, checks } = checkingTransport(() => ({ ask: false }));
+    const harness = await makeHarness({
+      transport,
+      events: eventLog([committedClick], [{ ...committedClick, timestampMs: 50_000 }]),
+    });
+
+    await harness.at(65_000);
+
+    expect(checks.map((check) => check.trigger)).toEqual([committedClick.description, committedClick.description]);
+    expect(checks[1]?.actions).toEqual([`${committedClick.description} (2 times)`]);
+  });
+});
+
+// Each test lands a pause, End, or the user's voice on a check at one of its
+// awaits: the read of the event log, the screenshot, the model's answer, and
+// the sidecar's speak.
+describe("a check that loses its chance", () => {
+  it("begins no check when a pause lands while the event log is being read", async () => {
+    const reads: Array<(actions: ObservedAction[]) => void> = [];
+    const { transport, checks } = checkingTransport(() => ({ ask: true, question: "Why?" }));
+    const harness = await makeHarness({ transport, events: { read: () => new Promise((resolve) => { reads.push(resolve); }) } });
+
+    await harness.at(45_000);
+    expect(reads).toHaveLength(1);
+
+    await harness.service.setPaused(true);
+    reads[0]!([committedClick]);
+    await harness.settle();
+
+    expect(harness.sidecar.screenshots).toEqual([]);
+    expect(checks).toHaveLength(0);
+    expect(harness.updates.at(-1)).toMatchObject({ state: "paused", sharing: false });
+  });
+
+  it("sends nothing to Claude when a pause lands while the check's screenshot is being taken", async () => {
+    const { transport, checks } = checkingTransport(() => ({ ask: true, question: "Why?" }));
+    const harness = await makeHarness({ transport, events: eventLog([committedClick]) });
+    harness.sidecar.hold("screenshot");
+
+    await harness.at(45_000);
+    expect(harness.sidecar.screenshots).toHaveLength(1);
+
+    await harness.service.setPaused(true);
+    harness.sidecar.release("screenshot");
+    await harness.settle();
+
+    expect(checks).toHaveLength(0);
+    expect(harness.removedImages).toEqual(harness.sidecar.screenshots);
+    expect(harness.sidecar.spoken).toEqual([]);
+    expect(harness.updates.at(-1)).toMatchObject({ state: "paused", sharing: false });
+  });
+
+  it("speaks nothing once end() lands while the model decides, and leaves no timer running", async () => {
+    const held = heldChecks();
+    const harness = await makeHarness({ transport: held.transport, events: eventLog([committedClick]) });
+
+    await harness.at(45_000);
+    expect(held.checks).toHaveLength(1);
+
+    const ending = harness.service.end();
+    held.answer({ ask: true, question: "Why?" });
+    await ending;
+
+    expect(harness.sidecar.spoken).toEqual([]);
+    expect(harness.updates.at(-1)).toMatchObject({ state: "ended", sharing: false });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("says nothing more of a question the user talks over", async () => {
+    const { transport } = checkingTransport(() => ({ ask: true, question: "You flagged that one. Was it the amount?" }));
+    const harness = await makeHarness({ transport, events: eventLog([committedClick]) });
+    harness.sidecar.hold("speak");
+
+    await harness.at(45_000);
+    expect(spokenTexts(harness)).toEqual(["You flagged that one."]);
+
+    harness.emitTranscript("hang on", false);
+    harness.sidecar.release("speak");
+    await harness.settle();
+
+    expect(spokenTexts(harness)).toEqual(["You flagged that one."]);
+    expect(harness.sidecar.stopSpeakingCount).toBe(1);
+    expect(harness.service.state).toBe("listening");
+  });
+});
+
+describe("reading the event log", () => {
+  it("never reads it twice at once, whether a check or a reply asks", async () => {
+    const reads: Array<(actions: ObservedAction[]) => void> = [];
+    const model = heldTransport();
+    const { transport, checks } = checkingTransport(() => ({ ask: false }));
+    const harness = await makeHarness({
+      transport: { reply: model.transport.reply, check: transport.check },
+      events: { read: () => new Promise((resolve) => { reads.push(resolve); }) },
+    });
+
+    await harness.at(45_000);
+    expect(reads).toHaveLength(1);
+
+    // The user speaks while the check's read is under way, and their turn
+    // closes before it finishes.
+    harness.emitTranscript("Why did I flag that?", true);
+    await harness.at(45_700);
+    expect(reads).toHaveLength(1);
+
+    reads[0]!([committedClick]);
+    await harness.settle();
+    expect(reads).toHaveLength(2);
+    reads[1]!([]);
+    await harness.settle();
+
+    // No check began once the user had spoken, and the action the check's
+    // read found reaches the reply.
+    expect(checks).toHaveLength(0);
+    expect(model.requests[0]?.actions).toEqual([committedClick.description]);
+  });
+
+  it("ends even while a read of it never returns", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({
+      transport: model.transport,
+      events: { read: () => new Promise<ObservedAction[]>(() => {}) },
+    });
+
+    // A check's read, and then a reply's, wait on the log.
+    await harness.at(45_000);
+    harness.emitTranscript("Why did I flag that?", true);
+    await harness.at(45_700);
+    expect(harness.service.state).toBe("thinking");
+
+    await harness.service.end();
+
+    expect(harness.service.state).toBe("ended");
+    expect(harness.sidecar.screenshots).toEqual([]);
+    expect(model.requests).toHaveLength(0);
   });
 });

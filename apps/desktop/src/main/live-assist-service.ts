@@ -3,7 +3,7 @@ import { chmod, mkdtemp, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LiveState, LiveUpdate } from "../shared/contracts.js";
-import { describeActions, type ObservedAction } from "./live-events-tail.js";
+import { appendActions, describeActions, type ObservedAction } from "./live-events-tail.js";
 import { LiveModelError, type LiveHistoryItem, type LiveModelTransport, type LiveReplyRequest } from "./live-model.js";
 
 export interface LiveTranscriptSignal {
@@ -53,7 +53,34 @@ export interface LiveAssistOptions {
   now?: () => number;
   turnSilenceMs?: number;
   requestTimeoutMs?: number;
+  /** Replaces any of `LIVE_PROACTIVE_DEFAULTS`, which decide when the tutor may ask a question of its own. */
+  proactive?: Partial<LiveProactiveTimings>;
 }
+
+/**
+ * The silences that must all have passed before the tutor checks whether to
+ * ask a question of its own (spec §5.5).
+ */
+export interface LiveProactiveTimings {
+  /** Since the user was last heard: any transcript event, partial or final. */
+  quietMs: number;
+  /**
+   * Since the tutor last spoke, whatever it said. It has not spoken when the
+   * session starts, and leaves the user this long from then as well.
+   */
+  speechGapMs: number;
+  /** Since the last check began. */
+  checkIntervalMs: number;
+}
+
+export const LIVE_PROACTIVE_DEFAULTS: Readonly<LiveProactiveTimings> = {
+  quietMs: 2_000,
+  speechGapMs: 45_000,
+  checkIntervalMs: 20_000,
+};
+
+/** How often the tutor considers checking whether to ask a question of its own. */
+const PROACTIVE_POLL_MS = 5_000;
 
 const SENTENCE_LIMIT = 200;
 
@@ -135,19 +162,33 @@ export function splitSentences(buffer: string): { sentences: string[]; rest: str
   return { sentences, rest };
 }
 
-/** One closed turn's request to the model, and the speech it produces. */
-interface Reply {
-  readonly userText: string;
+/** What any work holding the floor keeps. */
+interface ReplyBase {
   readonly controller: AbortController;
   /** True once any sentence of this reply has been handed to the sidecar. */
   spoke: boolean;
   /** True once the request has run past `requestTimeoutMs`. */
   timedOut: boolean;
-  /** The user's turn as the history will hold it, once its screenshot has been taken. */
-  userTurn: LiveHistoryItem | undefined;
   /** This reply's turn in the history, from the moment it first speaks. */
   assistantTurn: LiveHistoryItem | undefined;
 }
+
+/** One closed turn's request to the model, and the speech it produces. */
+interface Answer extends ReplyBase {
+  readonly kind: "answer";
+  readonly userText: string;
+  /** The user's turn as the history will hold it, once its screenshot has been taken. */
+  userTurn: LiveHistoryItem | undefined;
+}
+
+/** A check on one committed action (spec §5.5), and the question it may end in. */
+interface Check extends ReplyBase {
+  readonly kind: "check";
+  readonly trigger: ObservedAction;
+}
+
+/** Whatever holds the floor: an answer to the user, or a check of the tutor's own. */
+type Reply = Answer | Check;
 
 /** A sentence handed to the sidecar, and the assistant turn it joins once it has been heard to the end. */
 interface Utterance {
@@ -158,13 +199,17 @@ interface Utterance {
 /**
  * Assembles turns from streamed speech, sends one request per turn, speaks
  * the reply sentence by sentence, and yields to the user the moment they
- * speak again.
+ * speak again. After a committed action, once the user and the tutor have
+ * both been quiet long enough, it checks whether to ask a question of its
+ * own (spec §5.5).
  *
  * Event handlers and control calls run while a reply is suspended at any of
  * its awaits (the event log read, the screenshot, the next streamed chunk,
- * the sidecar's speak), so the class keeps these invariants. Code that
- * extends a reply must keep them too: call `#shouldContinue` after each of
- * its own awaits, and speak only through `#speak`.
+ * the model's decision on a check, the sidecar's speak), so the class keeps
+ * these invariants. A check holds the floor just as an answer to the user
+ * does, and "reply" below means either. Code that extends a reply must keep
+ * them too: call `#shouldContinue` after each of its own awaits, and speak
+ * only through `#speak`.
  *
  * 1. Only the current reply acts. The user speaking, `setPaused`, `end`, and
  *    a sidecar failure each supersede the current reply synchronously and
@@ -181,6 +226,8 @@ interface Utterance {
  *    moment of publishing, with `ended`, `failed`, and `paused` taking
  *    precedence, and a superseded reply publishes nothing. Once paused, the
  *    state stays `paused` until resumed; once failed or ended, it stays so.
+ *    A check answers nothing the user said, so it leaves the state
+ *    `listening` until it speaks, but it is sharing the screen all the same.
  * 4. `end()` is final and waits for the work. Before its first await it
  *    supersedes the reply, stops speech, detaches from the sidecar, and
  *    publishes `ended`; it resolves only once every reply has unwound. It
@@ -201,10 +248,23 @@ interface Utterance {
  *    assistant's turn only when the sidecar reports it finished while it is
  *    still outstanding, so a stopped sentence never does, even if reported
  *    finished late. Nothing else writes to the history, and `#speak` refuses
- *    a reply that has lost the floor, so such a reply adds nothing to it.
+ *    a reply that has lost the floor, so such a reply adds nothing to it. A
+ *    check has no user's turn, so its question enters the history alone, with
+ *    the action it asks about.
  * 7. No action the event log yields is lost. Reads of the log never overlap,
  *    and what a read returns is kept even when the reply that asked for it
  *    has lost the floor, because the log yields each action only once.
+ *    Identical actions in a row are merged before the stored actions are
+ *    bounded, and each read's newest committed action is kept apart as the
+ *    read arrives, so no run of later actions can push out the action a
+ *    check is about. A reply stops waiting for a read once it loses the
+ *    floor or times out, though the read still finishes and is kept, so a
+ *    read that never returns never holds up `end()`.
+ * 8. The tutor speaks first only when spec §5.5 allows it, and checks each
+ *    committed action at most once. A poll reads the event log only when the
+ *    moment allows a check, then tests every condition again once the read
+ *    is back, in the synchronous step in which the check takes the floor.
+ *    Until then the poll holds nothing, so nothing waits for it.
  */
 export class LiveAssistService {
   readonly #options: LiveAssistOptions &
@@ -238,6 +298,23 @@ export class LiveAssistService {
   #reading: Promise<void> = Promise.resolve();
   /** When the session began, by `now()`, which screenshot times are measured from. */
   readonly #startedAt: number;
+  readonly #proactive: LiveProactiveTimings;
+  /** Considers checking whether to ask a question of the tutor's own, every `PROACTIVE_POLL_MS`. */
+  #pollTimer: NodeJS.Timeout | undefined;
+  /** True while a poll waits for its read of the event log. */
+  #considering = false;
+  /** The newest committed action the event log has yielded that no check has yet been about. */
+  #trigger: ObservedAction | undefined;
+  /** When the user was last heard, by `now()`. */
+  #lastHeardAt = Number.NEGATIVE_INFINITY;
+  /**
+   * When the tutor last spoke, by `now()`: the latest moment a sentence was
+   * handed to the sidecar, finished, or was stopped. Until it first speaks,
+   * the session's start.
+   */
+  #lastSpokeAt: number;
+  /** When the latest check began, by `now()`. */
+  #lastCheckAt = Number.NEGATIVE_INFINITY;
 
   constructor(options: LiveAssistOptions) {
     this.#options = {
@@ -247,7 +324,9 @@ export class LiveAssistService {
       removeImage: (path) => unlink(path),
       ...options,
     };
+    this.#proactive = { ...LIVE_PROACTIVE_DEFAULTS, ...options.proactive };
     this.#startedAt = this.#options.now();
+    this.#lastSpokeAt = this.#startedAt;
   }
 
   get state(): LiveState {
@@ -256,7 +335,8 @@ export class LiveAssistService {
     if (this.#paused) return "paused";
     if (!this.#started) return "starting";
     if (this.#utterances.size > 0 || this.#reply?.spoke === true) return "speaking";
-    if (this.#reply !== undefined) return "thinking";
+    // A check answers nothing the user said, so the tutor is still listening.
+    if (this.#reply?.kind === "answer") return "thinking";
     if (this.#preparingModel) return "preparing_model";
     return "listening";
   }
@@ -280,6 +360,7 @@ export class LiveAssistService {
       sidecar.onSpeech((event) => this.#onSpeech(event)),
       sidecar.onState((event) => this.#onSidecarState(event)),
     );
+    this.#pollTimer = setInterval(() => this.#considerAsking(), PROACTIVE_POLL_MS);
     this.#publish();
   }
 
@@ -299,6 +380,7 @@ export class LiveAssistService {
   async end(): Promise<void> {
     if (this.#ending === undefined) {
       this.#ended = true;
+      clearInterval(this.#pollTimer);
       this.#clearTurn();
       this.#supersedeReply();
       const stopping = this.#stopSpeaking();
@@ -325,6 +407,7 @@ export class LiveAssistService {
 
   #onTranscript(event: LiveTranscriptSignal): void {
     if (this.#paused || this.#ended || this.#failed) return;
+    this.#lastHeardAt = this.#options.now();
     this.#heard = { text: event.text, final: event.isFinal };
     this.#yieldToUser();
     if (event.isFinal) this.#turn = joinWords(this.#turn, event.text);
@@ -335,7 +418,7 @@ export class LiveAssistService {
   /** Whatever the tutor is doing, the user speaking takes precedence. */
   #yieldToUser(): void {
     const reply = this.#supersedeReply();
-    if (reply !== undefined && !reply.spoke) {
+    if (reply?.kind === "answer" && !reply.spoke) {
       // Nothing has been said yet, so the user is still in the same turn:
       // their earlier words are sent again with the rest when it closes.
       this.#turn = joinWords(reply.userText, this.#turn);
@@ -361,55 +444,46 @@ export class LiveAssistService {
     const userText = this.#turn;
     if (userText === "" || this.#paused || this.#ended || this.#failed) return;
     this.#turn = "";
-    const reply: Reply = {
+    this.#takeFloor({
+      kind: "answer",
       userText,
       controller: new AbortController(),
       spoke: false,
       timedOut: false,
       userTurn: undefined,
       assistantTurn: undefined,
-    };
+    });
+  }
+
+  /**
+   * Gives `reply` the floor and publishes that. The reply is tracked before
+   * the update is published but starts only after, so a control call made
+   * from that update both supersedes it before any screenshot is taken and,
+   * if it is `end()`, waits for it.
+   */
+  #takeFloor(reply: Reply): void {
     this.#reply = reply;
-    // The reply is tracked before `thinking` is published but starts only
-    // after, so a control call made from that update both supersedes it before
-    // any screenshot is taken and, if it is `end()`, waits for it.
-    const running = Promise.resolve().then(() => this.#respond(reply));
+    const running = Promise.resolve().then(() => this.#run(reply));
     this.#running.add(running);
     const forget = () => { this.#running.delete(running); };
     running.then(forget, forget);
     this.#publish();
   }
 
-  async #respond(reply: Reply): Promise<void> {
+  /**
+   * Runs `reply` within the request timeout. Only a reply that still holds
+   * the floor reports its failure, and it gives the floor back however it
+   * ends.
+   */
+  async #run(reply: Reply): Promise<void> {
     if (!this.#shouldContinue(reply)) return;
     const timeout = setTimeout(() => {
       reply.timedOut = true;
       reply.controller.abort();
     }, this.#options.requestTimeoutMs);
     try {
-      const request = await this.#composeReplyRequest(reply);
-      if (request === undefined || !this.#shouldContinue(reply)) return;
-      let buffer = "";
-      for await (const chunk of this.#options.transport.reply(request)) {
-        if (!this.#shouldContinue(reply)) return;
-        if (chunk.kind === "text") {
-          const { sentences, rest } = splitSentences(buffer + chunk.text);
-          buffer = rest;
-          for (const sentence of sentences) {
-            await this.#speak(reply, sentence);
-            if (!this.#shouldContinue(reply)) return;
-          }
-        } else if (chunk.kind === "refusal") {
-          // Whatever the model began before refusing is never said.
-          buffer = "";
-          await this.#speak(reply, REFUSAL_REPLY);
-          if (!this.#shouldContinue(reply)) return;
-        }
-      }
-      if (!this.#shouldContinue(reply)) return;
-      await this.#speak(reply, buffer.trim());
-      if (!this.#shouldContinue(reply)) return;
-      this.#error = undefined;
+      if (reply.kind === "answer") await this.#respond(reply);
+      else await this.#ask(reply);
     } catch (cause) {
       // A superseded reply's failure, such as its own aborted request, is no
       // longer anyone's concern.
@@ -423,6 +497,117 @@ export class LiveAssistService {
         this.#publish();
       }
     }
+  }
+
+  /** Answers the user's closed turn, speaking each sentence as the answer streams in. */
+  async #respond(reply: Answer): Promise<void> {
+    const request = await this.#composeReplyRequest(reply);
+    if (request === undefined || !this.#shouldContinue(reply)) return;
+    let buffer = "";
+    for await (const chunk of this.#options.transport.reply(request)) {
+      if (!this.#shouldContinue(reply)) return;
+      if (chunk.kind === "text") {
+        const { sentences, rest } = splitSentences(buffer + chunk.text);
+        buffer = rest;
+        for (const sentence of sentences) {
+          await this.#speak(reply, sentence);
+          if (!this.#shouldContinue(reply)) return;
+        }
+      } else if (chunk.kind === "refusal") {
+        // Whatever the model began before refusing is never said.
+        buffer = "";
+        await this.#speak(reply, REFUSAL_REPLY);
+        if (!this.#shouldContinue(reply)) return;
+      }
+    }
+    if (!this.#shouldContinue(reply)) return;
+    await this.#speak(reply, buffer.trim());
+    if (!this.#shouldContinue(reply)) return;
+    this.#error = undefined;
+  }
+
+  /**
+   * Runs every `PROACTIVE_POLL_MS`. When the moment allows a check, reads the
+   * event log, and begins a check if the moment still allows one once the
+   * read is back. Until then the poll holds nothing, so nothing waits for it:
+   * not `end()`, and not a reply, whose own read queues behind this one and
+   * stops being waited for once the reply loses the floor or times out.
+   */
+  #considerAsking(): void {
+    if (this.#considering || !this.#mayCheck(this.#options.now())) return;
+    this.#considering = true;
+    // A failed read leaves nothing new to ask about, and a turn whose own read
+    // fails reports it.
+    void this.#readNewActions().catch(() => undefined).then(() => {
+      this.#considering = false;
+      this.#beginCheck();
+    });
+  }
+
+  /**
+   * Gives the floor to a check on the newest committed action not yet checked,
+   * if spec §5.5 allows a check at this moment.
+   */
+  #beginCheck(): void {
+    const now = this.#options.now();
+    const trigger = this.#trigger;
+    if (trigger === undefined || !this.#mayCheck(now)) return;
+    // Checked once, however the check ends.
+    this.#trigger = undefined;
+    this.#lastCheckAt = now;
+    this.#takeFloor({
+      kind: "check",
+      trigger,
+      controller: new AbortController(),
+      spoke: false,
+      timedOut: false,
+      assistantTurn: undefined,
+    });
+  }
+
+  /** Whether spec §5.5 allows a check at `now`, whatever the trigger. */
+  #mayCheck(now: number): boolean {
+    const { quietMs, speechGapMs, checkIntervalMs } = this.#proactive;
+    return (
+      // Started, and not paused, ended, failed, preparing the speech model,
+      // answering, or speaking.
+      this.state === "listening" &&
+      // A check under way leaves the state `listening`.
+      this.#reply === undefined &&
+      // Words heard that have not yet closed into a turn are about to be answered.
+      this.#turnTimer === undefined &&
+      now - this.#lastHeardAt >= quietMs &&
+      now - this.#lastSpokeAt >= speechGapMs &&
+      now - this.#lastCheckAt >= checkIntervalMs
+    );
+  }
+
+  /**
+   * Asks the model whether one short question about `check`'s action would
+   * help, and if so says it as an answer is said, sentence by sentence. The
+   * check is told what an answer is told, from the actions its poll has just
+   * read, with the action in place of the user's words.
+   */
+  async #ask(check: Check): Promise<void> {
+    const screenshot = await this.#captureScreenshot();
+    if (!this.#shouldContinue(check)) return;
+    const result = await this.#options.transport.check({
+      system: LIVE_SYSTEM_PROMPT,
+      actions: describeActions(this.#observed, RECENT_ACTION_LIMIT),
+      history: this.#historyForRequest(),
+      screenshot,
+      trigger: check.trigger.description,
+      signal: check.controller.signal,
+    });
+    if (!this.#shouldContinue(check)) return;
+    if (result.ask && result.question !== undefined) {
+      const { sentences, rest } = splitSentences(result.question);
+      for (const sentence of [...sentences, rest.trim()]) {
+        await this.#speak(check, sentence);
+        if (!this.#shouldContinue(check)) return;
+      }
+    }
+    this.#error = undefined;
   }
 
   /**
@@ -445,8 +630,11 @@ export class LiveAssistService {
    * read before the screenshot is taken, so a reply that loses the floor
    * during the read takes no screenshot.
    */
-  async #composeReplyRequest(reply: Reply): Promise<LiveReplyRequest | undefined> {
-    await this.#readNewActions();
+  async #composeReplyRequest(reply: Answer): Promise<LiveReplyRequest | undefined> {
+    // Waited for only while the reply holds the floor and has time left, so a
+    // read that never returns costs a turn no more than its timeout, and never
+    // holds up `end()`.
+    await unlessAborted(this.#readNewActions(), reply.controller.signal);
     if (!this.#shouldContinue(reply)) return undefined;
     const takenAt = formatClock(this.#options.now() - this.#startedAt);
     const screenshot = await this.#captureScreenshot();
@@ -465,17 +653,20 @@ export class LiveAssistService {
 
   /**
    * Adds whatever the event log has gained since the last read to the
-   * observed actions. The tail's read offset cannot be shared by overlapping
-   * reads, so each read waits for the one before it. What a read returns is
-   * kept whether or not the reply that asked for it still holds the floor,
-   * because the tail yields each action only once.
+   * observed actions, and keeps the newest committed action among them as the
+   * next check's trigger. The tail's read offset cannot be shared by
+   * overlapping reads, so each read waits for the one before it. What a read
+   * returns is kept whether or not the reply that asked for it still holds
+   * the floor, because the tail yields each action only once.
    */
   #readNewActions(): Promise<void> {
     const reading = this.#reading.then(async () => {
       const actions = await this.#options.events.read();
-      // Every key press and scroll is an action, so only as many as a request
-      // describes are kept.
-      this.#observed = [...this.#observed, ...actions.slice(-RECENT_ACTION_LIMIT)].slice(-RECENT_ACTION_LIMIT);
+      // Every key press and scroll-wheel event is an action, so identical ones
+      // in a row are merged, and only as many as a request describes are kept.
+      this.#observed = appendActions(this.#observed, actions, RECENT_ACTION_LIMIT);
+      // Kept apart from the observed actions, which later ones can push out.
+      this.#trigger = actions.findLast((action) => action.committed) ?? this.#trigger;
     });
     // A failed read fails the turn that asked for it, never the reads after it.
     this.#reading = reading.catch(() => undefined);
@@ -493,16 +684,21 @@ export class LiveAssistService {
   }
 
   /**
-   * Enters `reply` into the history as it first speaks: the user's turn, then
-   * the assistant's, which stays empty until a sentence of it is heard to the
-   * end. Answers the assistant's turn. The history keeps only what a request
-   * could still send, so a screenshot that has aged out is dropped from memory
-   * too; `boundHistory` keeps the assistant's turn as the same object, so the
+   * Enters `reply` into the history as it first speaks: the user's turn, if
+   * it answers one, then the assistant's, which stays empty until a sentence
+   * of it is heard to the end. A check's turn names the action it asks about.
+   * Answers the assistant's turn. The history keeps only what a request could
+   * still send, so a screenshot that has aged out is dropped from memory too;
+   * `boundHistory` keeps the assistant's turn as the same object, so the
    * sentences heard later still reach it.
    */
   #remember(reply: Reply): LiveHistoryItem {
-    const assistantTurn: LiveHistoryItem = { speaker: "assistant", text: "" };
-    const turns = reply.userTurn === undefined ? [assistantTurn] : [reply.userTurn, assistantTurn];
+    const assistantTurn: LiveHistoryItem =
+      reply.kind === "check"
+        ? { speaker: "assistant", text: "", trigger: reply.trigger.description }
+        : { speaker: "assistant", text: "" };
+    const turns =
+      reply.kind === "answer" && reply.userTurn !== undefined ? [reply.userTurn, assistantTurn] : [assistantTurn];
     this.#history = boundHistory([...this.#history, ...turns], HISTORY_TURN_LIMIT, HISTORY_SCREENSHOT_LIMIT);
     return assistantTurn;
   }
@@ -535,6 +731,7 @@ export class LiveAssistService {
     this.#utterances.set(utteranceId, { sentence, assistantTurn: reply.assistantTurn });
     reply.spoke = true;
     this.#said = sentence;
+    this.#lastSpokeAt = this.#options.now();
     const queued = this.#options.sidecar.speak(utteranceId, sentence);
     this.#publish();
     try {
@@ -554,6 +751,8 @@ export class LiveAssistService {
     // changes nothing.
     if (utterance === undefined) return;
     this.#utterances.delete(event.utteranceId);
+    // Silence is measured from the end of what the tutor said, not its start.
+    this.#lastSpokeAt = this.#options.now();
     // The history holds what the user heard, so a sentence joins it only once
     // it has been spoken to the end.
     if (event.phase === "finished") {
@@ -596,6 +795,7 @@ export class LiveAssistService {
   #stopSpeaking(): Promise<void> | undefined {
     if (this.#utterances.size === 0) return undefined;
     this.#utterances.clear();
+    this.#lastSpokeAt = this.#options.now();
     return this.#options.sidecar.stopSpeaking();
   }
 
@@ -618,6 +818,20 @@ export class LiveAssistService {
 function failureCode(reply: Reply, cause: unknown): string {
   if (reply.timedOut) return "timeout";
   return cause instanceof LiveModelError ? cause.code : "failed";
+}
+
+/**
+ * Waits for `work`, but no longer than until `signal` aborts. Only the wait
+ * gives up: the work carries on, and a failure of the work reaches a waiter
+ * that is still waiting.
+ */
+function unlessAborted(work: Promise<void>, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const giveUp = () => { resolve(); };
+    if (signal.aborted) giveUp();
+    else signal.addEventListener("abort", giveUp, { once: true });
+    void work.then(resolve, reject).finally(() => { signal.removeEventListener("abort", giveUp); });
+  });
 }
 
 function joinWords(...parts: string[]): string {

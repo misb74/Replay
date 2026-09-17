@@ -9,6 +9,11 @@ export interface ObservedAction {
   timestampMs: number;
   /** True for a click on a control that commits, or a switch to another application. */
   committed: boolean;
+  /**
+   * How many identical actions in a row this one stands for, once merged by
+   * `appendActions`. Absent on an action read from the log, which is one.
+   */
+  count?: number;
 }
 
 /**
@@ -88,13 +93,48 @@ export class LiveEventsTail {
 }
 
 /**
- * The descriptions of the last `limit` actions, oldest first. Pure and
- * history-free: callers that need a rolling window (such as the conversation
- * service) keep their own list of observed actions across reads and pass it
- * in here, rather than the tail keeping a second, unbounded copy.
+ * `recent` with `incoming` added after it, oldest first, keeping only the
+ * newest `limit` entries. An action described exactly as the entry before it
+ * is merged into that entry, which becomes the newer action with the two
+ * counts added together. The input monitor reports a scroll gesture once per
+ * scroll-wheel event, so without merging one gesture would push every older
+ * action out. Merging happens before the limit is applied, and neither list
+ * given is changed.
+ *
+ * Only the description of an entry is sure to survive merging, so a caller
+ * that acts on a particular action, such as asking about a committed one,
+ * must keep that action apart as it reads it.
+ */
+export function appendActions(
+  recent: readonly ObservedAction[],
+  incoming: readonly ObservedAction[],
+  limit: number,
+): ObservedAction[] {
+  const merged = [...recent];
+  for (const action of incoming) {
+    const last = merged.at(-1);
+    if (last?.description === action.description) {
+      merged[merged.length - 1] = { ...action, count: (last.count ?? 1) + (action.count ?? 1) };
+    } else {
+      merged.push(action);
+    }
+  }
+  return merged.slice(Math.max(0, merged.length - limit));
+}
+
+/**
+ * One line for each of the newest `limit` entries, oldest first, after
+ * merging identical actions in a row (see `appendActions`). A merged entry
+ * says how many actions it stands for, as in `scrolled in Northstar Ledger
+ * (23 times)`. Pure and history-free: callers that need a rolling window
+ * (such as the conversation service) keep their own list of observed actions
+ * across reads and pass it in here, rather than the tail keeping a second,
+ * unbounded copy.
  */
 export function describeActions(actions: readonly ObservedAction[], limit: number): string[] {
-  return actions.slice(-limit).map((action) => action.description);
+  return appendActions([], actions, limit).map((action) =>
+    action.count !== undefined && action.count > 1 ? `${action.description} (${action.count} times)` : action.description,
+  );
 }
 
 function toAction(line: string): ObservedAction | undefined {

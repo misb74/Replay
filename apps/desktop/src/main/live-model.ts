@@ -22,6 +22,8 @@ export interface LiveHistoryItem {
   screenshotTakenAt?: string;
   /** Present on user turns whose screenshot has aged out. */
   screenshotOmittedAt?: string;
+  /** Present on an assistant turn the tutor began itself: the action it asked about. */
+  trigger?: string;
 }
 
 export interface LiveReplyRequest {
@@ -131,31 +133,50 @@ export function parseLiveCheckResult(message: LiveCheckMessage): LiveCheckResult
   }
 }
 
+/**
+ * The messages for a reply or a check, both built here: the history, then the
+ * newest user message, which carries the screenshot, the recent actions, and
+ * `closing`.
+ *
+ * The Messages API requires the first message to be the user's, but the
+ * history can begin with the tutor: a question it asked before the user had
+ * said anything, or a turn left at the front once older turns were dropped.
+ * Those leading turns are never sent as the user's words. The first user
+ * message opens by naming them as what the tutor said earlier.
+ */
+export function liveMessages(request: LiveReplyRequest | LiveCheckRequest, closing: string): Anthropic.MessageParam[] {
+  const firstUserTurn = request.history.findIndex((item) => item.speaker === "user");
+  const leadingCount = firstUserTurn === -1 ? request.history.length : firstUserTurn;
+  const earlier: Anthropic.TextBlockParam[] = leadingCount === 0 ? [] : [{
+    type: "text",
+    text: `[Earlier, you said: "${request.history.slice(0, leadingCount).map((item) => item.text).join(" ")}"]`,
+  }];
+
+  const messages: Anthropic.MessageParam[] = [];
+  for (const item of request.history.slice(leadingCount)) {
+    const blocks: Anthropic.ContentBlockParam[] = messages.length === 0 ? [...earlier] : [];
+    if (item.screenshot) {
+      blocks.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: item.screenshot.base64 } });
+    } else if (item.screenshotOmittedAt) {
+      blocks.push({ type: "text", text: `[screenshot at ${item.screenshotOmittedAt} omitted]` });
+    }
+    blocks.push({ type: "text", text: item.text });
+    messages.push({ role: item.speaker === "user" ? "user" : "assistant", content: blocks });
+  }
+  messages.push({
+    role: "user",
+    content: [
+      ...(messages.length === 0 ? earlier : []),
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: request.screenshot.base64 } },
+      { type: "text", text: `Recent actions:\n${request.actions.join("\n")}` },
+      { type: "text", text: closing },
+    ],
+  });
+  return messages;
+}
+
 export function createClaudeLiveTransport(options: ClaudeLiveTransportOptions): LiveModelTransport {
   const client = new Anthropic({ apiKey: options.apiKey, maxRetries: 1 });
-
-  const content = (request: LiveReplyRequest | LiveCheckRequest, closing: string): Anthropic.MessageParam[] => {
-    const messages: Anthropic.MessageParam[] = [];
-    for (const item of request.history) {
-      const blocks: Anthropic.ContentBlockParam[] = [];
-      if (item.screenshot) {
-        blocks.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: item.screenshot.base64 } });
-      } else if (item.screenshotOmittedAt) {
-        blocks.push({ type: "text", text: `[screenshot at ${item.screenshotOmittedAt} omitted]` });
-      }
-      blocks.push({ type: "text", text: item.text });
-      messages.push({ role: item.speaker === "user" ? "user" : "assistant", content: blocks });
-    }
-    messages.push({
-      role: "user",
-      content: [
-        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: request.screenshot.base64 } },
-        { type: "text", text: `Recent actions:\n${request.actions.join("\n")}` },
-        { type: "text", text: closing },
-      ],
-    });
-    return messages;
-  };
 
   return {
     async *reply(request) {
@@ -167,7 +188,7 @@ export function createClaudeLiveTransport(options: ClaudeLiveTransportOptions): 
             max_tokens: 2048,
             output_config: { effort: "low" },
             system: [{ type: "text", text: request.system, cache_control: { type: "ephemeral" } }],
-            messages: content(request, request.userText),
+            messages: liveMessages(request, request.userText),
           },
           { signal: request.signal },
         );
@@ -206,7 +227,7 @@ export function createClaudeLiveTransport(options: ClaudeLiveTransportOptions): 
               format: { type: "json_schema", schema: CHECK_SCHEMA },
             },
             system: [{ type: "text", text: request.system, cache_control: { type: "ephemeral" } }],
-            messages: content(
+            messages: liveMessages(
               request,
               `The user just did: ${request.trigger}. Decide whether one short question about the judgment behind it would help capture this workflow. Ask only if the reason is not obvious from the screen. If you would not ask, set question to an empty string.`,
             ),

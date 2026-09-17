@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { classifyLiveModelError, LiveModelError, parseLiveCheckResult } from "./live-model.js";
+import {
+  classifyLiveModelError,
+  LiveModelError,
+  liveMessages,
+  parseLiveCheckResult,
+  type LiveCheckRequest,
+  type LiveHistoryItem,
+} from "./live-model.js";
 
 describe("classifyLiveModelError", () => {
   it("separates retryable failures from permanent ones", () => {
@@ -69,5 +76,70 @@ describe("parseLiveCheckResult", () => {
   it("answers ask: false when the question is empty", () => {
     const message = { stop_reason: "end_turn", content: [{ type: "text", text: '{"ask": true, "question": ""}' }] };
     expect(parseLiveCheckResult(message)).toEqual({ ask: false });
+  });
+});
+
+describe("liveMessages", () => {
+  const question = "Should a difference under $1.00 still count as a match?";
+  const flagged = 'clicked "Flag for follow-up" in Northstar Ledger';
+
+  const request = (history: LiveHistoryItem[]): LiveCheckRequest => ({
+    system: "You are Replay's live tutor.",
+    actions: [flagged],
+    history,
+    screenshot: { base64: "bGF0ZXN0" },
+    trigger: flagged,
+    signal: new AbortController().signal,
+  });
+
+  const latest = (...leading: Array<{ type: "text"; text: string }>) => ({
+    role: "user",
+    content: [
+      ...leading,
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "bGF0ZXN0" } },
+      { type: "text", text: `Recent actions:\n${flagged}` },
+      { type: "text", text: "Closing instruction." },
+    ],
+  });
+
+  it("sends a history that begins with the user as it is", () => {
+    expect(liveMessages(request([
+      { speaker: "user", text: "Which column is the total?", screenshotOmittedAt: "0:12" },
+      { speaker: "assistant", text: "The third one." },
+    ]), "Closing instruction.")).toEqual([
+      { role: "user", content: [{ type: "text", text: "[screenshot at 0:12 omitted]" }, { type: "text", text: "Which column is the total?" }] },
+      { role: "assistant", content: [{ type: "text", text: "The third one." }] },
+      latest(),
+    ]);
+  });
+
+  it("never begins with the tutor: what it said before the user first spoke opens the user's first message, as its own words", () => {
+    // A question the tutor asked before the user had said anything, then the
+    // user's answer and the tutor's reply.
+    expect(liveMessages(request([
+      { speaker: "assistant", text: question, trigger: flagged },
+      { speaker: "user", text: "Only under a dollar.", screenshot: { base64: "ZWFybGllcg" }, screenshotTakenAt: "0:52" },
+      { speaker: "assistant", text: "Noted." },
+    ]), "Closing instruction.")).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: `[Earlier, you said: "${question}"]` },
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "ZWFybGllcg" } },
+          { type: "text", text: "Only under a dollar." },
+        ],
+      },
+      { role: "assistant", content: [{ type: "text", text: "Noted." }] },
+      latest(),
+    ]);
+  });
+
+  it("carries the tutor's earlier words in the latest message when the user has not yet spoken", () => {
+    const messages = liveMessages(request([
+      { speaker: "assistant", text: question, trigger: flagged },
+      { speaker: "assistant", text: "Or only an exact match?" },
+    ]), "Closing instruction.");
+
+    expect(messages).toEqual([latest({ type: "text", text: `[Earlier, you said: "${question} Or only an exact match?"]` })]);
   });
 });

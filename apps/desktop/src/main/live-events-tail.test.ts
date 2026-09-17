@@ -2,7 +2,7 @@ import { mkdtemp, writeFile, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { LiveEventsTail, describeActions } from "./live-events-tail.js";
+import { LiveEventsTail, appendActions, describeActions, type ObservedAction } from "./live-events-tail.js";
 
 const clickLine = (id: string, label: string, role = "AXButton") => JSON.stringify({
   schemaVersion: 1,
@@ -12,6 +12,23 @@ const clickLine = (id: string, label: string, role = "AXButton") => JSON.stringi
   type: "click",
   target: { role, label, bundleId: "com.example.ledger", windowTitle: "Northstar Ledger — Invoice review" },
 }) + "\n";
+
+const clicked = (label: string, committed = true): ObservedAction => ({
+  kind: "click",
+  description: `clicked "${label}" in Northstar Ledger`,
+  role: committed ? "AXButton" : "AXStaticText",
+  timestampMs: 1_000,
+  committed,
+});
+
+/** One scroll gesture, which the input monitor reports once per scroll-wheel event. */
+const scrolled = (times: number): ObservedAction[] =>
+  Array.from({ length: times }, (_, index) => ({
+    kind: "scroll",
+    description: "scrolled in Northstar Ledger",
+    timestampMs: 2_000 + index * 16,
+    committed: false,
+  }));
 
 describe("LiveEventsTail", () => {
   it("returns only events appended since the previous read", async () => {
@@ -64,6 +81,22 @@ describe("LiveEventsTail", () => {
     ]);
   });
 
+  it("never marks a scroll or a drag as a trigger, even over a committing control", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "replay-tail-gesture-"));
+    const path = join(directory, "events.jsonl");
+    const over = { role: "AXButton", label: "Approve invoice", bundleId: "com.example.ledger", windowTitle: "Northstar Ledger — Invoice review" };
+    await writeFile(path, [
+      JSON.stringify({ schemaVersion: 1, id: "event-1", sessionId: "session-1", timestampMs: 1_000, type: "scroll", target: over }) + "\n",
+      JSON.stringify({ schemaVersion: 1, id: "event-2", sessionId: "session-1", timestampMs: 2_000, type: "drag", target: over }) + "\n",
+    ].join(""));
+    const tail = new LiveEventsTail(path);
+
+    const actions = await tail.read();
+
+    expect(actions).toHaveLength(2);
+    expect(actions.filter((action) => action.committed)).toEqual([]);
+  });
+
   it("returns an empty list when the file does not exist yet", async () => {
     const directory = await mkdtemp(join(tmpdir(), "replay-tail-missing-"));
     const tail = new LiveEventsTail(join(directory, "events.jsonl"));
@@ -90,6 +123,51 @@ describe("LiveEventsTail", () => {
       'clicked "Flag for follow-up" in Northstar Ledger — Invoice review',
       'clicked "Add note" in Northstar Ledger — Invoice review',
     ]);
+  });
+
+  it("describeActions merges identical actions in a row into one line that says how many, before taking the newest", () => {
+    const actions = [clicked("Approve invoice"), ...scrolled(23), clicked("Add note")];
+
+    expect(describeActions(actions, 10)).toEqual([
+      'clicked "Approve invoice" in Northstar Ledger',
+      "scrolled in Northstar Ledger (23 times)",
+      'clicked "Add note" in Northstar Ledger',
+    ]);
+    expect(describeActions(actions, 2)).toEqual([
+      "scrolled in Northstar Ledger (23 times)",
+      'clicked "Add note" in Northstar Ledger',
+    ]);
+  });
+
+  it("describeActions keeps identical actions apart when something else happened between them", () => {
+    expect(describeActions([...scrolled(1), clicked("Add note"), ...scrolled(2)], 10)).toEqual([
+      "scrolled in Northstar Ledger",
+      'clicked "Add note" in Northstar Ledger',
+      "scrolled in Northstar Ledger (2 times)",
+    ]);
+  });
+
+  it("appendActions merges into the newest entry across reads before keeping the newest `limit`, and changes neither list", () => {
+    const firstRead = [clicked("Approve invoice"), ...scrolled(5)];
+    const secondRead = [...scrolled(18), clicked("Add note"), clicked("Flag for follow-up")];
+
+    const afterFirst = appendActions([], firstRead, 3);
+    const afterSecond = appendActions(afterFirst, secondRead, 3);
+
+    expect(describeActions(afterFirst, 10)).toEqual([
+      'clicked "Approve invoice" in Northstar Ledger',
+      "scrolled in Northstar Ledger (5 times)",
+    ]);
+    expect(describeActions(afterSecond, 10)).toEqual([
+      "scrolled in Northstar Ledger (23 times)",
+      'clicked "Add note" in Northstar Ledger',
+      'clicked "Flag for follow-up" in Northstar Ledger',
+    ]);
+    // A merged entry is the newest of the actions it stands for.
+    expect(afterSecond[0]).toMatchObject({ timestampMs: secondRead[17]!.timestampMs, count: 23 });
+    expect(afterFirst).toHaveLength(2);
+    expect(firstRead).toHaveLength(6);
+    expect(firstRead.every((action) => action.count === undefined)).toBe(true);
   });
 
   it("keeps a multi-byte character intact when a read splits it mid-character", async () => {
