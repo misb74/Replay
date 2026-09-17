@@ -91,6 +91,13 @@ export function createMockApi(): ReplayDesktopApi {
     async listSessions() {
       return recording ? [recording, demoSession()] : [demoSession()];
     },
+    async getLiveTranscript(sessionId) {
+      if (sessionId !== workflow.sessionId) return [];
+      return [
+        { id: "live-1", startMs: 4_200, endMs: 7_800, text: "I'm opening the invoice from the review queue now.", speaker: "user" },
+        { id: "live-2", startMs: 9_000, endMs: 13_500, text: "Good — once it's open, compare the invoice total with the purchase order total before deciding.", speaker: "assistant" },
+      ];
+    },
     async startRecording({ microphone }) {
       recording = {
         id: `session-${Date.now()}`,

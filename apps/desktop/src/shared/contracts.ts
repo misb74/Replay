@@ -175,11 +175,21 @@ export interface LiveUpdate {
   error?: string;
 }
 
+/** One line of the live tutor conversation, saved during recording and shown under the video in review. */
+export interface LiveTranscriptSegmentView {
+  id: string;
+  startMs: number;
+  endMs: number;
+  text: string;
+  speaker?: "user" | "assistant";
+}
+
 export interface ReplayDesktopApi {
   getPermissions(): Promise<PermissionStatus[]>;
   requestPermission(name: PermissionName): Promise<PermissionStatus[]>;
   openPermissionSettings(name: PermissionName): Promise<void>;
   listSessions(): Promise<SessionSummary[]>;
+  getLiveTranscript(sessionId: string): Promise<LiveTranscriptSegmentView[]>;
   startRecording(options: { microphone: boolean; live?: boolean; displayId?: string }): Promise<SessionSummary>;
   stopRecording(): Promise<SessionSummary>;
   processSession(sessionId: string): Promise<WorkflowView>;
@@ -205,6 +215,7 @@ export const ipcChannels = {
   requestPermission: "permissions:request",
   openPermissionSettings: "permissions:open-settings",
   listSessions: "sessions:list",
+  liveTranscript: "live:transcript",
   startRecording: "capture:start",
   stopRecording: "capture:stop",
   processSession: "pipeline:process",

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, writeFile, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
-import type { PermissionName, PermissionState, PermissionStatus, SessionSummary } from "../shared/contracts.js";
+import type { LiveTranscriptSegmentView, PermissionName, PermissionState, PermissionStatus, SessionSummary } from "../shared/contracts.js";
 import { recordingVideoUrl } from "./recording-video-protocol.js";
 import { recoverInterruptedVideo } from "./session-video-recovery.js";
 import { SidecarClient, SidecarRequestError, type SidecarResult } from "./sidecar-client.js";
@@ -183,6 +183,26 @@ export class SessionService {
   async readEvents(id: string): Promise<string> {
     assertSafeId(id);
     return readFile(join(this.directory(id), "events.jsonl"), "utf8");
+  }
+
+  /**
+   * Reads the live tutor conversation saved alongside a recording. A missing
+   * file, unreadable JSON, or the wrong top-level shape is not an error here —
+   * most sessions have no live conversation at all — so this returns
+   * `undefined` rather than throwing. Segments that are not well-formed are
+   * dropped individually so one bad entry cannot hide the rest of the
+   * conversation from review.
+   */
+  async readLiveTranscript(id: string): Promise<{ version: 1; segments: LiveTranscriptSegmentView[] } | undefined> {
+    assertSafeId(id);
+    try {
+      const parsed = JSON.parse(await readFile(join(this.directory(id), "transcript.json"), "utf8")) as unknown;
+      if (typeof parsed !== "object" || parsed === null || !Array.isArray((parsed as { segments?: unknown }).segments)) return undefined;
+      const segments = (parsed as { segments: unknown[] }).segments.filter(isLiveTranscriptSegment);
+      return { version: 1, segments };
+    } catch {
+      return undefined;
+    }
   }
 
   videoPath(id: string): string {
@@ -367,6 +387,17 @@ function isSessionMetadata(value: unknown): value is SessionMetadata {
     && typeof display === "object"
     && display !== null
     && [display.width, display.height, display.scale].every((number) => Number.isFinite(number) && number > 0);
+}
+
+/** Guards what a parsed transcript.json entry may pass across IPC to the renderer. */
+function isLiveTranscriptSegment(value: unknown): value is LiveTranscriptSegmentView {
+  if (typeof value !== "object" || value === null) return false;
+  const item = value as Partial<LiveTranscriptSegmentView>;
+  return typeof item.id === "string"
+    && typeof item.text === "string"
+    && typeof item.startMs === "number" && Number.isFinite(item.startMs) && item.startMs >= 0
+    && typeof item.endMs === "number" && Number.isFinite(item.endMs) && item.endMs >= 0
+    && (item.speaker === undefined || item.speaker === "user" || item.speaker === "assistant");
 }
 
 function assertSafeId(id: string): void {

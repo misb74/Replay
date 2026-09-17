@@ -133,6 +133,10 @@ function registerIpc(services: {
   ipcMain.handle(ipcChannels.requestPermission, (_event, value: unknown) => services.permissions.request(permissionName(value)));
   ipcMain.handle(ipcChannels.openPermissionSettings, (_event, value: unknown) => services.permissions.openSettings(permissionName(value)));
   ipcMain.handle(ipcChannels.listSessions, () => services.sessions.list());
+  ipcMain.handle(ipcChannels.liveTranscript, async (_event, value: unknown) => {
+    const transcript = await services.sessions.readLiveTranscript(safeId(value, "session"));
+    return transcript?.segments ?? [];
+  });
   ipcMain.handle(ipcChannels.startRecording, async (_event, value: unknown) => {
     const options = recordingOptions(value);
     const display = screen.getPrimaryDisplay();

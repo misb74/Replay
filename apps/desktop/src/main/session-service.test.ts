@@ -150,3 +150,86 @@ describe("SessionService recovery", () => {
     expect((await service.readMetadata(active.id)).status).toBe("recording");
   });
 });
+
+describe("SessionService live transcript", () => {
+  it("returns the segments from a well-formed transcript file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-transcript-"));
+    const sessionDirectory = join(root, "sessions", "session-transcript");
+    await mkdir(sessionDirectory, { recursive: true });
+    const segments = [
+      { id: "seg-1", startMs: 100, endMs: 1300, text: "I start with the invoice already selected.", speaker: "user" },
+      { id: "seg-2", startMs: 1400, endMs: 2700, text: "Good — now compare the totals.", speaker: "assistant" },
+    ];
+    await writeFile(join(sessionDirectory, "transcript.json"), JSON.stringify({ version: 1, segments }));
+    const service = new SessionService({ on: () => () => {} } as unknown as SidecarClient, root);
+
+    await expect(service.readLiveTranscript("session-transcript")).resolves.toEqual({ version: 1, segments });
+  });
+
+  it("accepts a segment with no speaker", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-transcript-no-speaker-"));
+    const sessionDirectory = join(root, "sessions", "session-transcript");
+    await mkdir(sessionDirectory, { recursive: true });
+    const segments = [{ id: "seg-1", startMs: 100, endMs: 1300, text: "No speaker recorded for this line." }];
+    await writeFile(join(sessionDirectory, "transcript.json"), JSON.stringify({ version: 1, segments }));
+    const service = new SessionService({ on: () => () => {} } as unknown as SidecarClient, root);
+
+    await expect(service.readLiveTranscript("session-transcript")).resolves.toEqual({ version: 1, segments });
+  });
+
+  it("drops malformed segments while keeping well-formed ones", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-transcript-malformed-"));
+    const sessionDirectory = join(root, "sessions", "session-transcript");
+    await mkdir(sessionDirectory, { recursive: true });
+    const good = { id: "seg-good", startMs: 100, endMs: 1300, text: "A well-formed line.", speaker: "user" };
+    const segments = [
+      good,
+      { startMs: 100, endMs: 200, text: "Missing an id" },
+      { id: "seg-bad-text", startMs: 100, endMs: 200, text: 42 },
+      { id: "seg-bad-start", startMs: "100", endMs: 200, text: "startMs is a string" },
+      { id: "seg-bad-end", startMs: 100, endMs: -5, text: "endMs is negative" },
+      { id: "seg-bad-speaker", startMs: 100, endMs: 200, text: "Unknown speaker", speaker: "system" },
+      "not an object",
+      null,
+    ];
+    await writeFile(join(sessionDirectory, "transcript.json"), JSON.stringify({ version: 1, segments }));
+    const service = new SessionService({ on: () => () => {} } as unknown as SidecarClient, root);
+
+    await expect(service.readLiveTranscript("session-transcript")).resolves.toEqual({ version: 1, segments: [good] });
+  });
+
+  it("returns undefined when the transcript file is missing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-transcript-missing-"));
+    await mkdir(join(root, "sessions", "session-transcript"), { recursive: true });
+    const service = new SessionService({ on: () => () => {} } as unknown as SidecarClient, root);
+
+    await expect(service.readLiveTranscript("session-transcript")).resolves.toBeUndefined();
+  });
+
+  it("returns undefined for invalid JSON", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-transcript-badjson-"));
+    const sessionDirectory = join(root, "sessions", "session-transcript");
+    await mkdir(sessionDirectory, { recursive: true });
+    await writeFile(join(sessionDirectory, "transcript.json"), "{not json");
+    const service = new SessionService({ on: () => () => {} } as unknown as SidecarClient, root);
+
+    await expect(service.readLiveTranscript("session-transcript")).resolves.toBeUndefined();
+  });
+
+  it("returns undefined when segments is not an array", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-transcript-wrongshape-"));
+    const sessionDirectory = join(root, "sessions", "session-transcript");
+    await mkdir(sessionDirectory, { recursive: true });
+    await writeFile(join(sessionDirectory, "transcript.json"), JSON.stringify({ segments: "x" }));
+    const service = new SessionService({ on: () => () => {} } as unknown as SidecarClient, root);
+
+    await expect(service.readLiveTranscript("session-transcript")).resolves.toBeUndefined();
+  });
+
+  it("rejects an unsafe session id", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-transcript-unsafe-"));
+    const service = new SessionService({ on: () => () => {} } as unknown as SidecarClient, root);
+
+    await expect(service.readLiveTranscript("../outside")).rejects.toThrow("Invalid session id");
+  });
+});

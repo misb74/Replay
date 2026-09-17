@@ -3,6 +3,7 @@ import type {
   BranchPathView,
   CompileResultView,
   LiveAvailability,
+  LiveTranscriptSegmentView,
   LiveUpdate,
   PermissionName,
   PermissionStatus,
@@ -280,6 +281,7 @@ function ReviewWorkspace(props: {
   const [exportOpen, setExportOpen] = useState(false);
   const [runOpen, setRunOpen] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [conversation, setConversation] = useState<LiveTranscriptSegmentView[]>([]);
   const dirty = JSON.stringify(draft) !== JSON.stringify(props.workflow);
   const lowConfidence = draft.steps.flatMap((step) => step.decisions).filter((decision) => decision.confidence === "low").length;
   const reviewValid = isWorkflowReviewValid(draft);
@@ -293,11 +295,26 @@ function ReviewWorkspace(props: {
     refreshHistory();
     void props.api.getWorkflow(props.workflow.id).then(props.onWorkflowRefresh).catch(() => undefined);
   }, [props.run?.status, props.api, props.workflow.id, props.onWorkflowRefresh, refreshHistory]);
+  useEffect(() => {
+    const sessionId = props.workflow.sessionId;
+    if (!sessionId) { setConversation([]); return; }
+    // A newer effect run's cleanup marks this one stale before the next fetch
+    // starts, so a slow response for a session the operator has since left
+    // can never overwrite the conversation that's on screen now.
+    let stale = false;
+    void props.api.getLiveTranscript(sessionId)
+      .then((segments) => { if (!stale) setConversation(segments); })
+      .catch(() => { if (!stale) setConversation([]); });
+    return () => { stale = true; };
+  }, [props.api, props.workflow.sessionId]);
 
   function apply(edit: WorkflowEdit) { setDraft((workflow) => editWorkflow(workflow, edit)); }
+  function seekVideo(seconds: number) {
+    if (videoRef.current) videoRef.current.currentTime = seconds;
+  }
   function selectStep(step: StepView) {
     setSelectedStepId(step.id);
-    if (videoRef.current) videoRef.current.currentTime = step.time.startMs / 1_000;
+    seekVideo(step.time.startMs / 1_000);
   }
   function followVideo() {
     const timeMs = (videoRef.current?.currentTime ?? 0) * 1_000;
@@ -357,6 +374,18 @@ function ReviewWorkspace(props: {
           </div>
           <Timeline steps={draft.steps} selectedId={selectedStepId} onSelect={selectStep} />
           <div className="evidence-note"><span>⌁</span><p><strong>Every step stays linked to evidence.</strong><br />Select a step to jump to the moment it came from.</p>{runEvidenceUrl && <button onClick={() => setRunEvidenceUrl(undefined)}>Back to recording</button>}</div>
+          {conversation.length > 0
+            ? <section className="live-conversation" aria-label="Live conversation">
+                <h3>Conversation</h3>
+                {conversation.map((segment) => (
+                  <button key={segment.id} className={`live-line ${segment.speaker ?? "user"}`} onClick={() => seekVideo(segment.startMs / 1_000)}>
+                    <span className="live-line-time">{formatTime(segment.startMs)}</span>
+                    <span className="live-line-who">{segment.speaker === "assistant" ? "Replay" : "You"}</span>
+                    <span className="live-line-text">{segment.text}</span>
+                  </button>
+                ))}
+              </section>
+            : undefined}
         </div>
         <div className="editor-pane">
           <div className="tabs" role="tablist">
