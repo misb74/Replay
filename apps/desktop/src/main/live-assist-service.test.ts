@@ -311,6 +311,23 @@ function eventLogRepeating(action: ObservedAction): LiveAssistOptions["events"] 
   return { read: async () => [{ ...action }] };
 }
 
+/** An event log the test writes to as the user acts. Each read yields whatever was written since the read before. */
+function actionLog() {
+  let unread: ObservedAction[] = [];
+  const events: LiveAssistOptions["events"] = {
+    read: async () => {
+      const read = unread;
+      unread = [];
+      return read;
+    },
+  };
+  return {
+    events,
+    /** The user takes `actions` at this moment. */
+    act: (...actions: ObservedAction[]) => { unread.push(...actions); },
+  };
+}
+
 const committedClick: ObservedAction = {
   kind: "click",
   description: 'clicked "Flag for follow-up" in Northstar Ledger',
@@ -1211,13 +1228,18 @@ describe("what the tutor remembers of an interrupted conversation", () => {
   });
 });
 
-// Spec §5.5. The service considers asking every five seconds. Each test runs
-// the fake clock from the start of the session, when the tutor has said
-// nothing, and the tutor leaves the user the same forty-five seconds then as
-// after it has spoken.
+// Spec §5.5. The service reads the event log and considers asking every five
+// seconds while listening. Each test runs the fake clock from the start of the
+// session, when the tutor has said nothing, and the tutor leaves the user the
+// same forty-five seconds then as after it has spoken.
 describe("speaking first", () => {
-  it("waits by default as long as the spec sets out", () => {
-    expect(LIVE_PROACTIVE_DEFAULTS).toEqual({ quietMs: 2_000, speechGapMs: 45_000, checkIntervalMs: 20_000 });
+  it("waits by default as long as the spec sets out, and asks only about the last minute", () => {
+    expect(LIVE_PROACTIVE_DEFAULTS).toEqual({
+      quietMs: 2_000,
+      speechGapMs: 45_000,
+      checkIntervalMs: 20_000,
+      triggerMaxAgeMs: 60_000,
+    });
   });
 
   it("asks after a committed action once the quiet period has passed", async () => {
@@ -1390,18 +1412,16 @@ describe("when the tutor may speak first", () => {
     expect(checks).toHaveLength(2);
   });
 
-  it("never checks while paused, and checks again once resumed", async () => {
+  // Resuming is covered in "what the tutor may ask about".
+  it("never checks while paused", async () => {
     const { transport, checks } = checkingTransport(() => ({ ask: false }));
     const harness = await makeHarness({ transport, events: eventLogRepeating(committedClick) });
 
     await harness.at(30_000);
     await harness.service.setPaused(true);
     await harness.at(90_000);
-    expect(checks).toHaveLength(0);
 
-    await harness.service.setPaused(false);
-    await harness.at(95_000);
-    expect(checks).toHaveLength(1);
+    expect(checks).toHaveLength(0);
   });
 
   it("never checks while it is working on an answer", async () => {
@@ -1465,10 +1485,120 @@ describe("when the tutor may speak first", () => {
   });
 });
 
+// A check tells the model the user has just taken its action, so the action
+// must have been taken since listening last began, and within the last minute.
+describe("what the tutor may ask about", () => {
+  it("never asks about an action taken before a pause, once listening resumes", async () => {
+    const log = actionLog();
+    const { transport, checks } = checkingTransport(() => ({ ask: true, question: "Why?" }));
+    // However old an action may be, so that only the pause rules this one out.
+    const harness = await makeHarness({ transport, events: log.events, proactive: { triggerMaxAgeMs: 600_000 } });
+
+    await harness.at(20_000);
+    log.act(committedClick);
+    await harness.at(30_000);
+    await harness.service.setPaused(true);
+    await harness.at(40_000);
+    await harness.service.setPaused(false);
+    await harness.at(200_000);
+
+    expect(checks).toHaveLength(0);
+    expect(harness.sidecar.spoken).toEqual([]);
+  });
+
+  it("places an action taken during a pause, though first read after resuming, before the resume", async () => {
+    const log = actionLog();
+    const { transport, checks } = checkingTransport(() => ({ ask: true, question: "Why?" }));
+    const harness = await makeHarness({ transport, events: log.events, proactive: { triggerMaxAgeMs: 600_000 } });
+
+    await harness.at(60_000);
+    await harness.service.setPaused(true);
+    await harness.at(65_000);
+    // Nothing reads the log while paused, so the resume's read is the first to see this.
+    log.act(committedClick);
+    await harness.at(70_000);
+    await harness.service.setPaused(false);
+    await harness.at(200_000);
+
+    expect(checks).toHaveLength(0);
+  });
+
+  it("drops an action more than a minute old when a check could begin, and never asks about it later", async () => {
+    const log = actionLog();
+    const { transport, checks } = checkingTransport(() => ({ ask: true, question: "Why?" }));
+    // No check can begin before seventy seconds.
+    const harness = await makeHarness({ transport, events: log.events, proactive: { speechGapMs: 70_000 } });
+
+    await harness.at(5_000);
+    log.act(committedClick);
+    await harness.at(200_000);
+
+    expect(checks).toHaveLength(0);
+  });
+
+  it("asks about an action a minute old when a check begins", async () => {
+    const log = actionLog();
+    const { transport, checks } = checkingTransport(() => ({ ask: true, question: "Why?" }));
+    const harness = await makeHarness({ transport, events: log.events, proactive: { speechGapMs: 70_000 } });
+
+    await harness.at(10_000);
+    log.act(committedClick);
+    await harness.at(70_000);
+
+    expect(checks.map((check) => check.trigger)).toEqual([committedClick.description]);
+    expect(spokenTexts(harness)).toEqual(["Why?"]);
+  });
+
+  it("leaves forty-five seconds after resuming before asking, then asks about an action taken since", async () => {
+    const log = actionLog();
+    const { transport, checks } = checkingTransport(() => ({ ask: true, question: "Why?" }));
+    const harness = await makeHarness({ transport, events: log.events });
+
+    await harness.at(60_000);
+    await harness.service.setPaused(true);
+    await harness.at(70_000);
+    await harness.service.setPaused(false);
+    await harness.at(71_000);
+    log.act(committedClick);
+
+    await harness.at(110_000);
+    expect(checks).toHaveLength(0);
+    await harness.at(115_000);
+    expect(checks).toHaveLength(1);
+    expect(spokenTexts(harness)).toEqual(["Why?"]);
+  });
+
+  it("places an action by the last read that saw the log, not by a read that failed", async () => {
+    const log = actionLog();
+    let failNextRead = false;
+    const { transport, checks } = checkingTransport(() => ({ ask: true, question: "Why?" }));
+    const harness = await makeHarness({
+      transport,
+      events: {
+        read: async () => {
+          if (!failNextRead) return log.events.read();
+          failNextRead = false;
+          throw new Error("The event log could not be read.");
+        },
+      },
+      proactive: { speechGapMs: 70_000 },
+    });
+
+    await harness.at(5_000);
+    log.act(committedClick);
+    // The read at ten seconds fails, so the next one sees the click.
+    failNextRead = true;
+    await harness.at(200_000);
+
+    expect(checks).toHaveLength(0);
+  });
+});
+
 describe("what a check is told", () => {
   it("is told what a reply is told, with the action in place of the user's words, and no turn nobody heard", async () => {
+    const log = actionLog();
     const { transport, checks } = checkingTransport(() => ({ ask: false }), ["The third one.", "It includes tax."]);
-    const harness = await makeHarness({ transport, events: eventLog([], [], [committedClick]) });
+    const harness = await makeHarness({ transport, events: log.events });
 
     harness.emitTranscript("Which column is the total?", true);
     await harness.at(700);
@@ -1481,7 +1611,9 @@ describe("what a check is told", () => {
     await harness.at(6_000);
     harness.emitTranscript("hmm", false);
 
-    // Forty-five seconds after the tutor fell silent.
+    // The user clicks, and forty-five seconds after the tutor fell silent it checks.
+    await harness.at(50_000);
+    log.act(committedClick);
     await harness.at(55_000);
 
     expect(checks).toHaveLength(1);
@@ -1520,12 +1652,14 @@ describe("what a check is told", () => {
   });
 
   it("still checks a second click on the same control, though the two are told as one", async () => {
+    const log = actionLog();
     const { transport, checks } = checkingTransport(() => ({ ask: false }));
-    const harness = await makeHarness({
-      transport,
-      events: eventLog([committedClick], [{ ...committedClick, timestampMs: 50_000 }]),
-    });
+    const harness = await makeHarness({ transport, events: log.events });
 
+    log.act(committedClick);
+    await harness.at(50_000);
+    expect(checks).toHaveLength(1);
+    log.act({ ...committedClick, timestampMs: 50_000 });
     await harness.at(65_000);
 
     expect(checks.map((check) => check.trigger)).toEqual([committedClick.description, committedClick.description]);
@@ -1675,7 +1809,7 @@ describe("reading the event log", () => {
     const { transport, checks } = checkingTransport(() => ({ ask: false }));
     const harness = await makeHarness({ transport, events: { read: () => new Promise((resolve) => { reads.push(resolve); }) } });
 
-    // Two more chances to check come and go while the first read is under way.
+    // Polls come and go while the first read, begun at five seconds, is under way.
     await harness.at(55_000);
     reads[0]!([committedClick]);
     await harness.settle();

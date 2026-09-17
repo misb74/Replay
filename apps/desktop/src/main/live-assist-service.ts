@@ -66,17 +66,25 @@ export interface LiveProactiveTimings {
   quietMs: number;
   /**
    * Since the tutor last spoke, whatever it said. It has not spoken when the
-   * session starts, and leaves the user this long from then as well.
+   * session starts or listening resumes, and leaves the user this long from
+   * then as well.
    */
   speechGapMs: number;
   /** Since the last check began. */
   checkIntervalMs: number;
+  /**
+   * The oldest a committed action may be when a check about it begins. The
+   * check tells the model the user has just taken the action, so an older one
+   * is dropped, never kept for later.
+   */
+  triggerMaxAgeMs: number;
 }
 
 export const LIVE_PROACTIVE_DEFAULTS: Readonly<LiveProactiveTimings> = {
   quietMs: 2_000,
   speechGapMs: 45_000,
   checkIntervalMs: 20_000,
+  triggerMaxAgeMs: 60_000,
 };
 
 /** How often the tutor considers checking whether to ask a question of its own. */
@@ -190,6 +198,35 @@ interface Check extends ReplyBase {
 /** Whatever holds the floor: an answer to the user, or a check of the tutor's own. */
 type Reply = Answer | Check;
 
+/**
+ * A committed action a check may be about, and the earliest moment, by the
+ * service's `now()`, at which the user can have taken it.
+ *
+ * The action's own `timestampMs` is not used. It counts from the recording's
+ * capture origin on the sidecar's uptime clock, which the service cannot
+ * read, and which stops while the Mac sleeps. The reads of the event log place
+ * each action instead. A read returns every action whose line was complete in
+ * the log when it looked, and the log yields each action once. So an action a
+ * read returns was not yet complete when the last successful read before it
+ * began, and was taken after that moment, less the time the recorder took to
+ * write it. `notBefore` is that moment.
+ *
+ * Error bound: the action can have been taken before `notBefore` by at most
+ * the recorder's delay from the input event to a complete line in the log (an
+ * accessibility snapshot and a fsync, normally milliseconds). It can have been
+ * taken after `notBefore` by at most the time between those two reads. While
+ * listening, the poll reads the log every `PROACTIVE_POLL_MS`, so that is about
+ * five seconds, and listening resumes with a read of its own. An action taken
+ * during a pause, and first read on resuming, is therefore placed before the
+ * resume. At the session's start the service has not yet read the log, so the
+ * start stands in for a read, and an action taken in the moments between the
+ * recording starting and the service being made counts as taken at the start.
+ */
+interface Trigger {
+  readonly action: ObservedAction;
+  readonly notBefore: number;
+}
+
 /** A sentence handed to the sidecar, and the assistant turn it joins once it has been heard to the end. */
 interface Utterance {
   readonly sentence: string;
@@ -260,11 +297,14 @@ interface Utterance {
  *    check is about. A reply stops waiting for a read once it loses the
  *    floor or times out, though the read still finishes and is kept, so a
  *    read that never returns never holds up `end()`.
- * 8. The tutor speaks first only when spec §5.5 allows it, and checks each
- *    committed action at most once. A poll reads the event log only when the
- *    moment allows a check, then tests every condition again once the read
- *    is back, in the synchronous step in which the check takes the floor.
- *    Until then the poll holds nothing, so nothing waits for it.
+ * 8. The tutor speaks first only when spec §5.5 allows it, about a committed
+ *    action taken since listening last began and at most `triggerMaxAgeMs`
+ *    ago, and checks each action at most once. While listening, a poll reads
+ *    the event log every few seconds, which places each action within a poll
+ *    of when it was taken (see `Trigger`). A check begins only if every
+ *    condition still holds once the read is back, in the synchronous step in
+ *    which the check takes the floor. Until then the poll holds nothing, so
+ *    nothing waits for it.
  */
 export class LiveAssistService {
   readonly #options: LiveAssistOptions &
@@ -303,14 +343,19 @@ export class LiveAssistService {
   #pollTimer: NodeJS.Timeout | undefined;
   /** True while a poll waits for its read of the event log. */
   #considering = false;
-  /** The newest committed action the event log has yielded that no check has yet been about. */
-  #trigger: ObservedAction | undefined;
+  /** The newest committed action the event log has yielded that no check has yet been about or dropped. */
+  #trigger: Trigger | undefined;
+  /** When the latest successful read of the event log began, by `now()`. The session's start until the first. */
+  #lastReadBegan: number;
+  /** When listening most recently began, by `now()`: the session's start, or the latest resume. */
+  #listeningSince: number;
   /** When the user was last heard, by `now()`. */
   #lastHeardAt = Number.NEGATIVE_INFINITY;
   /**
    * When the tutor last spoke, by `now()`: the latest moment a sentence was
-   * handed to the sidecar, finished, or was stopped. Until it first speaks,
-   * the session's start.
+   * handed to the sidecar, finished, or was stopped. The session's start and
+   * each resume count as well, so the tutor leaves the user the same silence
+   * after them.
    */
   #lastSpokeAt: number;
   /** When the latest check began, by `now()`. */
@@ -326,6 +371,8 @@ export class LiveAssistService {
     };
     this.#proactive = { ...LIVE_PROACTIVE_DEFAULTS, ...options.proactive };
     this.#startedAt = this.#options.now();
+    this.#lastReadBegan = this.#startedAt;
+    this.#listeningSince = this.#startedAt;
     this.#lastSpokeAt = this.#startedAt;
   }
 
@@ -373,8 +420,24 @@ export class LiveAssistService {
     // later, such as a resume or the next reply's speech, can overtake them.
     const stopping = this.#stopSpeaking();
     const pausing = this.#options.sidecar.setPaused(paused);
+    if (!paused) this.#listenAgain();
     this.#publish();
     await Promise.all([stopping, pausing]);
+  }
+
+  /**
+   * Listening begins again, as it began at the start: nothing the user did
+   * before this moment may prompt a question, and the tutor leaves the user
+   * `speechGapMs` before speaking first. The read places whatever the log
+   * already holds before this moment (see `Trigger`).
+   */
+  #listenAgain(): void {
+    const now = this.#options.now();
+    this.#listeningSince = now;
+    this.#lastSpokeAt = now;
+    // A read that fails places nothing, and the next read that succeeds places
+    // what it returns before this moment, which is the safe side.
+    void this.#readNewActions().catch(() => undefined);
   }
 
   async end(): Promise<void> {
@@ -527,14 +590,15 @@ export class LiveAssistService {
   }
 
   /**
-   * Runs every `PROACTIVE_POLL_MS`. When the moment allows a check, reads the
-   * event log, and begins a check if the moment still allows one once the
-   * read is back. Until then the poll holds nothing, so nothing waits for it:
-   * not `end()`, and not a reply, whose own read queues behind this one and
-   * stops being waited for once the reply loses the floor or times out.
+   * Runs every `PROACTIVE_POLL_MS`. While listening, reads the event log
+   * whether or not the moment allows a check, so that each action is placed
+   * within a poll of when it was taken (see `Trigger`), then begins a check if
+   * the moment allows one. Until then the poll holds nothing, so nothing waits
+   * for it: not `end()`, and not a reply, whose own read queues behind this one
+   * and stops being waited for once the reply loses the floor or times out.
    */
   #considerAsking(): void {
-    if (this.#considering || !this.#mayCheck(this.#options.now())) return;
+    if (this.#considering || this.#paused || this.#ended || this.#failed) return;
     this.#considering = true;
     // A failed read leaves nothing new to ask about, and a turn whose own read
     // fails reports it.
@@ -546,18 +610,27 @@ export class LiveAssistService {
 
   /**
    * Gives the floor to a check on the newest committed action not yet checked,
-   * if spec §5.5 allows a check at this moment.
+   * if spec §5.5 allows a check at this moment. An action taken before
+   * listening last began, or more than `triggerMaxAgeMs` ago, is dropped
+   * instead.
    */
   #beginCheck(): void {
     const now = this.#options.now();
     const trigger = this.#trigger;
     if (trigger === undefined || !this.#mayCheck(now)) return;
-    // Checked once, however the check ends.
+    // Checked or dropped, never kept for later, however the check ends.
     this.#trigger = undefined;
+    // By the bound on `Trigger`, an action kept here was taken at most the
+    // recorder's write delay before listening began or before the window
+    // opened. One taken inside either limit by less than the time between two
+    // reads may be dropped, which is the safe side.
+    const tooEarly = trigger.notBefore < this.#listeningSince;
+    const tooOld = now - trigger.notBefore > this.#proactive.triggerMaxAgeMs;
+    if (tooEarly || tooOld) return;
     this.#lastCheckAt = now;
     this.#takeFloor({
       kind: "check",
-      trigger,
+      trigger: trigger.action,
       controller: new AbortController(),
       spoke: false,
       timedOut: false,
@@ -653,20 +726,24 @@ export class LiveAssistService {
 
   /**
    * Adds whatever the event log has gained since the last read to the
-   * observed actions, and keeps the newest committed action among them as the
-   * next check's trigger. The tail's read offset cannot be shared by
-   * overlapping reads, so each read waits for the one before it. What a read
-   * returns is kept whether or not the reply that asked for it still holds
-   * the floor, because the tail yields each action only once.
+   * observed actions, and keeps the newest committed action among them, placed
+   * in time, as the next check's trigger. The tail's read offset cannot be
+   * shared by overlapping reads, so each read waits for the one before it.
+   * What a read returns is kept whether or not the reply that asked for it
+   * still holds the floor, because the tail yields each action only once.
    */
   #readNewActions(): Promise<void> {
     const reading = this.#reading.then(async () => {
+      const began = this.#options.now();
       const actions = await this.#options.events.read();
       // Every key press and scroll-wheel event is an action, so identical ones
       // in a row are merged, and only as many as a request describes are kept.
       this.#observed = appendActions(this.#observed, actions, RECENT_ACTION_LIMIT);
-      // Kept apart from the observed actions, which later ones can push out.
-      this.#trigger = actions.findLast((action) => action.committed) ?? this.#trigger;
+      // Kept apart from the observed actions, which later ones can push out,
+      // and placed after the last successful read began (see `Trigger`).
+      const committed = actions.findLast((action) => action.committed);
+      if (committed !== undefined) this.#trigger = { action: committed, notBefore: this.#lastReadBegan };
+      this.#lastReadBegan = began;
     });
     // A failed read fails the turn that asked for it, never the reads after it.
     this.#reading = reading.catch(() => undefined);
