@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, rm, unlink } from "node:fs/promises";
+import { appendFile, chmod, mkdtemp, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TimestampedTranscript, TranscriptSegment } from "@replay/pipeline";
 import type { LiveState, LiveUpdate } from "../shared/contracts.js";
 import { appendActions, describeActions, type ObservedAction } from "./live-events-tail.js";
 import { LiveModelError, type LiveHistoryItem, type LiveModelTransport, type LiveReplyRequest } from "./live-model.js";
@@ -123,6 +124,12 @@ const SENTENCE_LIMIT = 200;
 
 const REFUSAL_REPLY = "I can't help with that one.";
 
+/** Spec §8's one apology, said the first time the user's turn cannot reach Claude. */
+const UNREACHABLE_REPLY = "I can't reach Claude right now.";
+
+/** How many of the user's own turns may fail in a row before the tutor pauses itself (spec §8). */
+const FAILURES_BEFORE_PAUSE = 3;
+
 /** How many of the newest actions a request describes. */
 const RECENT_ACTION_LIMIT = 10;
 
@@ -216,6 +223,11 @@ interface Answer extends ReplyBase {
   readonly userText: string;
   /** The user's turn as the history will hold it, once its screenshot has been taken. */
   userTurn: LiveHistoryItem | undefined;
+  /**
+   * The transcript segment this turn's words were written into, which goes on
+   * being written into if the user carries on with the turn.
+   */
+  readonly segment: LiveSegment | undefined;
 }
 
 /** A check on one committed action (spec §5.5), and the question it may end in. */
@@ -262,7 +274,20 @@ interface Trigger {
 /** A sentence handed to the sidecar, and the assistant turn it joins once it has been heard to the end. */
 interface Utterance {
   readonly sentence: string;
-  readonly assistantTurn: LiveHistoryItem;
+  /**
+   * The turn this sentence joins once it has been heard to the end. A
+   * sentence said aside — spec §8's apology — answers nothing, so it has
+   * none, and neither the history nor the transcript nor the log holds it.
+   */
+  readonly assistantTurn: LiveHistoryItem | undefined;
+  /** When the sidecar reported it started, on the capture clock, if it has. */
+  startedAtMs: number | undefined;
+}
+
+/** One segment of `transcript.json`: what one side said, on the capture clock. */
+interface LiveSegment extends TranscriptSegment {
+  /** What Task 19's prompts read to tell the two sides apart. */
+  speaker: "user" | "assistant";
 }
 
 /**
@@ -314,10 +339,10 @@ interface SpeechWindow {
  *    `listening` until it speaks, but it is sharing the screen all the same.
  * 4. `end()` is final and waits for the work. Before its first await it
  *    supersedes the reply, stops speech, detaches from the sidecar, and
- *    publishes `ended`; it resolves only once every reply has unwound. It
- *    must therefore never be awaited from inside a reply. A reply is tracked
- *    before it is announced, so this holds even for an `end()` called from
- *    that announcement.
+ *    publishes `ended`; it resolves only once every reply has unwound and
+ *    every write of theirs has landed. It must therefore never be awaited
+ *    from inside a reply. A reply is tracked before it is announced, so this
+ *    holds even for an `end()` called from that announcement.
  * 5. A screenshot is removed from disk in a `finally` as soon as it has been
  *    read, so before any request carries it, and whether or not reading it
  *    succeeded. Every screenshot is written inside one owner-only directory
@@ -334,7 +359,8 @@ interface SpeechWindow {
  *    finished late. Nothing else writes to the history, and `#speak` refuses
  *    a reply that has lost the floor, so such a reply adds nothing to it. A
  *    check has no user's turn, so its question enters the history alone, with
- *    the action it asks about.
+ *    the action it asks about. A sentence said aside (invariant 11) enters
+ *    nothing at all: it is part of no turn, so it brings no turn with it.
  * 7. No action the event log yields is lost. Reads of the log never overlap,
  *    and what a read returns is kept even when the reply that asked for it
  *    has lost the floor, because the log yields each action only once.
@@ -361,19 +387,40 @@ interface SpeechWindow {
  *    a wall clock set back counts that as passed. By the audio the event
  *    covers: while that audio runs into any stretch the tutor's voice has
  *    been heard in, from a `started` report until `echoTailMs` after its
- *    terminal report, and without end until that report comes. Every report
- *    places such a stretch, even about a sentence the service no longer
- *    waits on, so a sentence the sidecar plays after its hand-over failed is
- *    covered too; stretches sit in the past on the capture clock, so a stale
- *    report after a pause cannot deafen later speech, and they are let go
- *    once the audio heard is `SPEECH_WINDOW_RETENTION_MS` past them. When
- *    either judgement holds, `#onTranscript` drops the event before it
- *    changes anything: not the words heard, the turn or its timer, the
- *    reply, the speech, or when the user was last heard. Only reports about
- *    outstanding sentences reach state and history, so a sentence a stop has
- *    already forgotten (invariant 2) starts no arrival tail when it is
- *    reported late, and a pause ends any arrival tail, so listening resumes
- *    without one. In full duplex no event is dropped on these grounds.
+ *    terminal report, and without end until that report comes. A `started`
+ *    places such a stretch even about a sentence the service no longer waits
+ *    on, so a sentence the sidecar plays after its hand-over failed is
+ *    covered too; a terminal report with no `started` before it places
+ *    nothing, because nothing was played. A stretch that has been closed
+ *    sits in the past on the capture clock, so a stale terminal report after
+ *    a pause cannot deafen later speech; one still open goes on dropping the
+ *    audio after it, a pause and resume included, until its terminal report
+ *    closes it. Stretches are let go once the audio heard is
+ *    `SPEECH_WINDOW_RETENTION_MS` past them. When either judgement holds,
+ *    `#onTranscript` drops the event before it changes anything: not the
+ *    words heard, the turn or its timer and segment, the reply, the speech,
+ *    or when the user was last heard. Only reports about outstanding
+ *    sentences reach state and history, so a sentence a stop has already
+ *    forgotten (invariant 2) starts no arrival tail when it is reported
+ *    late, and a pause ends any arrival tail, so listening resumes without
+ *    one. In full duplex no event is dropped on these grounds.
+ * 10. The session directory says what happened, and stays readable. Each
+ *     change rewrites `transcript.json` whole and renames it into place, so
+ *     Build, which refuses a transcript it cannot accept, never finds a
+ *     half-written one; it holds the words of each turn the user was heard
+ *     to say and each sentence the tutor was heard to the end of, timed by
+ *     the capture clock the signals carry. `live.jsonl` records the turns,
+ *     requests, screenshots, checks, and outcomes, and never an image byte.
+ *     Writes never overlap and never fail a turn, and `end()` waits for
+ *     them.
+ * 11. A failing network never talks in circles, and nothing else is blamed on
+ *     it. Only a request to Claude for the user's own turn counts: an abort
+ *     the service made, a read of the event log that failed, a sidecar that
+ *     cannot take a screenshot or a sentence, and a check of the tutor's own
+ *     are reported at most. The tutor says once that it cannot reach Claude,
+ *     pauses itself after `FAILURES_BEFORE_PAUSE` such failures in a row, and
+ *     pauses at once when the key is rejected. Its apology answers nothing,
+ *     so it is part of no turn.
  */
 export class LiveAssistService {
   readonly #options: LiveAssistOptions &
@@ -390,6 +437,10 @@ export class LiveAssistService {
   #error: string | undefined;
   #turn = "";
   #turnTimer: NodeJS.Timeout | undefined;
+  /** Where the open turn's words began on the capture clock: its first transcript event, partial or final. */
+  #turnStartMs: number | undefined;
+  /** The open turn's segment in the transcript, once a final has given it words. */
+  #turnSegment: LiveSegment | undefined;
   /** The reply that holds the floor, if any. */
   #reply: Reply | undefined;
   /** Utterances handed to the sidecar that have neither finished nor been stopped, by id. */
@@ -446,6 +497,12 @@ export class LiveAssistService {
   #lastSpokeAt: number;
   /** When the latest check began, by `now()`. */
   #lastCheckAt = Number.NEGATIVE_INFINITY;
+  /** `transcript.json`'s segments, in the order they were first written. */
+  readonly #segments: LiveSegment[] = [];
+  /** How many of the user's own turns have failed to reach Claude in a row (spec §8). */
+  #consecutiveFailures = 0;
+  /** Every write to the session directory, in the order it was queued. */
+  #writing: Promise<void> = Promise.resolve();
 
   constructor(options: LiveAssistOptions) {
     this.#options = {
@@ -504,6 +561,7 @@ export class LiveAssistService {
   async setPaused(paused: boolean): Promise<void> {
     if (this.#ended || this.#paused === paused) return;
     this.#paused = paused;
+    this.#log({ type: paused ? "paused" : "resumed" });
     this.#clearTurn();
     this.#supersedeReply();
     // Both commands are issued before the first await, so nothing issued
@@ -536,6 +594,7 @@ export class LiveAssistService {
   async end(): Promise<void> {
     if (this.#ending === undefined) {
       this.#ended = true;
+      this.#log({ type: "ended" });
       clearInterval(this.#pollTimer);
       this.#clearTurn();
       this.#supersedeReply();
@@ -549,13 +608,15 @@ export class LiveAssistService {
 
   /**
    * The recording stops once `end()` resolves, so this waits for the stop, for
-   * starting, and for every reply to unwind, but never fails because one of
-   * them did. Only then does it remove the screenshot directory whole, which
-   * also sweeps a screenshot the sidecar finished writing after its request
-   * had stopped waiting for it.
+   * starting, for every reply to unwind, and for every write those replies
+   * queued as they did, but never fails because one of them did. Only then
+   * does it remove the screenshot directory whole, which also sweeps a
+   * screenshot the sidecar finished writing after its request had stopped
+   * waiting for it.
    */
   async #finishEnding(stopping: Promise<void> | undefined): Promise<void> {
     await Promise.allSettled([stopping, this.#starting, ...this.#running]);
+    await this.flush();
     if (this.#screenshotDirectory === undefined) return;
     // Nothing is left to report a failed removal to.
     await rm(this.#screenshotDirectory, { recursive: true, force: true }).catch(() => undefined);
@@ -571,10 +632,39 @@ export class LiveAssistService {
     if (tutor) return;
     this.#lastHeardAt = this.#options.now();
     this.#heard = { text: event.text, final: event.isFinal };
+    // The turn's words begin where its first event does, partial or final.
+    this.#turnStartMs ??= event.startMs;
     this.#yieldToUser();
-    if (event.isFinal) this.#turn = joinWords(this.#turn, event.text);
+    if (event.isFinal) {
+      this.#turn = joinWords(this.#turn, event.text);
+      this.#recordTurnSoFar(event);
+    }
     this.#restartTurnTimer();
     this.#publish();
+  }
+
+  /**
+   * Keeps the open turn's segment of the transcript up to date: the words the
+   * turn holds so far, from its first transcript event to this final (spec
+   * §5.6). A final the recogniser sends with no words of its own leaves the
+   * segment alone, so nothing empty, and nothing that ends before it began,
+   * ever reaches the file Build reads.
+   */
+  #recordTurnSoFar(event: LiveTranscriptSignal): void {
+    if (this.#turn === "") return;
+    if (this.#turnSegment === undefined) {
+      const startMs = Math.max(0, this.#turnStartMs ?? event.startMs);
+      this.#turnSegment = this.#recordSegment({
+        speaker: "user",
+        text: this.#turn,
+        startMs,
+        endMs: Math.max(startMs, event.endMs),
+      });
+      return;
+    }
+    this.#turnSegment.text = this.#turn;
+    this.#turnSegment.endMs = Math.max(this.#turnSegment.endMs, event.endMs);
+    this.#persistTranscript();
   }
 
   /**
@@ -622,9 +712,13 @@ export class LiveAssistService {
   /**
    * Takes `ms` as audio the session has reached, and lets go of any stretch
    * of the tutor's voice that ended well before it. A stretch with no end
-   * yet is kept, because the sentence may still be playing.
+   * yet is kept, because the sentence may still be playing. A time that is
+   * not a finite number is no news about the audio at all: taken as one it
+   * would leave the mark unknowable, and no stretch would ever be let go
+   * again.
    */
   #noteAudioUpTo(ms: number): void {
+    if (!Number.isFinite(ms)) return;
     this.#newestAudioMs = Math.max(this.#newestAudioMs, ms);
     const oldest = this.#newestAudioMs - SPEECH_WINDOW_RETENTION_MS;
     for (const [utteranceId, window] of this.#speechWindows) {
@@ -637,8 +731,11 @@ export class LiveAssistService {
     const reply = this.#supersedeReply();
     if (reply?.kind === "answer" && !reply.spoke) {
       // Nothing has been said yet, so the user is still in the same turn:
-      // their earlier words are sent again with the rest when it closes.
+      // their earlier words are sent again with the rest when it closes, and
+      // the transcript goes on writing them into the one segment they began.
       this.#turn = joinWords(reply.userText, this.#turn);
+      this.#turnSegment = reply.segment;
+      this.#turnStartMs = reply.segment?.startMs ?? this.#turnStartMs;
     }
     // An event handler has no caller to report a failed stop to, and nothing
     // further it could do about one.
@@ -653,17 +750,31 @@ export class LiveAssistService {
   #clearTurn(): void {
     if (this.#turnTimer !== undefined) clearTimeout(this.#turnTimer);
     this.#turnTimer = undefined;
+    this.#forgetTurn();
+  }
+
+  /**
+   * Forgets the open turn: its words, where they began, and the segment they
+   * were being written into. The segment itself stays in the transcript,
+   * because the user said those words.
+   */
+  #forgetTurn(): void {
     this.#turn = "";
+    this.#turnStartMs = undefined;
+    this.#turnSegment = undefined;
   }
 
   #closeTurn(): void {
     this.#turnTimer = undefined;
     const userText = this.#turn;
+    const segment = this.#turnSegment;
+    this.#forgetTurn();
     if (userText === "" || this.#paused || this.#ended || this.#failed) return;
-    this.#turn = "";
+    this.#log({ type: "user_turn", text: userText });
     this.#takeFloor({
       kind: "answer",
       userText,
+      segment,
       controller: new AbortController(),
       spoke: false,
       timedOut: false,
@@ -702,9 +813,26 @@ export class LiveAssistService {
       if (reply.kind === "answer") await this.#respond(reply);
       else await this.#ask(reply);
     } catch (cause) {
-      // A superseded reply's failure, such as its own aborted request, is no
-      // longer anyone's concern.
-      if (this.#reply === reply) this.#error = failureCode(reply, cause);
+      // A request the service itself aborted — the user speaking over it, a
+      // pause, End, a turn superseded, a check cancelled — fails as it
+      // unwinds, and that failure is nobody's concern: not the panel's, not
+      // the log's, and not the count of failures below. Every one of those
+      // aborts takes the floor in the same synchronous step (invariant 1), so
+      // a reply that no longer holds the floor is exactly a reply whose
+      // request the service aborted, and nothing need be classified to know
+      // it: the SDK raises `APIUserAbortError`, which carries no status and
+      // is not named `AbortError`, so `classifyLiveModelError` would call it
+      // a plain failure. A reply's own timeout aborts it while it still holds
+      // the floor, and that does count (spec §8).
+      if (this.#reply !== reply) return;
+      const code = failureCode(reply, cause);
+      this.#error = code;
+      this.#log({ type: "error", code });
+      // Only Claude failing bounds the conversation (spec §8): a sidecar that
+      // cannot take a screenshot or a sentence has failed locally, and a
+      // check of the tutor's own asked nothing of the user.
+      if (reply.kind === "check") this.#log({ type: "proactive_check", asked: false, failed: true });
+      else if (reply.timedOut || cause instanceof LiveModelError) await this.#boundFailures(reply, code);
     } finally {
       clearTimeout(timeout);
       // However the reply ends, its request ends with it.
@@ -735,12 +863,39 @@ export class LiveAssistService {
         buffer = "";
         await this.#speak(reply, REFUSAL_REPLY);
         if (!this.#shouldContinue(reply)) return;
+      } else if (chunk.kind === "usage") {
+        const { inputTokens, outputTokens, cacheReadTokens } = chunk;
+        this.#log({ type: "request", inputTokens, outputTokens, cacheReadTokens });
       }
     }
     if (!this.#shouldContinue(reply)) return;
     await this.#speak(reply, buffer.trim());
     if (!this.#shouldContinue(reply)) return;
     this.#error = undefined;
+    // Claude answered, so whatever failed before it is no longer a run.
+    this.#consecutiveFailures = 0;
+  }
+
+  /**
+   * Spec §8's bound on a failing network. The tutor says once that it cannot
+   * reach Claude and goes on listening; once `FAILURES_BEFORE_PAUSE` of the
+   * user's turns have failed in a row it pauses itself instead of talking in
+   * circles. A rejected key pauses at once, since nothing will change until
+   * it is fixed. `end()` is never awaited from here (invariant 4).
+   */
+  async #boundFailures(reply: Answer, code: string): Promise<void> {
+    if (code === "unauthenticated") {
+      await this.setPaused(true);
+      return;
+    }
+    this.#consecutiveFailures += 1;
+    // Said aside, because an apology answers nothing: it is part of no turn.
+    // A sidecar that cannot take it has failed at the one thing left to try,
+    // and there is nothing further to report.
+    if (this.#consecutiveFailures === 1) {
+      await this.#speak(reply, UNREACHABLE_REPLY, { aside: true }).catch(() => undefined);
+    }
+    if (this.#consecutiveFailures >= FAILURES_BEFORE_PAUSE) await this.setPaused(true);
   }
 
   /**
@@ -780,7 +935,10 @@ export class LiveAssistService {
     // reads may be dropped, which is the safe side.
     const tooEarly = trigger.notBefore < this.#listeningSince;
     const tooOld = now - trigger.notBefore > this.#proactive.triggerMaxAgeMs;
-    if (tooEarly || tooOld) return;
+    if (tooEarly || tooOld) {
+      this.#log({ type: "proactive_check", asked: false, skipped: tooEarly ? "before_listening" : "too_old" });
+      return;
+    }
     this.#lastCheckAt = now;
     this.#takeFloor({
       kind: "check",
@@ -827,8 +985,12 @@ export class LiveAssistService {
       signal: check.controller.signal,
     });
     if (!this.#shouldContinue(check)) return;
-    if (result.ask && result.question !== undefined) {
-      const { sentences, rest } = splitSentences(result.question);
+    const question = result.ask ? result.question : undefined;
+    // Logged where the decision is made, so the log holds one line per check
+    // that reached one. A check cancelled before then decided nothing.
+    this.#log({ type: "proactive_check", asked: question !== undefined });
+    if (question !== undefined) {
+      const { sentences, rest } = splitSentences(question);
       for (const sentence of [...sentences, rest.trim()]) {
         await this.#speak(check, sentence);
         if (!this.#shouldContinue(check)) return;
@@ -860,8 +1022,11 @@ export class LiveAssistService {
   async #composeReplyRequest(reply: Answer): Promise<LiveReplyRequest | undefined> {
     // Waited for only while the reply holds the floor and has time left, so a
     // read that never returns costs a turn no more than its timeout, and never
-    // holds up `end()`.
-    await unlessAborted(this.#readNewActions(), reply.controller.signal);
+    // holds up `end()`. A read that fails leaves the actions already stored,
+    // which is what the request carries: a log the service could not read is
+    // not the user's turn failing, and is never a sign that Claude is
+    // unreachable. It moves nothing in time either (see `Trigger`).
+    await unlessAborted(this.#readNewActions().catch(() => undefined), reply.controller.signal);
     if (!this.#shouldContinue(reply)) return undefined;
     const takenAt = formatClock(this.#options.now() - this.#startedAt);
     const screenshot = await this.#captureScreenshot();
@@ -939,7 +1104,10 @@ export class LiveAssistService {
     const path = join(this.#screenshotDirectory, `${randomUUID()}.png`);
     try {
       await this.#options.sidecar.screenshot(path);
-      return { base64: await this.#options.readImage(path) };
+      const base64 = await this.#options.readImage(path);
+      // When the screen was shared, and nothing of what it showed (spec §5.6).
+      this.#log({ type: "screenshot" });
+      return { base64 };
     } finally {
       // The screenshot exists only until it has been read into memory, and is
       // removed even when taking or reading it failed. A removal that fails
@@ -951,15 +1119,23 @@ export class LiveAssistService {
   /**
    * Hands one sentence to the sidecar for `reply`, unless another has taken
    * the floor. The check and the hand-over share one synchronous stretch.
-   * Callers re-check with `#shouldContinue` once this resolves.
+   * Callers re-check with `#shouldContinue` once this resolves. A sentence
+   * said `aside` — spec §8's apology — holds the room exactly as any other
+   * does, but answers nothing, so it is part of no turn: the history, the
+   * transcript, and the log all leave it out.
    */
-  async #speak(reply: Reply, sentence: string): Promise<void> {
+  async #speak(reply: Reply, sentence: string, options: { aside?: boolean } = {}): Promise<void> {
     if (this.#reply !== reply || sentence === "") return;
     const utteranceId = randomUUID();
-    // The first sentence enters the turn into the history, in the same step
-    // that stops `#yieldToUser` sending the user's words again.
-    reply.assistantTurn ??= this.#remember(reply);
-    this.#utterances.set(utteranceId, { sentence, assistantTurn: reply.assistantTurn });
+    const aside = options.aside === true;
+    // The first sentence of a turn enters it into the history, in the same
+    // step that stops `#yieldToUser` sending the user's words again.
+    if (!aside) reply.assistantTurn ??= this.#remember(reply);
+    this.#utterances.set(utteranceId, {
+      sentence,
+      assistantTurn: aside ? undefined : reply.assistantTurn,
+      startedAtMs: undefined,
+    });
     reply.spoke = true;
     this.#said = sentence;
     this.#lastSpokeAt = this.#options.now();
@@ -979,23 +1155,37 @@ export class LiveAssistService {
     // Every report places the tutor's voice on the capture clock, whether or
     // not the service still waits on that utterance.
     this.#placeSpeech(event);
-    if (event.phase === "started") return;
     const utterance = this.#utterances.get(event.utteranceId);
     // Only speech the service is still waiting on affects its state, its
     // history, or when it listens again; a late report about an utterance it
     // has already stopped changes nothing.
     if (utterance === undefined) return;
+    if (event.phase === "started") {
+      // Where the sentence began on the capture clock, which its transcript
+      // segment runs from. The sidecar reports a start once per sentence.
+      utterance.startedAtMs ??= event.atMs;
+      return;
+    }
     this.#utterances.delete(event.utteranceId);
     const now = this.#options.now();
     // Silence is measured from the end of what the tutor said, not its start.
     this.#lastSpokeAt = now;
     // In half duplex, transcripts arriving in the moments after are ignored too.
     this.#lastSentenceEndedAt = now;
-    // The history holds what the user heard, so a sentence joins it only once
-    // it has been spoken to the end.
-    if (event.phase === "finished") {
+    // The history and the transcript hold what the user heard, so a sentence
+    // joins them only once it has been spoken to the end, and never when it
+    // was part of no turn.
+    if (event.phase === "finished" && utterance.assistantTurn !== undefined) {
       utterance.assistantTurn.text = joinWords(utterance.assistantTurn.text, utterance.sentence);
+      const startMs = Math.max(0, utterance.startedAtMs ?? event.atMs);
+      this.#recordSegment({
+        speaker: "assistant",
+        text: utterance.sentence,
+        startMs,
+        endMs: Math.max(startMs, event.atMs),
+      });
     }
+    this.#logTurn(utterance, event.phase === "cancelled");
     this.#publish();
   }
 
@@ -1032,9 +1222,95 @@ export class LiveAssistService {
    */
   #stopSpeaking(): Promise<void> | undefined {
     if (this.#utterances.size === 0) return undefined;
+    // Every sentence this cuts off is an interrupted turn (spec §5.2), logged
+    // here because the sidecar's report about it arrives once it has been
+    // forgotten and no longer changes anything.
+    for (const utterance of this.#utterances.values()) this.#logTurn(utterance, true);
     this.#utterances.clear();
     this.#lastSpokeAt = this.#options.now();
     return this.#options.sidecar.stopSpeaking();
+  }
+
+  /**
+   * Adds one segment to the transcript and writes the file again. Ids run in
+   * the order segments are first written, so each is unique.
+   */
+  #recordSegment(segment: Omit<LiveSegment, "id">): LiveSegment {
+    const recorded: LiveSegment = { id: `live-${this.#segments.length + 1}`, ...segment };
+    this.#segments.push(recorded);
+    this.#persistTranscript();
+    return recorded;
+  }
+
+  /**
+   * Rewrites `transcript.json` whole and renames it into place, so that a
+   * crash mid-write leaves the last complete file rather than a truncated
+   * one: Build reads this file and refuses a recording whose transcript it
+   * cannot accept. Nothing is written until something has been said, so a
+   * session nobody spoke in leaves Build the audio to transcribe. The
+   * snapshot is taken here, synchronously, so that a segment still growing
+   * cannot change what an earlier write says.
+   */
+  #persistTranscript(): void {
+    const snapshot: TimestampedTranscript = {
+      version: 1,
+      segments: [...this.#segments].sort((left, right) => left.startMs - right.startMs),
+    };
+    const body = `${JSON.stringify(snapshot)}\n`;
+    const path = join(this.#options.sessionDirectory, "transcript.json");
+    this.#queueWrite(async () => {
+      const temporary = `${path}.${randomUUID()}.tmp`;
+      await writeFile(temporary, body, { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, path);
+    });
+  }
+
+  /**
+   * Adds one line to `live.jsonl`: what happened, and `t`, the milliseconds
+   * since the conversation began, which the recording's own start precedes by
+   * the sidecar's start-up. No entry ever carries an image.
+   */
+  #log(entry: Record<string, unknown>): void {
+    const line = `${JSON.stringify({ t: this.#options.now() - this.#startedAt, ...entry })}\n`;
+    const path = join(this.#options.sessionDirectory, "live.jsonl");
+    this.#queueWrite(() => appendFile(path, line, { encoding: "utf8", mode: 0o600 }));
+  }
+
+  /**
+   * One sentence's outcome (spec §5.2): heard to the end, or cut off before
+   * it was. A sentence that is part of no turn — spec §8's apology — is no
+   * part of the conversation either, so nothing records it.
+   */
+  #logTurn(utterance: Utterance, interrupted: boolean): void {
+    const turn = utterance.assistantTurn;
+    if (turn === undefined) return;
+    this.#log({
+      type: "assistant_turn",
+      text: utterance.sentence,
+      interrupted,
+      ...(turn.trigger === undefined ? {} : { trigger: turn.trigger }),
+    });
+  }
+
+  /**
+   * Queues one write after the last, so writes never overlap: the log keeps
+   * the order things happened in, and the newest transcript is the one left
+   * on disk. A write that fails is let go — there is nothing the conversation
+   * could usefully do about it, and the recording is never the casualty.
+   */
+  #queueWrite(write: () => Promise<void>): void {
+    this.#writing = this.#writing.then(write).catch(() => undefined);
+  }
+
+  /** Waits for every queued write, which is how `end()` leaves the files complete. */
+  async flush(): Promise<void> {
+    // A write queued while an earlier one is still in flight joins the end of
+    // the chain, so this waits again until the chain has stopped growing.
+    let pending: Promise<void>;
+    do {
+      pending = this.#writing;
+      await pending;
+    } while (pending !== this.#writing);
   }
 
   #publish(): void {
