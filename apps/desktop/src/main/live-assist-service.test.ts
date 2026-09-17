@@ -34,9 +34,16 @@ interface Harness {
   updates: LiveUpdate[];
   /** Every screenshot path the service removed, in order. */
   removedImages: string[];
-  emitTranscript: (text: string, isFinal: boolean) => void;
-  finishUtterances: () => void;
-  emitSpeech: (utteranceId: string, phase: LiveSpeechSignal["phase"]) => void;
+  /**
+   * Delivers a transcript event. Its audio is placed on the capture clock,
+   * which the fakes count as milliseconds since the session started: by
+   * default at the moment it arrives, or over `audio` when given.
+   */
+  emitTranscript: (text: string, isFinal: boolean, audio?: { startMs: number; endMs: number }) => void;
+  /** Reports every sentence spoken so far finished, at `atMs` on the capture clock, by default now. */
+  finishUtterances: (atMs?: number) => void;
+  /** Reports `phase` of one sentence, at `atMs` on the capture clock, by default now. */
+  emitSpeech: (utteranceId: string, phase: LiveSpeechSignal["phase"], atMs?: number) => void;
   emitSidecarState: (state: LiveStateSignal["state"], reason?: string) => void;
   /** Runs `listener` synchronously on every update, the instant the service publishes it. */
   whenUpdated: (listener: (update: LiveUpdate) => void) => void;
@@ -67,6 +74,13 @@ class FakeSidecar implements LiveSidecar {
   readonly #held = new Map<HeldCommand, Array<() => void>>();
   #screenshotsFail = false;
 
+  /** Answers the capture clock's milliseconds, on which speech events are placed. */
+  readonly #captureClock: () => number;
+
+  constructor(captureClock: () => number) {
+    this.#captureClock = captureClock;
+  }
+
   /**
    * Makes every later screenshot fail once its path has been handed over, as
    * a request fails when the sidecar client stops waiting for it.
@@ -95,7 +109,7 @@ class FakeSidecar implements LiveSidecar {
   async speak(utteranceId: string, text: string) {
     this.spoken.push({ utteranceId, text });
     this.commands.push(`speak ${text}`);
-    for (const listener of this.speechListeners) listener({ utteranceId, phase: "started" });
+    for (const listener of this.speechListeners) listener({ utteranceId, phase: "started", atMs: this.#captureClock() });
     await this.#reply("speak");
   }
   async stopSpeaking() {
@@ -190,11 +204,13 @@ type HarnessOverrides = Partial<Omit<LiveAssistOptions, "sessionId" | "sessionDi
 
 async function makeHarness(overrides: HarnessOverrides = {}): Promise<Harness> {
   const directory = await mkdtemp(join(tmpdir(), "replay-live-"));
-  const sidecar = new FakeSidecar();
+  const startedAt = Date.now();
+  // The capture clock the fakes place audio on: fake time since the session started.
+  const captureNow = () => Date.now() - startedAt;
+  const sidecar = new FakeSidecar(captureNow);
   const updates: LiveUpdate[] = [];
   const removedImages: string[] = [];
   const updateListeners: Array<(update: LiveUpdate) => void> = [];
-  const startedAt = Date.now();
   const service = new LiveAssistService({
     transport: transportYielding([]),
     events: { read: async () => [] },
@@ -218,19 +234,20 @@ async function makeHarness(overrides: HarnessOverrides = {}): Promise<Harness> {
     sidecar,
     updates,
     removedImages,
-    emitTranscript(text, isFinal) {
+    emitTranscript(text, isFinal, audio) {
       segment += 1;
+      const { startMs, endMs } = audio ?? { startMs: captureNow(), endMs: captureNow() };
       for (const listener of sidecar.transcriptListeners) {
-        listener({ segmentId: `segment-${segment}`, text, isFinal, startMs: segment * 1_000, endMs: segment * 1_000 + 500 });
+        listener({ segmentId: `segment-${segment}`, text, isFinal, startMs, endMs });
       }
     },
-    finishUtterances() {
+    finishUtterances(atMs = captureNow()) {
       for (const { utteranceId } of sidecar.spoken) {
-        for (const listener of sidecar.speechListeners) listener({ utteranceId, phase: "finished" });
+        for (const listener of sidecar.speechListeners) listener({ utteranceId, phase: "finished", atMs });
       }
     },
-    emitSpeech(utteranceId, phase) {
-      for (const listener of sidecar.speechListeners) listener({ utteranceId, phase });
+    emitSpeech(utteranceId, phase, atMs = captureNow()) {
+      for (const listener of sidecar.speechListeners) listener({ utteranceId, phase, atMs });
     },
     emitSidecarState(state, reason) {
       for (const listener of sidecar.stateListeners) listener(reason === undefined ? { state } : { state, reason });
@@ -848,12 +865,17 @@ describe("LiveAssistService interleavings", () => {
     const harness = await makeHarness({ transport: transportYielding([{ kind: "text", text: "Answer." }]) });
     harness.emitTranscript("First question?", true);
     await vi.advanceTimersByTimeAsync(700);
+    const [cut] = harness.sidecar.spoken;
 
     // The sidecar is slow to acknowledge pausing; meanwhile the user resumes
     // and asks again.
     harness.sidecar.hold("setPaused");
     const pausing = harness.service.setPaused(true);
     const resuming = harness.service.setPaused(false);
+    // The sidecar cancels the sentence the stop reached, and a second passes
+    // before the user speaks.
+    harness.emitSpeech(cut!.utteranceId, "cancelled");
+    await vi.advanceTimersByTimeAsync(1_000);
     harness.emitTranscript("Second question?", true);
     await vi.advanceTimersByTimeAsync(700);
     harness.sidecar.release("setPaused");
@@ -902,6 +924,8 @@ describe("LiveAssistService interleavings", () => {
     model.release({ kind: "text", text: "Second. " });
     model.finish();
     harness.finishUtterances();
+    // A second on, so that only the failure can keep these words out.
+    await vi.advanceTimersByTimeAsync(1_000);
     harness.emitTranscript("Hello?", true);
     await vi.advanceTimersByTimeAsync(700);
 
@@ -909,6 +933,8 @@ describe("LiveAssistService interleavings", () => {
     expect(model.requests).toHaveLength(1);
     expect(harness.service.state).toBe("failed");
     expect(harness.updates.at(-1)).toMatchObject({ state: "failed", sharing: false, error: "live_audio_failed" });
+    // Nothing said after the failure was heard at all, not even on the panel.
+    expect(harness.updates.at(-1)?.heard).toEqual({ text: "Question?", final: true });
   });
 });
 
@@ -1106,6 +1132,9 @@ describe("not hearing itself", () => {
 
   it("keeps ignoring it while a newer sentence plays, whatever the sidecar reports late about one a pause stopped", async () => {
     const harness = await makeHarness({ transport: transportYielding([{ kind: "text", text: "Answer." }]) });
+    // The sidecar takes each sentence but has reported nothing about either,
+    // so only when they were handed over says whether the tutor may be heard.
+    harness.sidecar.speak = async (utteranceId, text) => { harness.sidecar.spoken.push({ utteranceId, text }); };
     harness.emitTranscript("First question?", true);
     await vi.advanceTimersByTimeAsync(700);
     const [stopped] = harness.sidecar.spoken;
@@ -1137,9 +1166,11 @@ describe("not hearing itself", () => {
     const [stopped] = harness.sidecar.spoken;
 
     await harness.service.setPaused(true);
+    await vi.advanceTimersByTimeAsync(1_000);
     await harness.service.setPaused(false);
-    // The sidecar's report that the pause cancelled the sentence arrives after the resume.
-    harness.emitSpeech(stopped!.utteranceId, "cancelled");
+    // The sidecar's report that the pause cancelled the sentence, at the
+    // moment it did, arrives only after the resume.
+    harness.emitSpeech(stopped!.utteranceId, "cancelled", 750);
     harness.emitTranscript("And the date?", true);
     await vi.advanceTimersByTimeAsync(700);
 
@@ -1156,7 +1187,11 @@ describe("not hearing itself", () => {
     model.release({ kind: "text", text: "Use the invoice total." });
     model.finish();
     await harness.settle();
-    harness.finishUtterances();
+    // The sentence played until 2 s, but the sidecar's report of it arrives a
+    // second late, so the service is still waiting out the echo it was told
+    // about when the pause comes.
+    await vi.advanceTimersByTimeAsync(2_300);
+    harness.finishUtterances(2_000);
 
     await harness.service.setPaused(true);
     await harness.service.setPaused(false);
@@ -1179,9 +1214,10 @@ describe("not hearing itself", () => {
     harness.emitSpeech(first!.utteranceId, "finished");
 
     // The pause cuts off the second sentence, and the sidecar's report that it
-    // finished arrives after the stop.
+    // finished arrives after the stop. A second later listening resumes.
     await harness.service.setPaused(true);
     harness.emitSpeech(second!.utteranceId, "finished");
+    await vi.advanceTimersByTimeAsync(1_000);
     await harness.service.setPaused(false);
     harness.emitTranscript("Which totals?", true);
     await vi.advanceTimersByTimeAsync(700);
@@ -1240,6 +1276,188 @@ describe("not hearing itself", () => {
     expect(checks).toHaveLength(2);
   });
 
+  it("drops the recogniser's final for the tutor's own sentence by the audio it covers, however late it arrives", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport });
+
+    harness.emitTranscript("Which total should I use?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    model.release({ kind: "text", text: "Use the invoice total. " });
+    await harness.settle();
+    const [sentence] = harness.sidecar.spoken;
+    // The sentence plays from 0.7 s to 2.7 s on the capture clock.
+    await vi.advanceTimersByTimeAsync(2_000);
+    harness.emitSpeech(sentence!.utteranceId, "finished");
+
+    // Two seconds after it finished, the recogniser's final for it arrives.
+    await vi.advanceTimersByTimeAsync(2_000);
+    const updatesBefore = harness.updates.length;
+    harness.emitTranscript("Use the invoice total.", true, { startMs: 900, endMs: 2_600 });
+    expect(harness.updates).toHaveLength(updatesBefore);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(model.requests).toHaveLength(1);
+
+    // The reply was not interrupted, and the panel still shows the user's question as heard.
+    model.release({ kind: "text", text: "It includes tax." });
+    model.finish();
+    await harness.settle();
+    expect(spokenTexts(harness)).toEqual(["Use the invoice total.", "It includes tax."]);
+    expect(harness.updates.at(-1)?.heard).toEqual({ text: "Which total should I use?", final: true });
+    expect(harness.sidecar.stopSpeakingCount).toBe(0);
+  });
+
+  it("never counts the late final for its own question as the user speaking, so its next check is not held back", async () => {
+    const { transport, checks } = checkingTransport(() => ({ ask: true, question: "Why?" }));
+    const harness = await makeHarness({
+      transport,
+      events: eventLogRepeating(committedClick),
+      // A check at every poll, unless the user has been heard in the last five seconds.
+      proactive: { speechGapMs: 0, checkIntervalMs: 0, quietMs: 5_000 },
+    });
+
+    await harness.at(5_000);
+    expect(spokenTexts(harness)).toEqual(["Why?"]);
+    await harness.at(5_600);
+    harness.finishUtterances();
+    // Two seconds after the question finished, the recogniser's final for it arrives.
+    await harness.at(7_600);
+    harness.emitTranscript("Why?", true, { startMs: 5_100, endMs: 5_500 });
+    await harness.at(10_000);
+
+    expect(checks).toHaveLength(2);
+  });
+
+  it("hears words spoken after the tutor's audio and its echo, even when they arrive just after the sidecar reports that audio", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport });
+    // The request to speak fails, so the service stops waiting on the
+    // sentence, but the sidecar plays it all the same.
+    harness.sidecar.speak = async (utteranceId, text) => {
+      harness.sidecar.spoken.push({ utteranceId, text });
+      throw new Error("The capture sidecar did not answer.");
+    };
+
+    harness.emitTranscript("Which total should I use?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    model.release({ kind: "text", text: "Use the invoice total. " });
+    await harness.settle();
+    const [played] = harness.sidecar.spoken;
+
+    // It plays from 1 s to 2 s on the capture clock. The sidecar's reports
+    // arrive at 3 s, and straight after them the recogniser's final for the
+    // room's echo of it, then the user's first words.
+    await vi.advanceTimersByTimeAsync(2_300);
+    harness.emitSpeech(played!.utteranceId, "started", 1_000);
+    harness.emitSpeech(played!.utteranceId, "finished", 2_000);
+    harness.emitTranscript("invoice total", true, { startMs: 2_100, endMs: 2_400 });
+    harness.emitTranscript("And the date?", true, { startMs: 2_801, endMs: 2_990 });
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(model.requests.map((request) => request.userText)).toEqual(["Which total should I use?", "And the date?"]);
+  });
+
+  it("drops only the audio of a sentence reported after a pause and resume, never the user's later words", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport });
+
+    harness.emitTranscript("Which total should I use?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    model.release({ kind: "text", text: "Use the invoice total. " });
+    await harness.settle();
+    const [stopped] = harness.sidecar.spoken;
+
+    // The pause lasts two seconds. The sidecar did not stop the sentence in
+    // time, and reports it finished at 1.5 s only once listening has resumed.
+    await harness.service.setPaused(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await harness.service.setPaused(false);
+    harness.emitSpeech(stopped!.utteranceId, "finished", 1_500);
+    // The recogniser's final for the sentence arrives, then the user's words.
+    harness.emitTranscript("Use the invoice total.", true, { startMs: 800, endMs: 1_400 });
+    await vi.advanceTimersByTimeAsync(500);
+    harness.emitTranscript("And the date?", true, { startMs: 2_800, endMs: 3_100 });
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(model.requests.map((request) => request.userText)).toEqual(["Which total should I use?", "And the date?"]);
+  });
+
+  it("drops what it hears after a sentence the sidecar started and has not reported ended, even one it no longer waits on", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport });
+
+    harness.emitTranscript("Which total should I use?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    model.release({ kind: "text", text: "Use the invoice total. " });
+    await harness.settle();
+
+    // The sidecar has reported the sentence started at 0.7 s, and has still
+    // not reported it ended when listening resumes after a two-second pause.
+    await harness.service.setPaused(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await harness.service.setPaused(false);
+    await vi.advanceTimersByTimeAsync(300);
+    harness.emitTranscript("invoice total", true, { startMs: 2_750, endMs: 2_900 });
+    await vi.advanceTimersByTimeAsync(700);
+    expect(model.requests).toHaveLength(1);
+
+    // Words from before the sentence started are still heard.
+    harness.emitTranscript("Which total?", true, { startMs: 100, endMs: 600 });
+    await vi.advanceTimersByTimeAsync(700);
+    expect(model.requests.map((request) => request.userText)).toEqual(["Which total should I use?", "Which total?"]);
+  });
+
+  it.each([
+    ["the user's words", (harness: Harness) => { harness.emitTranscript("Anything else?", false, { startMs: 32_000, endMs: 32_400 }); }],
+    ["the sidecar's report of a later sentence", (harness: Harness) => { harness.emitSpeech("a-later-sentence", "cancelled", 32_400); }],
+  ])("forgets where the tutor's audio was once %s come thirty seconds after it", async (_, hearLater) => {
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport });
+
+    harness.emitTranscript("Which total should I use?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    model.release({ kind: "text", text: "Use the invoice total." });
+    model.finish();
+    await harness.settle();
+    // The sentence plays from 0.7 s to 1.5 s, so it and its echo end by 2.3 s.
+    await vi.advanceTimersByTimeAsync(800);
+    harness.finishUtterances();
+
+    // A very late final for the sentence is dropped while nothing newer has been heard.
+    await vi.advanceTimersByTimeAsync(30_000);
+    harness.emitTranscript("invoice total", false, { startMs: 1_000, endMs: 1_400 });
+    expect(harness.updates.at(-1)?.heard).toEqual({ text: "Which total should I use?", final: true });
+
+    // Once newer audio is more than thirty seconds past the sentence and its
+    // echo, the service no longer holds where the sentence was.
+    await vi.advanceTimersByTimeAsync(1_000);
+    hearLater(harness);
+    harness.emitTranscript("invoice total", false, { startMs: 1_000, endMs: 1_400 });
+    expect(harness.updates.at(-1)?.heard).toEqual({ text: "invoice total", final: false });
+  });
+
+  it("still hears the user when the wall clock is set back while it waits out the echo", async () => {
+    let clock = 10_000;
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport, now: () => clock });
+
+    harness.emitTranscript("Which total should I use?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    model.release({ kind: "text", text: "Use the invoice total." });
+    model.finish();
+    await harness.settle();
+    // The sentence plays for two seconds, by the service's clock and the capture clock alike.
+    clock += 2_000;
+    await vi.advanceTimersByTimeAsync(2_000);
+    harness.finishUtterances();
+    // Straight away the wall clock is set back an hour, and a second later the user speaks.
+    clock -= 3_600_000;
+    await vi.advanceTimersByTimeAsync(1_000);
+    harness.emitTranscript("And the date?", true);
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(model.requests.map((request) => request.userText)).toEqual(["Which total should I use?", "And the date?"]);
+  });
+
   it("lets the user talk over the tutor in full duplex", async () => {
     const model = heldTransport();
     const harness = await makeHarness({ transport: model.transport, fullDuplex: true });
@@ -1248,6 +1466,7 @@ describe("not hearing itself", () => {
     await vi.advanceTimersByTimeAsync(700);
     model.release({ kind: "text", text: "Use the invoice total. " });
     await harness.settle();
+    const [cut] = harness.sidecar.spoken;
 
     harness.emitTranscript("Wait, which total?", true);
     expect(harness.sidecar.stopSpeakingCount).toBe(1);
@@ -1257,8 +1476,20 @@ describe("not hearing itself", () => {
     model.finish();
     await vi.advanceTimersByTimeAsync(700);
 
+    // Nor is anything judged by the audio it covers: the sidecar reports
+    // where the cut sentence's voice was, and words from inside that stretch
+    // are still heard. That reply had said nothing, so its turn is re-sent
+    // with them.
+    harness.emitSpeech(cut!.utteranceId, "cancelled");
+    harness.emitTranscript("And the date?", true, { startMs: 800, endMs: 1_200 });
+    await vi.advanceTimersByTimeAsync(700);
+
     expect(spokenTexts(harness)).toEqual(["Use the invoice total."]);
-    expect(model.requests.map((request) => request.userText)).toEqual(["Which total should I use?", "Wait, which total?"]);
+    expect(model.requests.map((request) => request.userText)).toEqual([
+      "Which total should I use?",
+      "Wait, which total?",
+      "Wait, which total? And the date?",
+    ]);
   });
 });
 
@@ -1416,8 +1647,10 @@ describe("what the tutor is told", () => {
     await harness.settle();
     harness.finishUtterances();
 
-    // The user speaks again once the echo of the answer has died away.
+    // The user speaks again once the echo of the answer has died away, on the
+    // service's clock and the capture clock alike.
     clock += 1_000;
+    await vi.advanceTimersByTimeAsync(1_000);
     harness.emitTranscript("And the date?", true);
     await vi.advanceTimersByTimeAsync(700);
 

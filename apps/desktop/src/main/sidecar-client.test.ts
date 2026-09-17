@@ -158,6 +158,7 @@ describe("SidecarClient", () => {
         sessionId: "session-1",
         utteranceId: "utterance-1",
         phase: "started",
+        atMs: 2600,
       }))
     );
     transport.lineListeners.forEach((listener) =>
@@ -171,7 +172,7 @@ describe("SidecarClient", () => {
 
     // Assert live events reached their listeners
     expect(transcripts).toEqual([expect.objectContaining({ text: "Any difference is flagged", isFinal: true })]);
-    expect(speeches).toEqual([expect.objectContaining({ phase: "started" })]);
+    expect(speeches).toEqual([expect.objectContaining({ phase: "started", atMs: 2600 })]);
     expect(states).toEqual([expect.objectContaining({ state: "listening" })]);
 
     // Assert request is still pending (live events did not resolve it)

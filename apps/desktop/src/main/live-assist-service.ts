@@ -17,6 +17,11 @@ export interface LiveTranscriptSignal {
 export interface LiveSpeechSignal {
   utteranceId: string;
   phase: "started" | "finished" | "cancelled";
+  /**
+   * When the phase happened, in capture-relative milliseconds: the clock a
+   * transcript's `startMs` and `endMs` are on.
+   */
+  atMs: number;
 }
 
 export interface LiveStateSignal {
@@ -73,6 +78,13 @@ export interface LiveAssistOptions {
  * echo of its last syllables is not transcribed as the user.
  */
 export const LIVE_ECHO_TAIL_MS = 800;
+
+/**
+ * How far behind the newest audio heard the service keeps where the tutor's
+ * voice was. The recogniser is not expected to report audio that old, so
+ * older stretches are let go and memory stays bounded.
+ */
+const SPEECH_WINDOW_RETENTION_MS = 30_000;
 
 /**
  * The silences that must all have passed before the tutor checks whether to
@@ -254,6 +266,16 @@ interface Utterance {
 }
 
 /**
+ * Where one sentence of the tutor's voice may be heard on the capture clock:
+ * from when the sidecar reported it started until `echoTailMs` after it
+ * reported it finished or cancelled, and without end until it has.
+ */
+interface SpeechWindow {
+  readonly fromMs: number;
+  untilMs: number;
+}
+
+/**
  * Assembles turns from streamed speech, sends one request per turn, speaks
  * the reply sentence by sentence, and yields to the user the moment they are
  * heard again. After a committed action, once the user and the tutor have
@@ -330,18 +352,28 @@ interface Utterance {
  *    condition still holds once the read is back, in the synchronous step in
  *    which the check takes the floor. Until then the poll holds nothing, so
  *    nothing waits for it.
- * 9. In half duplex, nothing the microphone hears while the tutor may be
- *    heard in the room reaches the conversation. That is while any sentence
- *    is outstanding, from the synchronous step in which `#speak` hands it to
- *    the sidecar, and for `echoTailMs` after the sidecar last reports a
- *    sentence it still waits on finished or cancelled, by `now()`. Until then
- *    `#onTranscript` drops each event before it changes anything: not the
- *    words heard, the turn or its timer, the reply, the speech, or when the
- *    user was last heard. Only reports about outstanding sentences count, so
- *    a sentence a stop has already forgotten (invariant 2) starts no echo
- *    tail when it is reported late, and a pause ends any echo tail, so
- *    listening resumes without one. In full duplex no event is dropped on
- *    these grounds.
+ * 9. In half duplex, nothing the microphone hears of the tutor reaches the
+ *    conversation, judged two ways, because a recogniser reports a result
+ *    later than the audio it is for. By when an event arrives: while any
+ *    sentence is outstanding, from the synchronous step in which `#speak`
+ *    hands it to the sidecar, and for `echoTailMs` after the sidecar last
+ *    reports a sentence it still waits on finished or cancelled, by `now()`;
+ *    a wall clock set back counts that as passed. By the audio the event
+ *    covers: while that audio runs into any stretch the tutor's voice has
+ *    been heard in, from a `started` report until `echoTailMs` after its
+ *    terminal report, and without end until that report comes. Every report
+ *    places such a stretch, even about a sentence the service no longer
+ *    waits on, so a sentence the sidecar plays after its hand-over failed is
+ *    covered too; stretches sit in the past on the capture clock, so a stale
+ *    report after a pause cannot deafen later speech, and they are let go
+ *    once the audio heard is `SPEECH_WINDOW_RETENTION_MS` past them. When
+ *    either judgement holds, `#onTranscript` drops the event before it
+ *    changes anything: not the words heard, the turn or its timer, the
+ *    reply, the speech, or when the user was last heard. Only reports about
+ *    outstanding sentences reach state and history, so a sentence a stop has
+ *    already forgotten (invariant 2) starts no arrival tail when it is
+ *    reported late, and a pause ends any arrival tail, so listening resumes
+ *    without one. In full duplex no event is dropped on these grounds.
  */
 export class LiveAssistService {
   readonly #options: LiveAssistOptions &
@@ -364,10 +396,19 @@ export class LiveAssistService {
   readonly #utterances = new Map<string, Utterance>();
   /**
    * When the sidecar last reported an outstanding utterance finished or
-   * cancelled, by `now()`. In half duplex the room may still echo it for
-   * `echoTailMs` after. A pause resets it.
+   * cancelled, by `now()`. In half duplex, transcript events arriving within
+   * `echoTailMs` after it are ignored. A pause resets it.
    */
-  #fellSilentAt = Number.NEGATIVE_INFINITY;
+  #lastSentenceEndedAt = Number.NEGATIVE_INFINITY;
+  /**
+   * Where the tutor's voice has been on the capture clock, by utterance id.
+   * Every speech report the sidecar sends adds to it, whether or not the
+   * service still waits on that utterance, and it is used only to ignore
+   * transcripts of that audio: never for state, history, or `#utterances`.
+   */
+  readonly #speechWindows = new Map<string, SpeechWindow>();
+  /** The newest capture-clock time any transcript or speech report has reached. */
+  #newestAudioMs = Number.NEGATIVE_INFINITY;
   /** Every reply still running, current or superseded. */
   readonly #running = new Set<Promise<void>>();
   #starting: Promise<void> | undefined;
@@ -471,7 +512,7 @@ export class LiveAssistService {
     const pausing = this.#options.sidecar.setPaused(paused);
     // The stop silences the tutor, and nothing is heard until listening
     // resumes, so no echo tail outlives a pause.
-    this.#fellSilentAt = Number.NEGATIVE_INFINITY;
+    this.#lastSentenceEndedAt = Number.NEGATIVE_INFINITY;
     if (!paused) this.#listenAgain();
     this.#publish();
     await Promise.all([stopping, pausing]);
@@ -522,8 +563,12 @@ export class LiveAssistService {
 
   #onTranscript(event: LiveTranscriptSignal): void {
     if (this.#paused || this.#ended || this.#failed) return;
+    const tutor = this.#mayHearTutor(event);
+    // Where the tutor's voice was is let go only once this event has been
+    // judged against it.
+    this.#noteAudioUpTo(event.endMs);
     // Dropped before it changes anything, and never kept for later.
-    if (this.#mayHearTutor()) return;
+    if (tutor) return;
     this.#lastHeardAt = this.#options.now();
     this.#heard = { text: event.text, final: event.isFinal };
     this.#yieldToUser();
@@ -533,14 +578,58 @@ export class LiveAssistService {
   }
 
   /**
-   * Whether, in half duplex, what the microphone hears now may be the tutor
-   * itself: while any utterance is outstanding, and for `echoTailMs` after
-   * the sidecar last reported one finished or cancelled. Never in full
-   * duplex, where the user may talk over the tutor.
+   * Whether, in half duplex, `event` may be the tutor itself rather than the
+   * user. By when it arrives: while any utterance is outstanding, and for
+   * `echoTailMs` after the sidecar last reported one finished or cancelled,
+   * which covers the moments before the sidecar has reported anything about
+   * a sentence just handed over. By the audio it covers: when that audio
+   * runs into any stretch the tutor's voice has been heard in, which covers
+   * a result the recogniser reports long after the audio it is for. Never in
+   * full duplex, where the user may talk over the tutor.
    */
-  #mayHearTutor(): boolean {
+  #mayHearTutor(event: LiveTranscriptSignal): boolean {
     if (this.#options.fullDuplex) return false;
-    return this.#utterances.size > 0 || this.#options.now() - this.#fellSilentAt < this.#options.echoTailMs;
+    if (this.#utterances.size > 0) return true;
+    const sinceSentenceEnded = this.#options.now() - this.#lastSentenceEndedAt;
+    // A wall clock set back counts the tail as passed, rather than leaving
+    // the microphone ignored until the clock has caught up again.
+    if (sinceSentenceEnded >= 0 && sinceSentenceEnded < this.#options.echoTailMs) return true;
+    for (const window of this.#speechWindows.values()) {
+      if (event.startMs <= window.untilMs && event.endMs >= window.fromMs) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Places one speech report on the capture clock. A `started` opens the
+   * stretch the sentence may be heard in, and a terminal report closes it
+   * `echoTailMs` later; until then it has no end, because the sentence may
+   * still be playing. The sidecar sends one terminal report per sentence, so
+   * a later one changes nothing.
+   */
+  #placeSpeech(event: LiveSpeechSignal): void {
+    const window = this.#speechWindows.get(event.utteranceId);
+    if (event.phase === "started") {
+      if (window === undefined) {
+        this.#speechWindows.set(event.utteranceId, { fromMs: event.atMs, untilMs: Number.POSITIVE_INFINITY });
+      }
+    } else if (window?.untilMs === Number.POSITIVE_INFINITY) {
+      window.untilMs = event.atMs + this.#options.echoTailMs;
+    }
+    this.#noteAudioUpTo(event.atMs);
+  }
+
+  /**
+   * Takes `ms` as audio the session has reached, and lets go of any stretch
+   * of the tutor's voice that ended well before it. A stretch with no end
+   * yet is kept, because the sentence may still be playing.
+   */
+  #noteAudioUpTo(ms: number): void {
+    this.#newestAudioMs = Math.max(this.#newestAudioMs, ms);
+    const oldest = this.#newestAudioMs - SPEECH_WINDOW_RETENTION_MS;
+    for (const [utteranceId, window] of this.#speechWindows) {
+      if (window.untilMs < oldest) this.#speechWindows.delete(utteranceId);
+    }
   }
 
   /** Whatever the tutor is doing, the user being heard takes precedence. */
@@ -887,6 +976,9 @@ export class LiveAssistService {
   }
 
   #onSpeech(event: LiveSpeechSignal): void {
+    // Every report places the tutor's voice on the capture clock, whether or
+    // not the service still waits on that utterance.
+    this.#placeSpeech(event);
     if (event.phase === "started") return;
     const utterance = this.#utterances.get(event.utteranceId);
     // Only speech the service is still waiting on affects its state, its
@@ -897,8 +989,8 @@ export class LiveAssistService {
     const now = this.#options.now();
     // Silence is measured from the end of what the tutor said, not its start.
     this.#lastSpokeAt = now;
-    // In half duplex, the room may echo it for a moment longer.
-    this.#fellSilentAt = now;
+    // In half duplex, transcripts arriving in the moments after are ignored too.
+    this.#lastSentenceEndedAt = now;
     // The history holds what the user heard, so a sentence joins it only once
     // it has been spoken to the end.
     if (event.phase === "finished") {

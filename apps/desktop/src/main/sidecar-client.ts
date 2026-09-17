@@ -49,6 +49,8 @@ export interface SidecarLiveSpeechEvent {
   sessionId: string;
   utteranceId: string;
   phase: "started" | "finished" | "cancelled";
+  /** When the phase happened, in capture-relative milliseconds, on the clock of a transcript's `startMs` and `endMs`. */
+  atMs: number;
 }
 
 export interface SidecarLiveStateEvent {
