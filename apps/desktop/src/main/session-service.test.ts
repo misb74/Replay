@@ -442,6 +442,36 @@ describe("SessionService live start", () => {
     expect(sidecar.commands).toEqual(["live_prepare"]);
   });
 
+  it("asks no more once the sidecar goes between two attempts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-live-prepare-gone-"));
+    const sidecar: FakeSidecar = fakeSidecar(async (command) => {
+      if (command !== "live_prepare") throw new Error(`Unexpected ${command}`);
+      return { type: "live_preparing" };
+    });
+    const service = new SessionService(sidecar.client, root);
+    await service.initialize();
+    vi.useFakeTimers();
+    let conversations = 0;
+
+    const started = service.start({
+      microphone: true,
+      live: { beforeRecord: async () => { conversations += 1; } },
+      display,
+      appVersion: "0.1.0",
+    });
+    const rejected = expect(started).rejects.toMatchObject({ code: "exited" });
+    // The first answer is in and the next ask is a second away when the capture
+    // process dies. Asking again would start a fresh one, whose clock begins
+    // again at zero.
+    await vi.advanceTimersByTimeAsync(100);
+    sidecar.emit("exit");
+    await vi.advanceTimersByTimeAsync(1_000);
+    await rejected;
+
+    expect(sidecar.commands).toEqual(["live_prepare"]);
+    expect(conversations).toBe(0);
+  });
+
   it("gives up on the speech model after ten minutes and records nothing", async () => {
     const root = await mkdtemp(join(tmpdir(), "replay-live-prepare-slow-"));
     const sidecar = fakeSidecar(async (command) => {

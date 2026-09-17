@@ -182,14 +182,15 @@ export class SessionService {
   async #prepareLiveAudio(sessionId: string, live: LiveStartOptions): Promise<void> {
     const deadline = Date.now() + LIVE_PREPARE_DEADLINE_MS;
     for (;;) {
+      // Asked before the request, because `SidecarClient.request` starts a
+      // capture process when none is running: a sidecar that exited during the
+      // wait between two asks would be replaced by a fresh one, whose capture
+      // clock begins again at zero.
+      this.#assertStillReserved(sessionId);
       const result = await this.sidecar.request("live_prepare");
-      // The reservation can be dropped while this waits, when the sidecar
-      // exits. Asking again would start a fresh capture process, whose clock
-      // begins at zero, so nothing more is prepared for a recording that has
-      // already gone.
-      if (this.#activeSessionId !== sessionId) {
-        throw new SidecarRequestError("exited", "The capture sidecar exited while starting the recording.");
-      }
+      // Asked again, because the recording can go while the answer is in
+      // flight, and nothing more is prepared for one that has.
+      this.#assertStillReserved(sessionId);
       if (result.type === "live_ready") return;
       if (result.type !== "live_preparing") {
         throw new SidecarRequestError("unexpected_response", "The capture sidecar did not confirm the speech model.");
@@ -197,6 +198,13 @@ export class SessionService {
       if (Date.now() >= deadline) throw new Error("Preparing the speech model took too long.");
       live.onPreparing?.(sessionId);
       await new Promise((resolve) => { setTimeout(resolve, LIVE_PREPARE_POLL_MS); });
+    }
+  }
+
+  /** Fails once the reservation this start made has been dropped, as a sidecar exit drops it. */
+  #assertStillReserved(sessionId: string): void {
+    if (this.#activeSessionId !== sessionId) {
+      throw new SidecarRequestError("exited", "The capture sidecar exited while starting the recording.");
     }
   }
 

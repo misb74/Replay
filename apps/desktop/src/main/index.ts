@@ -13,10 +13,11 @@ import {
   Tray,
 } from "electron";
 import { ModelAdapterError, type ModelAdapterErrorCode } from "@replay/pipeline";
-import type { CompileRequest, LiveAvailability, LiveUpdate, PermissionName, PermissionStatus, ProcessSessionIpcResult, RunMode, RunResponse, WorkflowView } from "../shared/contracts.js";
+import type { CompileRequest, LiveUpdate, PermissionName, ProcessSessionIpcResult, RunMode, RunResponse, WorkflowView } from "../shared/contracts.js";
 import { ipcChannels } from "../shared/contracts.js";
 import { CompilerService } from "./compiler-service.js";
 import { LiveAssistService, type LiveSidecar, type LiveSpeechSignal, type LiveStateSignal, type LiveTranscriptSignal } from "./live-assist-service.js";
+import { liveAvailability, withDeadline, withoutFailing } from "./live-availability.js";
 import { LiveEventsTail } from "./live-events-tail.js";
 import { createClaudeLiveTransport } from "./live-model.js";
 import { DesktopPipelineService } from "./pipeline-service.js";
@@ -33,8 +34,8 @@ let runner: RunnerService | undefined;
 /** The conversation running with the current recording, and the recording it belongs to. */
 let liveSession: { id: string; service: LiveAssistService } | undefined;
 
-/** How long a quit waits for the live conversation to finish its files. */
-const QUIT_LIVE_DEADLINE_MS = 5_000;
+/** How long anything ending a recording waits for the live conversation to finish its files. */
+const LIVE_END_DEADLINE_MS = 5_000;
 
 app.setName("Replay");
 protocol.registerSchemesAsPrivileged([{
@@ -85,30 +86,20 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", (event) => {
+  // Aborting the same runs twice is a no-op, so this is safe on both passes.
   runner?.stopAll();
   if (liveSession) {
-    // The conversation finishes its files and sweeps its screenshots before
-    // the app goes, so the quit waits for it — but never for long. Ending it
-    // clears `liveSession`, so the quit below takes the ordinary path.
+    // The conversation finishes its files before the app goes, so the quit
+    // waits for it — but never for long, and never fails. Ending it clears
+    // `liveSession`, so the quit below takes the ordinary path.
     event.preventDefault();
-    void withDeadline(endLiveSession(), QUIT_LIVE_DEADLINE_MS).then(() => app.quit());
+    void endLiveSession().then(() => app.quit());
     return;
   }
   sidecar?.close();
   globalShortcut.unregisterAll();
   tray?.destroy();
 });
-
-/** Waits for `work`, but never longer than `ms`, so a quit is never held up. */
-function withDeadline(work: Promise<void>, ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    void work.catch(() => undefined).finally(() => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
-}
 
 function sendToWindow(channel: string, value: unknown): void {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, value);
@@ -131,30 +122,25 @@ function sendToPanel(_channel: string, _value: unknown): void {}
  * recording comes through here. A `failure` is published after the service's
  * own `ended` update, so the panel says why the tutor stopped rather than
  * falling silent (spec §8).
+ *
+ * It never fails and never waits beyond `LIVE_END_DEADLINE_MS`, because the
+ * recording is never the casualty: Stop ends the tutor before it stops the
+ * recording, and a tutor that cannot end must not keep the recorder running.
+ * Every caller that must fail rethrows its own cause instead.
  */
 async function endLiveSession(failure?: string): Promise<void> {
   const session = liveSession;
   liveSession = undefined;
   if (!session) return;
-  try {
-    await session.service.end();
-  } finally {
-    if (failure !== undefined) {
-      publishLiveUpdate({ sessionId: session.id, state: "failed", sharing: false, error: failure });
-    }
-    closeLivePanel();
+  await withDeadline(session.service.end(), LIVE_END_DEADLINE_MS, () => {
+    // Carries no session content: the tutor's files, not what is in them.
+    console.warn("The live conversation did not finish within five seconds; some of its notes may be incomplete.");
+  });
+  if (failure !== undefined) {
+    withoutFailing(() => publishLiveUpdate({ sessionId: session.id, state: "failed", sharing: false, error: failure }));
   }
-}
-
-/** Spec §6.1: the first failing check is the reason the record card shows. */
-function liveAvailability(permissions: PermissionStatus[]): LiveAvailability {
-  const [major] = process.getSystemVersion().split(".");
-  if (Number(major) < 26) return { available: false, reason: "Needs macOS 26" };
-  if (!process.env.ANTHROPIC_API_KEY) return { available: false, reason: "Set ANTHROPIC_API_KEY in .env" };
-  if (permissions.find((permission) => permission.name === "microphone")?.state !== "granted") {
-    return { available: false, reason: "Grant Microphone in System Settings" };
-  }
-  return { available: true };
+  // Guarded on its own, so a panel that cannot be told still gets closed.
+  withoutFailing(closeLivePanel);
 }
 
 /**
@@ -197,6 +183,9 @@ function liveStartOptions(client: SidecarClient): LiveStartOptions {
   return {
     onPreparing: (sessionId) => publishLiveUpdate({ sessionId, state: "preparing_model", sharing: false }),
     beforeRecord: async ({ id, directory }) => {
+      // A conversation is never overwritten: an orphan would go on listening
+      // to the sidecar with nobody left to end it.
+      await endLiveSession();
       const service = new LiveAssistService({
         sessionId: id,
         sessionDirectory: directory,
@@ -313,7 +302,11 @@ function registerIpc(services: {
     await endLiveSession();
     return services.sessions.stop();
   });
-  ipcMain.handle(ipcChannels.liveAvailability, async () => liveAvailability(await services.permissions.get()));
+  ipcMain.handle(ipcChannels.liveAvailability, async () => liveAvailability(
+    process.getSystemVersion(),
+    process.env.ANTHROPIC_API_KEY,
+    await services.permissions.get(),
+  ));
   ipcMain.handle(ipcChannels.setLivePaused, async (_event, value: unknown) => {
     if (typeof value !== "boolean") throw new Error("Invalid pause value");
     await liveSession?.service.setPaused(value);
