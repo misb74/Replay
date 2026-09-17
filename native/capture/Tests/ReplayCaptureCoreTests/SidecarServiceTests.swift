@@ -791,6 +791,137 @@ import Testing
     #expect(lastLocale == "en-GB")
 }
 
+@Test func recordWithLiveRollsBackTheLiveSessionWhenInputMonitorFails() async throws {
+    let live = FakeLiveAudio()
+    let monitor = FakeInputMonitor(startError: .permissionDenied(.inputMonitoring))
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: monitor,
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let response = await service.handle(liveRecordCommand(directory: directory))
+
+    #expect(!response.ok)
+    #expect(response.error?.code == .permissionDenied)
+    #expect(await live.session.stopped)
+    let metadata = try JSONDecoder.replay.decode(
+        SessionMetadata.self,
+        from: Data(contentsOf: directory.appendingPathComponent("meta.json"))
+    )
+    #expect(metadata.status == .interrupted)
+
+    let speak = await service.handle(.init(
+        requestId: "request-speak-after-failure",
+        command: .liveSpeak(.init(utteranceId: "utterance-1", text: "Hello."))
+    ))
+    #expect(speak.error?.code == .invalidState)
+
+    // A second recording must be possible, so nothing stayed active. Heal
+    // the monitor first: it is the same fake the first attempt used, and
+    // `startError` would otherwise fail every future call too, which would
+    // test something else entirely (a permanently broken dependency, not
+    // whether `active` was reset).
+    monitor.setStartError(nil)
+    let second = await service.handle(.init(
+        requestId: "request-plain",
+        command: .record(.init(
+            sessionId: "session-plain",
+            sessionDirectory: directory.appendingPathComponent("second").path,
+            includeAudio: false,
+            display: .init(width: 100, height: 50, scale: 1)
+        ))
+    ))
+    #expect(second.ok)
+}
+
+@Test func recordWithLiveRollsBackTheLiveSessionWhenTheRecorderIsUnhealthy() async throws {
+    let live = FakeLiveAudio()
+    let recorder = FakeRecorder(healthy: false)
+    let service = SidecarService(
+        recorder: recorder,
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let response = await service.handle(liveRecordCommand(directory: directory))
+
+    #expect(!response.ok)
+    #expect(response.error?.code == .captureFailed)
+    #expect(await live.session.stopped)
+    let metadata = try JSONDecoder.replay.decode(
+        SessionMetadata.self,
+        from: Data(contentsOf: directory.appendingPathComponent("meta.json"))
+    )
+    #expect(metadata.status == .interrupted)
+
+    let speak = await service.handle(.init(
+        requestId: "request-speak-after-failure",
+        command: .liveSpeak(.init(utteranceId: "utterance-1", text: "Hello."))
+    ))
+    #expect(speak.error?.code == .invalidState)
+
+    // A second recording must be possible, so nothing stayed active. Heal
+    // the recorder first, the same way the existing
+    // heartbeatAndStopExposeARecorderThatFailedAfterStartup test does.
+    recorder.setHealthy(true)
+    let second = await service.handle(.init(
+        requestId: "request-plain",
+        command: .record(.init(
+            sessionId: "session-plain",
+            sessionDirectory: directory.appendingPathComponent("second").path,
+            includeAudio: false,
+            display: .init(width: 100, height: 50, scale: 1)
+        ))
+    ))
+    #expect(second.ok)
+}
+
+@Test func recordWithLivePropagatesAModelPreparationFailure() async throws {
+    let live = FakeLiveAudio(preparationError: SidecarOperationError.captureFailed)
+    let recorder = FakeRecorder()
+    let service = SidecarService(
+        recorder: recorder,
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let response = await service.handle(liveRecordCommand(directory: directory))
+
+    #expect(!response.ok)
+    #expect(response.error?.code == .captureFailed)
+    #expect(!FileManager.default.fileExists(atPath: directory.path))
+    #expect(recorder.startCallCount() == 0)
+    #expect(live.lastConfiguration == nil)
+
+    // A plain record command afterwards still succeeds.
+    let second = await service.handle(.init(
+        requestId: "request-plain",
+        command: .record(.init(
+            sessionId: "session-plain",
+            sessionDirectory: directory.appendingPathComponent("second").path,
+            includeAudio: false,
+            display: .init(width: 100, height: 50, scale: 1)
+        ))
+    ))
+    #expect(second.ok)
+}
+
 @Test func guardrailCannotBeLostWhileSubscriptionIsStarting() async {
     let safety = FakeSafetyMonitor(eventOnStart: .init(type: .killSwitch, timestampMs: 0))
     let received = SafetyEventCollector()
@@ -853,7 +984,7 @@ private final class FakeRecorder: RecordingControlling, @unchecked Sendable {
 
 private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
     private let lock = NSLock()
-    private let startError: SidecarOperationError?
+    private var startError: SidecarOperationError?
     private var handler: InputEventHandler?
     private var timeOrigin: UInt64?
     private var excludedProcessIds: [Int32] = []
@@ -868,8 +999,8 @@ private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
         excludeProcessIds: [Int32],
         handler: @escaping InputEventHandler
     ) async throws {
-        if let startError {
-            throw startError
+        if let currentError = lock.withLock({ startError }) {
+            throw currentError
         }
         lock.withLock {
             self.handler = handler
@@ -879,6 +1010,12 @@ private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
     }
 
     func stop() async {}
+
+    /// Lets a test that broke `start()` heal it before a later attempt,
+    /// mirroring `FakeRecorder.setHealthy`.
+    func setStartError(_ error: SidecarOperationError?) {
+        lock.withLock { startError = error }
+    }
 
     func emit(_ event: RawInputEvent, target: AccessibilityTarget?) async {
         let currentHandler = lock.withLock { handler }
