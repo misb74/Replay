@@ -185,9 +185,18 @@ function sendToPanel(channel: string, value: unknown): void {
  * path — Stop, a fresh recording, quitting — has nothing worth keeping on
  * screen, so it still closes the panel immediately, as before.
  *
- * `lastLiveUpdate` is scoped to the session it belongs to: cleared on every
- * path out of this function, so a panel opened for whatever recording comes
- * next never briefly replays a line that belonged to this one.
+ * `lastLiveUpdate` is scoped to the session it belongs to, but only on the
+ * paths that actually close the panel — the early return and the
+ * non-failure branch — which clear it so a panel opened for whatever
+ * recording comes next never briefly replays a line that belonged to this
+ * one. The failure branch leaves it exactly as `publishLiveUpdate` just set
+ * it: that update is the one reason the panel is still open, so it must
+ * still be there to replay if that panel's own renderer ever reloads while
+ * showing it — a crash recovery, dev tools, anything that fires
+ * `did-finish-load` again, which is why that handler is registered with
+ * `.on` rather than `.once`. Clearing it here would leave such a reload with
+ * nothing to say, even though the panel itself is still open specifically to
+ * say it.
  *
  * It never fails and never waits beyond `LIVE_END_DEADLINE_MS`, because the
  * recording is never the casualty: Stop ends the tutor before it stops the
@@ -209,12 +218,14 @@ async function endLiveSession(failure?: string): Promise<void> {
     console.warn("The live conversation did not finish within five seconds; some of its notes may be incomplete.");
   });
   if (failure !== undefined) {
+    // `lastLiveUpdate` is left as this failure on purpose: the panel stays
+    // open to show it, and must still have it to replay if it reloads.
     withoutFailing(() => publishLiveUpdate({ sessionId: session.id, state: "failed", sharing: false, error: failure }));
   } else {
     // Guarded on its own, so a panel that cannot be told still gets closed.
     withoutFailing(closeLivePanel);
+    lastLiveUpdate = undefined;
   }
-  lastLiveUpdate = undefined;
 }
 
 /**
