@@ -416,6 +416,9 @@ export class SessionService {
     this.#activePhase = "recording";
     if (result.sessionId === expectedSessionId) return "expected_active";
     this.#activeGeneration += 1;
+    // The recording the app was holding has been abandoned in favour of
+    // another, so it is over as far as anything that belonged to it goes.
+    this.#options.onRecordingEnded?.(expectedSessionId);
     return "other_active";
   }
 

@@ -187,11 +187,12 @@ export class SidecarClient {
       return;
     }
     if (value.event === "live_transcript" || value.event === "live_speech" || value.event === "live_state") {
-      if (!hasLiveTimes(value)) {
-        // The conversation tells the tutor's own voice from the user's by
-        // comparing these times, so a line without them would silently switch
-        // that judgement off and let the tutor answer itself. The live session
-        // fails visibly instead of running on half-safe.
+      if (!isUsableLiveEvent(value)) {
+        // A line this build cannot read would not fail loudly: it would be
+        // read as a missing time, an unstarted sentence, or a session that is
+        // fine — each of which quietly weakens the guard that keeps the tutor
+        // from answering itself. The live session fails visibly instead of
+        // running on half-safe.
         this.#events.emit("live_state", {
           protocolVersion: 1,
           event: "live_state",
@@ -326,14 +327,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Whether a live event carries the capture-relative times the conversation
- * needs: a transcript's `startMs` and `endMs`, and a speech phase's `atMs`. A
- * `live_state` event carries none and is always accepted.
+ * Whether a live event says something this build can act on: a transcript's
+ * capture-relative `startMs` and `endMs`, a speech report's `atMs` and one of
+ * the three phases, and one of the four states.
+ *
+ * The times are how the conversation tells the tutor's own voice from the
+ * user's. The phase is read the same way, and anything that is not `started`
+ * closes the stretch the tutor could be heard in and marks a sentence
+ * complete that no transcript segment was ever written for. A state this
+ * build does not know would be read as "not failed", leaving the panel saying
+ * the session is fine while it is not.
  */
-function hasLiveTimes(value: Record<string, unknown>): boolean {
+function isUsableLiveEvent(value: Record<string, unknown>): boolean {
   if (value.event === "live_transcript") return isFiniteNumber(value.startMs) && isFiniteNumber(value.endMs);
-  if (value.event === "live_speech") return isFiniteNumber(value.atMs);
-  return true;
+  if (value.event === "live_speech") {
+    return isFiniteNumber(value.atMs)
+      && (value.phase === "started" || value.phase === "finished" || value.phase === "cancelled");
+  }
+  return value.state === "preparing_model" || value.state === "listening" || value.state === "paused" || value.state === "failed";
 }
 
 function isFiniteNumber(value: unknown): boolean {

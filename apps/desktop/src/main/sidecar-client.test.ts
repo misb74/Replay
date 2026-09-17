@@ -19,15 +19,6 @@ class FakeTransport implements SidecarTransport {
   exit(code: number | null) { this.exitListeners.forEach((listener) => listener(code, null)); }
 }
 
-function createTestClient() {
-  const transport = new FakeTransport();
-  const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
-  const emitLine = (line: string) => {
-    transport.lineListeners.forEach((listener) => listener(line));
-  };
-  return { client, emitLine };
-}
-
 describe("SidecarClient", () => {
   afterEach(() => vi.useRealTimers());
 
@@ -214,6 +205,39 @@ describe("SidecarClient", () => {
     transport.respond({ protocolVersion: 1, event: "live_speech", sessionId: "session-1", utteranceId: "utterance-1", phase: "started", atMs: "soon" });
 
     expect(speeches).toEqual([]);
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_timing_invalid" })]);
+    client.close();
+  });
+
+  it("fails the live session instead of forwarding a speech event with a phase it cannot read", async () => {
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+    await client.start();
+    const speeches: unknown[] = [];
+    const states: unknown[] = [];
+    client.on("live_speech", (event) => speeches.push(event));
+    client.on("live_state", (event) => states.push(event));
+
+    // Anything that is not `started` closes the echo window and marks the
+    // sentence complete, so an unknown phase is as unsafe as a missing time.
+    transport.respond({ protocolVersion: 1, event: "live_speech", sessionId: "session-1", utteranceId: "utterance-1", phase: "interrupted", atMs: 10 });
+
+    expect(speeches).toEqual([]);
+    expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_timing_invalid" })]);
+    client.close();
+  });
+
+  it("fails the live session instead of forwarding a state it cannot read", async () => {
+    const transport = new FakeTransport();
+    const client = new SidecarClient({ binaryPath: "fake", transportFactory: () => transport, heartbeatIntervalMs: 0 });
+    await client.start();
+    const states: unknown[] = [];
+    client.on("live_state", (event) => states.push(event));
+
+    // A state this build does not know would be taken as "not failed" and
+    // leave the panel saying the session is fine.
+    transport.respond({ protocolVersion: 1, event: "live_state", sessionId: "session-1", state: "reconnecting" });
+
     expect(states).toEqual([expect.objectContaining({ state: "failed", reason: "live_timing_invalid" })]);
     client.close();
   });

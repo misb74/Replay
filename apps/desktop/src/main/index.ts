@@ -13,28 +13,35 @@ import {
   Tray,
 } from "electron";
 import { ModelAdapterError, type ModelAdapterErrorCode } from "@replay/pipeline";
-import type { CompileRequest, LiveUpdate, PermissionName, ProcessSessionIpcResult, RunMode, RunResponse, WorkflowView } from "../shared/contracts.js";
+import type { CompileRequest, PermissionName, ProcessSessionIpcResult, RunMode, RunResponse, WorkflowView } from "../shared/contracts.js";
 import { ipcChannels } from "../shared/contracts.js";
 import { CompilerService } from "./compiler-service.js";
-import { LiveAssistService, type LiveSidecar, type LiveSpeechSignal, type LiveStateSignal, type LiveTranscriptSignal } from "./live-assist-service.js";
-import { liveAvailability, withDeadline, withoutFailing } from "./live-lifecycle.js";
+import { LiveAssistService } from "./live-assist-service.js";
+import { createLiveSidecar, liveAvailability, LiveTutor, type LivePanelWindow } from "./live-lifecycle.js";
 import { LiveEventsTail } from "./live-events-tail.js";
 import { createClaudeLiveTransport } from "./live-model.js";
 import { DesktopPipelineService } from "./pipeline-service.js";
 import { RunnerService } from "./runner-service.js";
-import { PermissionService, SessionService, type LiveStartOptions } from "./session-service.js";
+import { PermissionService, SessionService } from "./session-service.js";
 import { createRecordingVideoHandler, recordingVideoPrivileges, recordingVideoScheme } from "./recording-video-protocol.js";
-import { SidecarClient, SidecarRequestError } from "./sidecar-client.js";
+import { SidecarClient } from "./sidecar-client.js";
 import { WorkflowRepository } from "./workflow-repository.js";
 
 let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let sidecar: SidecarClient | undefined;
 let runner: RunnerService | undefined;
-/** The conversation running with the current recording, and the recording it belongs to. */
-let liveSession: { id: string; service: LiveAssistService } | undefined;
+/** Owns the live conversation's lifetime; `before-quit` waits for it. */
+let tutor: LiveTutor | undefined;
+/** True once a quit is waiting for the conversation, so a second Cmd-Q keeps waiting rather than overtaking it. */
+let quitting = false;
 
-/** How long anything ending a recording waits for the live conversation to finish its files. */
+/**
+ * How long anything ending a recording waits for the live conversation to
+ * finish its files. Past it the remaining writes are let go: the transcript on
+ * disk is always a complete earlier one, and nothing in main keeps a log to
+ * report the loss to.
+ */
 const LIVE_END_DEADLINE_MS = 5_000;
 
 app.setName("Replay");
@@ -48,9 +55,11 @@ app.whenReady().then(async () => {
   const sidecarClient = new SidecarClient({ binaryPath: captureBinaryPath() });
   sidecar = sidecarClient;
   const workflows = new WorkflowRepository(dataDirectory);
+  const liveTutor = createLiveTutor(sidecarClient);
+  tutor = liveTutor;
   const sessions = new SessionService(sidecarClient, dataDirectory, {
     // However a recording ends, the tutor and its panel end with it.
-    onRecordingEnded: (sessionId) => { if (liveSession?.id === sessionId) void endLiveSession(); },
+    onRecordingEnded: (sessionId) => { void liveTutor.endSession(sessionId); },
   });
   const permissions = new PermissionService(sidecarClient);
   const compiler = new CompilerService(workflows, sessions, dataDirectory);
@@ -59,7 +68,7 @@ app.whenReady().then(async () => {
   sidecarClient.on("exit", () => {
     // The capture process is gone, and with it the recording, the microphone,
     // and the clock the conversation's times are on (spec §8).
-    void endLiveSession("capture stopped");
+    void liveTutor.end("capture stopped");
   });
 
   mainWindow = createWindow();
@@ -67,7 +76,7 @@ app.whenReady().then(async () => {
     model: process.env.REPLAY_CLAUDE_MODEL ?? "claude-sonnet-5",
     onUpdate: (update) => sendToWindow(ipcChannels.runUpdate, update),
   });
-  registerIpc({ dataDirectory, workflows, sessions, permissions, compiler, sidecar: sidecarClient, runner, send: sendToWindow });
+  registerIpc({ dataDirectory, workflows, sessions, permissions, compiler, sidecar: sidecarClient, runner, tutor: liveTutor, send: sendToWindow });
   installRunKillSwitch(runner);
   tray = createTray(runner);
   installContentPolicy();
@@ -86,21 +95,29 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", (event) => {
-  // Aborting the same runs twice is a no-op, so this is safe on both passes.
+  // Aborting the same runs twice is a no-op, so this is safe on every pass.
   runner?.stopAll();
-  if (liveSession) {
-    // The conversation finishes its files before the app goes, so the quit
-    // waits for it — but never for long, and never fails. Ending it clears
-    // `liveSession`, so the quit below takes the ordinary path.
+  if (quitting) {
+    // An earlier press is still finishing the conversation's files, and will
+    // quit for real when it is done. A second Cmd-Q must not overtake it and
+    // close the sidecar from under a flush.
     event.preventDefault();
-    void endLiveSession().then(() => app.quit());
+    return;
+  }
+  if (tutor?.isRunning) {
+    event.preventDefault();
+    quitting = true;
+    void tutor.end().then(() => {
+      quitting = false;
+      app.quit();
+    });
     return;
   }
   sidecar?.close();
   // Belt and braces: every path that opens the panel opens it with a live
   // session, and every path that ends one already closes the panel above —
   // but a quit is not the place to find out that invariant slipped.
-  closeLivePanel();
+  tutor?.closePanel();
   globalShortcut.unregisterAll();
   tray?.destroy();
 });
@@ -109,17 +126,34 @@ function sendToWindow(channel: string, value: unknown): void {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, value);
 }
 
-/** The conversation reaches both the main window's record card and the floating panel. */
-function publishLiveUpdate(update: LiveUpdate): void {
-  // Kept so a panel that opens (or reloads) after the update was sent still
-  // shows the current state rather than "Starting" until the next change.
-  lastLiveUpdate = update;
-  sendToWindow(ipcChannels.liveUpdate, update);
-  sendToPanel(ipcChannels.liveUpdate, update);
+/**
+ * Everything the live tutor needs that only Electron can give it: the panel's
+ * window, the two windows it speaks to, and the conversation itself. The
+ * lifetime those parts are driven through lives in `live-lifecycle.ts`, which
+ * imports no Electron and is tested without one.
+ */
+function createLiveTutor(client: SidecarClient): LiveTutor {
+  return new LiveTutor({
+    createPanelWindow: createLivePanelWindow,
+    publish: (update) => sendToWindow(ipcChannels.liveUpdate, update),
+    createConversation: ({ id, directory }, onUpdate) => new LiveAssistService({
+      sessionId: id,
+      sessionDirectory: directory,
+      sidecar: createLiveSidecar(client),
+      transport: createClaudeLiveTransport({
+        apiKey: process.env.ANTHROPIC_API_KEY ?? "",
+        model: process.env.REPLAY_LIVE_MODEL ?? "claude-opus-5",
+      }),
+      events: new LiveEventsTail(join(directory, "events.jsonl")),
+      onUpdate,
+      readImage: async (path) => nativeImage.createFromPath(path).toJPEG(85).toString("base64"),
+      // Half duplex until echo cancellation is verified: while the tutor
+      // speaks, the user interrupts with Pause rather than by talking over it.
+      fullDuplex: process.env.REPLAY_LIVE_FULL_DUPLEX === "1",
+    }),
+    endDeadlineMs: LIVE_END_DEADLINE_MS,
+  });
 }
-
-let panelWindow: BrowserWindow | undefined;
-let lastLiveUpdate: LiveUpdate | undefined;
 
 /**
  * The always-on-top HUD for the live conversation (spec §6.3). `type: "panel"`
@@ -129,10 +163,9 @@ let lastLiveUpdate: LiveUpdate | undefined;
  * other half of that (Electron 44 docs, `structures/base-window-options.md`
  * and `base-window.md`: "Shows the window but doesn't focus on it").
  */
-function openLivePanel(): void {
-  if (panelWindow && !panelWindow.isDestroyed()) return;
+function createLivePanelWindow(): LivePanelWindow {
   const display = screen.getPrimaryDisplay().workArea;
-  panelWindow = new BrowserWindow({
+  const window = new BrowserWindow({
     width: 340,
     height: 150,
     x: display.x + display.width - 360,
@@ -146,154 +179,20 @@ function openLivePanel(): void {
     backgroundColor: "#0b1220",
     webPreferences: secureWebPreferences(),
   });
-  panelWindow.setAlwaysOnTop(true, "floating");
-  panelWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-  panelWindow.once("ready-to-show", () => panelWindow?.showInactive());
-  denyWindowOpenAndNavigation(panelWindow);
-  // The panel's own subscription starts empty: without this, it would say
-  // "Starting" until the next change, however far into the conversation it
-  // opened (spec §8's states are meant to be read live, not guessed at).
-  panelWindow.webContents.on("did-finish-load", () => {
-    if (lastLiveUpdate) sendToPanel(ipcChannels.liveUpdate, lastLiveUpdate);
-  });
+  window.setAlwaysOnTop(true, "floating");
+  window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  window.once("ready-to-show", () => window.showInactive());
+  denyWindowOpenAndNavigation(window);
   const developmentUrl = process.env.REPLAY_DEV_SERVER_URL;
   void (developmentUrl
-    ? panelWindow.loadURL(`${developmentUrl}/panel.html`)
-    : panelWindow.loadFile(join(app.getAppPath(), "dist/renderer/panel.html")));
-}
-
-function closeLivePanel(): void {
-  if (panelWindow && !panelWindow.isDestroyed()) panelWindow.close();
-  panelWindow = undefined;
-}
-
-function sendToPanel(channel: string, value: unknown): void {
-  if (panelWindow && !panelWindow.isDestroyed()) panelWindow.webContents.send(channel, value);
-}
-
-/**
- * Ends the live conversation, if one is running. The conversation never
- * outlives its recording, so every path that ends a recording comes through
- * here. A `failure` is published after the service's own `ended` update, so
- * the panel says why the tutor stopped rather than falling silent (spec §8).
- *
- * A session ending *with* a reason leaves its panel open, showing that
- * reason, instead of closing it in the same breath — `Failed · capture
- * stopped` would otherwise be gone before anyone had read it. End Live is
- * what dismisses it: that calls this function again, finds nothing left
- * running, and closes the panel then, in the branch below. Every other end
- * path — Stop, a fresh recording, quitting — has nothing worth keeping on
- * screen, so it still closes the panel immediately, as before.
- *
- * `lastLiveUpdate` is scoped to the session it belongs to, but only on the
- * paths that actually close the panel — the early return and the
- * non-failure branch — which clear it so a panel opened for whatever
- * recording comes next never briefly replays a line that belonged to this
- * one. The failure branch leaves it exactly as `publishLiveUpdate` just set
- * it: that update is the one reason the panel is still open, so it must
- * still be there to replay if that panel's own renderer ever reloads while
- * showing it — a crash recovery, dev tools, anything that fires
- * `did-finish-load` again, which is why that handler is registered with
- * `.on` rather than `.once`. Clearing it here would leave such a reload with
- * nothing to say, even though the panel itself is still open specifically to
- * say it.
- *
- * It never fails and never waits beyond `LIVE_END_DEADLINE_MS`, because the
- * recording is never the casualty: Stop ends the tutor before it stops the
- * recording, and a tutor that cannot end must not keep the recorder running.
- * Every caller that must fail rethrows its own cause instead.
- */
-async function endLiveSession(failure?: string): Promise<void> {
-  const session = liveSession;
-  liveSession = undefined;
-  if (!session) {
-    // Either there was never a session, or a previous call already ended one
-    // and left its panel open with a reason — this is End Live dismissing it.
-    withoutFailing(closeLivePanel);
-    lastLiveUpdate = undefined;
-    return;
-  }
-  await withDeadline(session.service.end(), LIVE_END_DEADLINE_MS, () => {
-    // Carries no session content: the tutor's files, not what is in them.
-    console.warn("The live conversation did not finish within five seconds; some of its notes may be incomplete.");
-  });
-  if (failure !== undefined) {
-    // `lastLiveUpdate` is left as this failure on purpose: the panel stays
-    // open to show it, and must still have it to replay if it reloads.
-    withoutFailing(() => publishLiveUpdate({ sessionId: session.id, state: "failed", sharing: false, error: failure }));
-  } else {
-    // Guarded on its own, so a panel that cannot be told still gets closed.
-    withoutFailing(closeLivePanel);
-    lastLiveUpdate = undefined;
-  }
-}
-
-/**
- * The only capability the tutor has over the Mac: it can look at the screen,
- * speak, stop speaking, and be paused. There is deliberately no path here to
- * any `act_*` command other than the screenshot.
- */
-function createLiveSidecar(client: SidecarClient): LiveSidecar {
-  // A sidecar that has gone is never revived for the tutor. A fresh capture
-  // process would start its clock again at zero, and this conversation belongs
-  // to the recording that went with the old one.
-  const request = async (command: string, payload: Record<string, unknown> = {}) => {
-    if (!client.isRunning()) throw new SidecarRequestError("exited", "The capture sidecar is no longer running.");
-    return client.request(command, payload);
-  };
+    ? window.loadURL(`${developmentUrl}/panel.html`)
+    : window.loadFile(join(app.getAppPath(), "dist/renderer/panel.html")));
   return {
-    screenshot: async (outputPath) => {
-      // Replay's own windows are never in what the tutor sees, and
-      // `createDirectories: false` stops a late screenshot from recreating the
-      // private directory the conversation has already swept.
-      const result = await request("act_screenshot", { outputPath, excludeProcessIds: [process.pid], createDirectories: false });
-      return { path: result.screenshot?.path ?? outputPath };
-    },
-    speak: async (utteranceId, text) => { await request("live_speak", { utteranceId, text }); },
-    stopSpeaking: async () => { await request("live_stop_speaking"); },
-    setPaused: async (paused) => { await request("live_set_paused", { paused }); },
-    onTranscript: (listener) => client.on("live_transcript", (event) => listener(event as LiveTranscriptSignal)),
-    onSpeech: (listener) => client.on("live_speech", (event) => listener(event as LiveSpeechSignal)),
-    onState: (listener) => client.on("live_state", (event) => listener(event as LiveStateSignal)),
-  };
-}
-
-/**
- * What `SessionService.start` needs to bring the tutor up with a recording.
- * The conversation is made and started in the moment before `record` is sent,
- * so its clocks begin with the recording rather than minutes earlier while the
- * speech model was being prepared.
- */
-function liveStartOptions(client: SidecarClient): LiveStartOptions {
-  return {
-    onPreparing: (sessionId) => publishLiveUpdate({ sessionId, state: "preparing_model", sharing: false }),
-    beforeRecord: async ({ id, directory }) => {
-      // A conversation is never overwritten: an orphan would go on listening
-      // to the sidecar with nobody left to end it.
-      await endLiveSession();
-      const service = new LiveAssistService({
-        sessionId: id,
-        sessionDirectory: directory,
-        sidecar: createLiveSidecar(client),
-        transport: createClaudeLiveTransport({
-          apiKey: process.env.ANTHROPIC_API_KEY ?? "",
-          model: process.env.REPLAY_LIVE_MODEL ?? "claude-opus-5",
-        }),
-        events: new LiveEventsTail(join(directory, "events.jsonl")),
-        onUpdate: publishLiveUpdate,
-        readImage: async (path) => nativeImage.createFromPath(path).toJPEG(85).toString("base64"),
-        // Half duplex until echo cancellation is verified: while the tutor
-        // speaks, the user interrupts with Pause rather than by talking over it.
-        fullDuplex: process.env.REPLAY_LIVE_FULL_DUPLEX === "1",
-      });
-      liveSession = { id, service };
-      try {
-        await service.start();
-      } catch (cause) {
-        await endLiveSession();
-        throw cause;
-      }
-    },
+    isDestroyed: () => window.isDestroyed(),
+    close: () => window.close(),
+    send: (channel, value) => window.webContents.send(channel, value),
+    // `.on`, not `.once`: a reload of the panel's page needs telling again.
+    onLoad: (listener) => { window.webContents.on("did-finish-load", listener); },
   };
 }
 
@@ -361,6 +260,7 @@ function registerIpc(services: {
   compiler: CompilerService;
   sidecar: SidecarClient;
   runner: RunnerService;
+  tutor: LiveTutor;
   send: (channel: string, value: unknown) => void;
 }): void {
   ipcMain.handle(ipcChannels.getPermissions, () => services.permissions.get());
@@ -373,11 +273,20 @@ function registerIpc(services: {
   });
   ipcMain.handle(ipcChannels.startRecording, async (_event, value: unknown) => {
     const options = recordingOptions(value);
+    if (options.live) {
+      // Main is the authority over its own gate. The renderer's disabled
+      // checkbox is a courtesy, not a guarantee: a live start with no key
+      // would otherwise reach the tutor and auto-pause on its first request,
+      // instead of a record card that says what to do about it.
+      const availability = liveAvailability(process.getSystemVersion(), process.env.ANTHROPIC_API_KEY, await services.permissions.get());
+      if (!availability.available) throw new Error(availability.reason ?? "Live is unavailable on this Mac");
+    }
     const display = screen.getPrimaryDisplay();
+    const live = options.live ? services.tutor.startFor() : undefined;
     try {
       const summary = await services.sessions.start({
         microphone: options.microphone || options.live,
-        ...(options.live ? { live: liveStartOptions(services.sidecar) } : {}),
+        ...(live ? { live } : {}),
         display: {
           width: Math.round(display.size.width * display.scaleFactor),
           height: Math.round(display.size.height * display.scaleFactor),
@@ -388,18 +297,20 @@ function registerIpc(services: {
         // Replay's own windows are absent from every recording (spec §4.3).
         excludeProcessIds: [process.pid],
       });
-      if (options.live) openLivePanel();
+      if (live) services.tutor.openPanel();
       return summary;
     } catch (cause) {
-      // A start that failed leaves no recording for the tutor to belong to.
-      await endLiveSession();
+      // Only what this start brought up is ended. A second Record click,
+      // refused because a recording is already active, must leave the
+      // conversation the first click is still bringing up alone.
+      await live?.abandon();
       throw cause;
     }
   });
   ipcMain.handle(ipcChannels.stopRecording, async () => {
     // The tutor falls silent and finishes its files first: its speech commands
     // reach the sidecar only while the recording is still running.
-    await endLiveSession();
+    await services.tutor.end();
     return services.sessions.stop();
   });
   ipcMain.handle(ipcChannels.liveAvailability, async () => liveAvailability(
@@ -409,9 +320,9 @@ function registerIpc(services: {
   ));
   ipcMain.handle(ipcChannels.setLivePaused, async (_event, value: unknown) => {
     if (typeof value !== "boolean") throw new Error("Invalid pause value");
-    await liveSession?.service.setPaused(value);
+    await services.tutor.setPaused(value);
   });
-  ipcMain.handle(ipcChannels.endLive, async () => { await endLiveSession(); });
+  ipcMain.handle(ipcChannels.endLive, async () => { await services.tutor.end(); });
   ipcMain.handle(ipcChannels.processSession, async (_event, value: unknown) => {
     const sessionId = safeId(value, "session");
     try {

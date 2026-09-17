@@ -511,6 +511,27 @@ describe("SessionService recording lifetime", () => {
     expect(ended).toEqual([started.id]);
   });
 
+  it("reports that the recording ended when the sidecar has moved on to another one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-ended-other-"));
+    const sidecar = fakeSidecar(async (command, payload) => {
+      if (command === "record") {
+        await writeRecordingMetadata(payload);
+        return { type: "recording_started", sessionId: String(payload.sessionId), state: "recording" };
+      }
+      // The sidecar is recording something else entirely, so the recording the
+      // app was holding is over as far as the app is concerned.
+      if (command === "status") return { type: "status", state: "recording", sessionId: "session-elsewhere" };
+      throw new SidecarRequestError("timeout", "The capture sidecar did not answer stop in time.");
+    });
+    const ended: string[] = [];
+    const service = new SessionService(sidecar.client, root, { onRecordingEnded: (id) => ended.push(id) });
+
+    const started = await service.start({ microphone: false, display, appVersion: "0.1.0" });
+    await expect(service.stop()).rejects.toMatchObject({ code: "timeout" });
+
+    expect(ended).toEqual([started.id]);
+  });
+
   it("reports that the recording ended when the sidecar is found idle", async () => {
     const root = await mkdtemp(join(tmpdir(), "replay-ended-idle-"));
     const sidecar = fakeSidecar(async (command, payload) => {
