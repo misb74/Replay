@@ -1026,6 +1026,60 @@ describe("not hearing itself", () => {
     expect(model.requests.map((request) => request.userText)).toEqual(["Which total should I use?", "And the date?"]);
   });
 
+  it("measures how long the echo takes to die away on its own clock", async () => {
+    let clock = 0;
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport, now: () => clock });
+
+    harness.emitTranscript("Which total should I use?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    model.release({ kind: "text", text: "Use the invoice total." });
+    model.finish();
+    await harness.settle();
+    harness.finishUtterances();
+
+    // The timers run on, but by the service's clock the echo is half a second old.
+    clock = 500;
+    await vi.advanceTimersByTimeAsync(2_000);
+    harness.emitTranscript("invoice total", true);
+    clock = 900;
+    harness.emitTranscript("And the date?", true);
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(model.requests.map((request) => request.userText)).toEqual(["Which total should I use?", "And the date?"]);
+  });
+
+  it("keeps ignoring it until the last of its sentences has ended, finished or cut short, and while that one's echo dies away", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport });
+
+    harness.emitTranscript("Which total should I use?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    model.release({ kind: "text", text: "Use the invoice total. It includes tax." });
+    model.finish();
+    await harness.settle();
+    const [first, second] = harness.sidecar.spoken;
+    harness.emitSpeech(first!.utteranceId, "finished");
+
+    // A second after the first sentence finished, the microphone picks up the
+    // second, which is still playing.
+    await vi.advanceTimersByTimeAsync(1_000);
+    harness.emitTranscript("It includes tax.", true);
+    // The sidecar cuts the second sentence short a second later. Half a second
+    // after that the microphone picks up the room's echo of it, and nine
+    // tenths of a second after, the user speaks.
+    await vi.advanceTimersByTimeAsync(1_000);
+    harness.emitSpeech(second!.utteranceId, "cancelled");
+    await vi.advanceTimersByTimeAsync(500);
+    harness.emitTranscript("includes", true);
+    await vi.advanceTimersByTimeAsync(400);
+    harness.emitTranscript("And the date?", true);
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(harness.sidecar.stopSpeakingCount).toBe(0);
+    expect(model.requests.map((request) => request.userText)).toEqual(["Which total should I use?", "And the date?"]);
+  });
+
   it("still lets the user cut a reply short between its sentences, once the echo has died away", async () => {
     const model = heldTransport();
     const harness = await makeHarness({ transport: model.transport });
