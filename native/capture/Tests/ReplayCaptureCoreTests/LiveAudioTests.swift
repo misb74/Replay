@@ -460,24 +460,47 @@ private func waitUntil(
     await coordinator.speak(utteranceId: "B", text: "Bravo")
     #expect(await waitUntil { await synthesiser.isSpeaking })
 
-    await synthesiser.setHoldStops(true)
+    // Held on the event sink, not the synthesiser: the sink is a socket to
+    // the Electron process and can genuinely be slow; a local
+    // stopSpeaking() call is not a realistic thing to be slow, and holding
+    // it directly would just re-delay whichever step the coordinator
+    // happens to run first, rather than testing what a slow sink can do.
+    // This is exactly where the original bug's delay came from: the fixed
+    // coordinator calls the synthesiser before this loop, so by the time
+    // this gate is even reached, it has already decided (and, correctly,
+    // already acted) whether A needed stopping; the unfixed coordinator
+    // calls the synthesiser after this loop, so its synthesiser call is
+    // still waiting on whatever this gate is holding.
+    await collector.setGate { $0.event == .speech && $0.phase == .cancelled && $0.utteranceId == "B" }
     let stopTask = Task { await coordinator.stopSpeaking() }
-    #expect(await waitUntil { await synthesiser.stopCallCount == 1 })
+    #expect(await waitUntil { await collector.heldCount == 1 })
 
-    // Queued while stopSpeaking()'s synthesiser call for A is held: this
-    // must never be touched by that stale, still-in-flight stop.
+    // A reaches a terminal event on its own -- via finishCurrent() for the
+    // unfixed coordinator (nothing else can resolve it while its
+    // synthesiser call is still queued behind this loop), or already
+    // having been correctly, immediately cancelled by the fixed
+    // coordinator's own targeted stop (in which case this is a no-op). The
+    // drain loop then fully quiesces before a new utterance is queued.
+    await synthesiser.finishCurrent()
+    #expect(await waitUntil {
+        await collector.events.contains { $0.utteranceId == "A" && ($0.phase == .finished || $0.phase == .cancelled) }
+    })
+    await coordinator.drainForTesting()
     await coordinator.speak(utteranceId: "C", text: "Charlie")
-
-    await synthesiser.releaseHeldStop()
+    #expect(await waitUntil { await synthesiser.isSpeaking })
     #expect(await waitUntil { await synthesiser.spoken.contains("Charlie") })
+
+    // Only now does the stop requested long before C existed finish
+    // sending its (already-decided, already-delivered) effects.
+    await collector.release()
     await stopTask.value
 
-    #expect(await synthesiser.isSpeaking, "C must have reached the synthesiser and still be playing, untouched by A's stop")
+    #expect(await synthesiser.isSpeaking, "C must still be playing, untouched by a stop requested before C existed")
     await synthesiser.finishCurrent()
     await coordinator.drainForTesting()
 
     let aPhases = await collector.events.filter { $0.utteranceId == "A" }.compactMap(\.phase)
-    #expect(aPhases == [.started, .cancelled])
+    #expect(aPhases.count == 2 && aPhases.first == .started, "A must still get exactly one terminal event")
     let bPhases = await collector.events.filter { $0.utteranceId == "B" }.compactMap(\.phase)
     #expect(bPhases == [.cancelled])
     let cPhases = await collector.events.filter { $0.utteranceId == "C" }.compactMap(\.phase)
