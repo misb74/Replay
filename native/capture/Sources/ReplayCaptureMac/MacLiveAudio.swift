@@ -395,7 +395,7 @@ final class SpeechPlayback: @unchecked Sendable {
         // Discards anything a previous utterance left inside the converter
         // — including, deliberately, the tail of one the user barged in
         // on, which must not prefix this reply.
-        converter?.beginUtterance()
+        converter?.beginUtterance(utteranceId)
         playerQueue.async { [self] in
             // Re-checked here rather than only at the call site: the engine
             // can stop itself in between, and `play()` on a stopped engine
@@ -501,7 +501,7 @@ final class SpeechPlayback: @unchecked Sendable {
         // Only the reference is taken under the lock; the conversion itself
         // happens outside it, and the converter guards its own state.
         guard let converter = currentConverter(for: utteranceId),
-              let rendered = converter.convert(pcm) else { return }
+              let rendered = converter.convert(pcm, for: utteranceId) else { return }
         let handoff = BufferHandoff(rendered)
         playerQueue.async { [self] in
             guard let ready = handoff.take() else { return }
@@ -515,7 +515,7 @@ final class SpeechPlayback: @unchecked Sendable {
     /// settle. Both steps go through `playerQueue` in that order, because
     /// an utterance that settled first would refuse its own tail.
     private func finishSynthesis(for utteranceId: String) {
-        let tail = currentConverter(for: utteranceId)?.finishUtterance()
+        let tail = currentConverter(for: utteranceId)?.finishUtterance(utteranceId)
         let handoff = tail.map(BufferHandoff.init)
         playerQueue.async { [self] in
             if let ready = handoff?.take() {
@@ -743,6 +743,13 @@ final class MicrophoneTap: @unchecked Sendable {
         // but it is the session's last audio, and the converter will not
         // give it up on its own.
         let tail = flushAudioConverter(analyzerConverter, to: analyzerFormat)
+        // Reset for the same reason the synthesiser's converter is: it has
+        // just been told its stream ended, and `removeTap` does not promise
+        // that no callback is still in flight. Nothing that arrives now is
+        // used — the continuation below is nil from here on — but leaving a
+        // converter in an end-of-stream state for a late caller to find is
+        // not a distinction worth relying on.
+        analyzerConverter.reset()
         let continuation = analyzerInput
         analyzerInput = nil
         lock.unlock()
@@ -755,13 +762,22 @@ final class MicrophoneTap: @unchecked Sendable {
     /// Synchronous, so everything already queued is written before the file
     /// is released — which is what writes its trailer and closes it.
     func closeNarration() {
-        let tail = lock.replayWithLock { flushAudioConverter(fileConverter, to: fileFormat) }
-        if let tail {
+        lock.lock()
+        // Flushed and queued in the same locked stretch the tap converts
+        // and queues in, so this last fragment cannot overtake a real
+        // buffer that was converted just before it and land out of order
+        // at the end of `audio.m4a`.
+        if let tail = flushAudioConverter(fileConverter, to: fileFormat) {
             let handoff = BufferHandoff(tail)
             narrationQueue.async { [self] in
                 if let ready = handoff.take() { write(ready) }
             }
         }
+        // Reset for the same reason as the analyser's converter above.
+        fileConverter.reset()
+        lock.unlock()
+        // Outside the lock: nothing on this queue takes it, but waiting on
+        // a queue while holding a lock is not a habit worth forming.
         narrationQueue.sync { [self] in file = nil }
     }
 
@@ -788,11 +804,18 @@ final class MicrophoneTap: @unchecked Sendable {
     }
 
     private func writeNarration(_ buffer: AVAudioPCMBuffer) {
-        // Under the lock because teardown flushes this same converter, and
-        // `removeTap` does not promise that no callback is still in flight.
-        // An `AVAudioConverter` is not a node and calls nothing back into
-        // this object, so there is no ordering hazard in holding it here.
-        switch lock.replayWithLock({ convertAudioBuffer(buffer, using: fileConverter, to: fileFormat) }) {
+        // Converted *and* queued under the lock, because teardown flushes
+        // this same converter and `removeTap` does not promise that no
+        // callback is still in flight. Holding it across the conversion is
+        // not the hazard the player node's calls were — an
+        // `AVAudioConverter` calls nothing back into this object — and
+        // holding it across the hand-off as well is what makes the order
+        // buffers reach the file the order they were converted in.
+        // `async` only enqueues, and no block on that queue takes this
+        // lock.
+        lock.lock()
+        defer { lock.unlock() }
+        switch convertAudioBuffer(buffer, using: fileConverter, to: fileFormat) {
         case let .success(converted):
             guard converted.frameLength > 0 else { return }
             let handoff = BufferHandoff(converted)
@@ -806,7 +829,12 @@ final class MicrophoneTap: @unchecked Sendable {
     }
 
     private func feedAnalyzer(_ buffer: AVAudioPCMBuffer) {
-        // Under the lock, for the same reason as `writeNarration`.
+        // Under the lock, for the same reason as `writeNarration` — but
+        // only the conversion, not the hand-off below. This path needs no
+        // ordering guarantee of its own: `finishAnalyzerInput` clears the
+        // continuation in the same locked stretch as its flush, so a buffer
+        // converted before that flush and yielded after it finds nothing to
+        // yield to and is dropped, rather than arriving out of order.
         switch lock.replayWithLock({ convertAudioBuffer(buffer, using: analyzerConverter, to: analyzerFormat) }) {
         case let .success(converted):
             guard converted.frameLength > 0 else { return }
@@ -1017,6 +1045,14 @@ final class UtteranceAudioConverter: @unchecked Sendable {
     private let lock = NSLock()
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
+    /// The utterance this converter currently belongs to. Checked in the
+    /// same locked stretch as the conversion itself, because the caller
+    /// cannot do it for us: it decides which utterance is live under its
+    /// own lock, and a straggler from the previous one can arrive between
+    /// that decision and this call — by which time the converter may
+    /// already have been reset for the next utterance, and the straggler's
+    /// residue would become that utterance's opening frames.
+    private var current: String?
 
     init(renderFormat: AVAudioFormat) {
         self.renderFormat = renderFormat
@@ -1026,14 +1062,18 @@ final class UtteranceAudioConverter: @unchecked Sendable {
     /// left behind is discarded rather than carried into it — including,
     /// deliberately, the tail of an utterance the user barged in on, which
     /// was stopped precisely so that it would not be heard.
-    func beginUtterance() {
-        lock.replayWithLock { converter?.reset() }
+    func beginUtterance(_ utteranceId: String) {
+        lock.replayWithLock {
+            current = utteranceId
+            converter?.reset()
+        }
     }
 
     /// Converts one of the synthesiser's buffers into what the mixer wants.
-    func convert(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    func convert(_ source: AVAudioPCMBuffer, for utteranceId: String) -> AVAudioPCMBuffer? {
         lock.lock()
         defer { lock.unlock() }
+        guard current == utteranceId else { return nil }
         if converter == nil || sourceFormat != source.format {
             let built = AVAudioConverter(from: source.format, to: renderFormat)
             // As on both tap converters: no priming, so nothing is shifted
@@ -1052,9 +1092,13 @@ final class UtteranceAudioConverter: @unchecked Sendable {
     /// utterance's own last fragment, which would otherwise be dropped.
     /// The converter is reset afterwards, because it has now been told its
     /// stream ended and a new one may not follow on from that.
-    func finishUtterance() -> AVAudioPCMBuffer? {
+    func finishUtterance(_ utteranceId: String) -> AVAudioPCMBuffer? {
         lock.replayWithLock {
-            guard let converter else { return nil }
+            // The same staleness check, and for a sharper reason: a
+            // terminal callback from an utterance that is no longer being
+            // spoken must not flush and reset a converter that now belongs
+            // to the next one.
+            guard current == utteranceId, let converter else { return nil }
             defer { converter.reset() }
             return flushAudioConverter(converter, to: renderFormat)
         }

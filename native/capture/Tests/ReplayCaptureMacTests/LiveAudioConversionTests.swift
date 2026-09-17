@@ -200,12 +200,12 @@ private func audibleLeadingFrames(of buffer: AVAudioPCMBuffer) -> Int {
     let loud = try #require(makeTone(source, frames: utteranceBufferFrames, amplitude: 1))
     let silent = try #require(makeTone(source, frames: utteranceBufferFrames, amplitude: 0))
 
-    converter.beginUtterance()
+    converter.beginUtterance("A")
     var spoken = 0
     for _ in 0..<buffersPerUtterance {
-        spoken += Int(converter.convert(loud)?.frameLength ?? 0)
+        spoken += Int(converter.convert(loud, for: "A")?.frameLength ?? 0)
     }
-    spoken += Int(converter.finishUtterance()?.frameLength ?? 0)
+    spoken += Int(converter.finishUtterance("A")?.frameLength ?? 0)
 
     let ideal = Int((Double(utteranceBufferFrames) * Double(buffersPerUtterance)
         * target.sampleRate / source.sampleRate).rounded())
@@ -217,8 +217,8 @@ private func audibleLeadingFrames(of buffer: AVAudioPCMBuffer) -> Int {
 
     // The next utterance is silent, so anything audible in it can only have
     // come from the one before.
-    converter.beginUtterance()
-    let next = try #require(converter.convert(silent))
+    converter.beginUtterance("B")
+    let next = try #require(converter.convert(silent, for: "B"))
     #expect(
         audibleLeadingFrames(of: next) == 0,
         "the next utterance began with \(audibleLeadingFrames(of: next)) frames of the previous one's audio"
@@ -236,17 +236,50 @@ private func audibleLeadingFrames(of buffer: AVAudioPCMBuffer) -> Int {
     let loud = try #require(makeTone(source, frames: utteranceBufferFrames, amplitude: 1))
     let silent = try #require(makeTone(source, frames: utteranceBufferFrames, amplitude: 0))
 
-    converter.beginUtterance()
+    converter.beginUtterance("A")
     for _ in 0..<buffersPerUtterance {
-        _ = converter.convert(loud)
+        _ = converter.convert(loud, for: "A")
     }
     // No `finishUtterance()`: the user spoke over it.
 
-    converter.beginUtterance()
-    let reply = try #require(converter.convert(silent))
+    converter.beginUtterance("B")
+    let reply = try #require(converter.convert(silent, for: "B"))
 
     #expect(
         audibleLeadingFrames(of: reply) == 0,
         "the reply began with \(audibleLeadingFrames(of: reply)) frames of the utterance that was stopped"
+    )
+}
+
+/// A buffer of the previous utterance that was already approved when the
+/// next one registered. `SpeechPlayback` checks the utterance under its own
+/// lock and then converts under the converter's, so a straggler can arrive
+/// between the two, after the converter has just been reset for the reply —
+/// where its residue would be the reply's opening frames. The converter has
+/// to be able to refuse it on its own.
+@Test func aBufferFromAnEarlierUtteranceCannotConvertIntoTheNextOne() throws {
+    let source = try #require(synthesisFormat)
+    let target = try #require(mixerFormat)
+    let converter = UtteranceAudioConverter(renderFormat: target)
+    let loud = try #require(makeTone(source, frames: utteranceBufferFrames, amplitude: 1))
+    let silent = try #require(makeTone(source, frames: utteranceBufferFrames, amplitude: 0))
+
+    converter.beginUtterance("A")
+    for _ in 0..<buffersPerUtterance {
+        _ = converter.convert(loud, for: "A")
+    }
+
+    // The reply registers, and the converter is reset for it.
+    converter.beginUtterance("B")
+    // Only now does A's straggler arrive.
+    #expect(
+        converter.convert(loud, for: "A") == nil,
+        "a buffer named for an utterance that is no longer being spoken must not reach the converter"
+    )
+
+    let reply = try #require(converter.convert(silent, for: "B"))
+    #expect(
+        audibleLeadingFrames(of: reply) == 0,
+        "the reply began with \(audibleLeadingFrames(of: reply)) frames left by the straggler"
     )
 }
