@@ -378,6 +378,18 @@ public struct LiveConfiguration: Codable, Equatable, Sendable {
     }
 }
 
+/// Asks the sidecar to make sure the on-device speech model for `locale` is
+/// installed, without waiting for a first-run download. Valid with or
+/// without a recording active.
+public struct LivePrepareCommand: Codable, Equatable, Sendable {
+    /// BCP 47 locale for speech recognition. The system locale when absent.
+    public var locale: String?
+
+    public init(locale: String? = nil) {
+        self.locale = locale
+    }
+}
+
 public struct LiveSpeakCommand: Codable, Equatable, Sendable {
     public var utteranceId: String
     public var text: String
@@ -415,6 +427,7 @@ public enum SidecarCommand: Equatable, Sendable {
     case heartbeat(HeartbeatCommand)
     case guardrailsSubscribe(GuardrailsSubscribeCommand)
     case guardrailsUnsubscribe(GuardrailsUnsubscribeCommand)
+    case livePrepare(LivePrepareCommand)
     case liveSpeak(LiveSpeakCommand)
     case liveStopSpeaking(LiveStopSpeakingCommand)
     case liveSetPaused(LiveSetPausedCommand)
@@ -435,6 +448,7 @@ public enum SidecarCommand: Equatable, Sendable {
         case .heartbeat: return "heartbeat"
         case .guardrailsSubscribe: return "guardrails_subscribe"
         case .guardrailsUnsubscribe: return "guardrails_unsubscribe"
+        case .livePrepare: return "live_prepare"
         case .liveSpeak: return "live_speak"
         case .liveStopSpeaking: return "live_stop_speaking"
         case .liveSetPaused: return "live_set_paused"
@@ -491,6 +505,7 @@ public struct SidecarCommandEnvelope: Codable, Equatable, Sendable {
             command = .guardrailsSubscribe(try GuardrailsSubscribeCommand(from: payloadDecoder))
         case "guardrails_unsubscribe":
             command = .guardrailsUnsubscribe(try GuardrailsUnsubscribeCommand(from: payloadDecoder))
+        case "live_prepare": command = .livePrepare(try LivePrepareCommand(from: payloadDecoder))
         case "live_speak": command = .liveSpeak(try LiveSpeakCommand(from: payloadDecoder))
         case "live_stop_speaking":
             command = .liveStopSpeaking(try LiveStopSpeakingCommand(from: payloadDecoder))
@@ -521,6 +536,7 @@ public struct SidecarCommandEnvelope: Codable, Equatable, Sendable {
         case let .heartbeat(value): try value.encode(to: payloadEncoder)
         case let .guardrailsSubscribe(value): try value.encode(to: payloadEncoder)
         case let .guardrailsUnsubscribe(value): try value.encode(to: payloadEncoder)
+        case let .livePrepare(value): try value.encode(to: payloadEncoder)
         case let .liveSpeak(value): try value.encode(to: payloadEncoder)
         case let .liveStopSpeaking(value): try value.encode(to: payloadEncoder)
         case let .liveSetPaused(value): try value.encode(to: payloadEncoder)
@@ -542,6 +558,8 @@ public enum SidecarResultType: String, Codable, Equatable, Sendable {
     case speechStopped = "speech_stopped"
     case livePaused = "live_paused"
     case liveResumed = "live_resumed"
+    case livePreparing = "live_preparing"
+    case liveReady = "live_ready"
 }
 
 public enum SidecarRuntimeState: String, Codable, Equatable, Sendable {

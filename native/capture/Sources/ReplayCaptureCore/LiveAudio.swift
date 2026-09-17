@@ -95,9 +95,30 @@ public protocol LiveAudioControlling: AnyObject, Sendable {
     func stop() async
 }
 
+/// Outcome of asking a `LiveAudioProviding` to prepare its on-device speech
+/// model. See `LiveAudioProviding.prepare(locale:)`.
+public enum LivePreparation: Equatable, Sendable {
+    case ready
+    case preparing
+}
+
 /// Creates a live audio session. The sidecar holds one of these only on a
 /// system new enough to run on-device streaming speech.
 public protocol LiveAudioProviding: AnyObject, Sendable {
+    /// Prepares the on-device speech model for `locale` without blocking on
+    /// a first-run download.
+    ///
+    /// - Returns `.ready` when the on-device speech model for `locale` is
+    ///   installed. A nil `locale` means the system locale.
+    /// - Otherwise it starts installing the model in the background and
+    ///   returns `.preparing` without waiting. There is at most one
+    ///   installation per locale at a time, however often `prepare` is
+    ///   called; a later call joins the running one.
+    /// - It throws when the locale is unsupported, or when the most recent
+    ///   installation failed. A failure is reported once; the call after
+    ///   that starts a fresh installation.
+    func prepare(locale: String?) async throws -> LivePreparation
+
     func makeSession(
         configuration: LiveAudioStartConfiguration,
         eventSink: @escaping @Sendable (SidecarLiveEventEnvelope) async -> Void

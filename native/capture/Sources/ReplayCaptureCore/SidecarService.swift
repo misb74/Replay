@@ -165,7 +165,10 @@ public actor SidecarService {
     private let safetyEventSink: @Sendable (SidecarEventEnvelope) async -> Void
     private let monotonicNow: @Sendable () -> UInt64
     private let launchedAtNanoseconds: UInt64
+    private let liveAudio: LiveAudioProviding?
+    private let liveEventSink: @Sendable (SidecarLiveEventEnvelope) async -> Void
     private var active: ActiveRecordingSession?
+    private var activeLiveSession: LiveAudioControlling?
     private var guardrailsActive = false
     private var guardrailsTripped = false
 
@@ -177,7 +180,9 @@ public actor SidecarService {
         safetyMonitor: SafetyMonitoring? = nil,
         safetyInterlock: SafetyInterlock = SafetyInterlock(),
         safetyEventSink: @escaping @Sendable (SidecarEventEnvelope) async -> Void = { _ in },
-        monotonicNow: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+        monotonicNow: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+        liveAudio: LiveAudioProviding? = nil,
+        liveEventSink: @escaping @Sendable (SidecarLiveEventEnvelope) async -> Void = { _ in }
     ) {
         self.recorder = recorder
         self.inputMonitor = inputMonitor
@@ -188,6 +193,8 @@ public actor SidecarService {
         self.safetyEventSink = safetyEventSink
         self.monotonicNow = monotonicNow
         self.launchedAtNanoseconds = monotonicNow()
+        self.liveAudio = liveAudio
+        self.liveEventSink = liveEventSink
     }
 
     public func handle(_ envelope: SidecarCommandEnvelope) async -> SidecarResponse {
@@ -304,8 +311,20 @@ public actor SidecarService {
                     guardrailsActive: false,
                     guardrailsTripped: false
                 )
-            case .liveSpeak, .liveStopSpeaking, .liveSetPaused:
-                throw SidecarOperationError.unsupported("Live audio is not available.")
+            case let .livePrepare(command):
+                result = try await prepareLiveAudio(command)
+            case let .liveSpeak(command):
+                let session = try requireLiveSession()
+                await session.speak(utteranceId: command.utteranceId, text: command.text)
+                result = SidecarResponseResult(type: .speechQueued)
+            case .liveStopSpeaking:
+                let session = try requireLiveSession()
+                await session.stopSpeaking()
+                result = SidecarResponseResult(type: .speechStopped)
+            case let .liveSetPaused(command):
+                let session = try requireLiveSession()
+                await session.setPaused(command.paused)
+                result = SidecarResponseResult(type: command.paused ? .livePaused : .liveResumed)
             }
             return .success(requestId: envelope.requestId, result: result)
         } catch let error as SidecarOperationError {
@@ -331,6 +350,8 @@ public actor SidecarService {
         guardrailsTripped = false
         safetyInterlock.reset()
         if let active {
+            await activeLiveSession?.stop()
+            activeLiveSession = nil
             await inputMonitor.stop()
             try? await recorder.stop()
             try? await active.writer.markInterrupted(reason: "sidecar_shutdown")
@@ -348,13 +369,24 @@ public actor SidecarService {
             throw SidecarOperationError.invalidState("A recording is already active.")
         }
         if command.live != nil {
-            throw SidecarOperationError.unsupported("Live audio is not available.")
+            guard command.includeAudio else {
+                throw SidecarOperationError.invalidState("Live audio requires narration.")
+            }
+            guard liveAudio != nil else {
+                throw SidecarOperationError.unsupported("Live audio requires macOS 26 or newer.")
+            }
         }
         try await requirePermission(.screenRecording)
         try await requirePermission(.accessibility)
         try await requirePermission(.inputMonitoring)
         if command.includeAudio {
             try await requirePermission(.microphone)
+        }
+        if let live = command.live, let liveAudio {
+            let preparation = try await liveAudio.prepare(locale: live.locale)
+            guard preparation == .ready else {
+                throw SidecarOperationError.invalidState("The speech model is not ready yet.")
+            }
         }
 
         let directory = URL(fileURLWithPath: command.sessionDirectory, isDirectory: true)
@@ -375,14 +407,27 @@ public actor SidecarService {
         }
         let runtime = ActiveRecordingSession(sessionId: command.sessionId, writer: writer)
         do {
+            let audioURL = command.includeAudio
+                ? directory.appendingPathComponent(SessionWriter.audioFileName)
+                : nil
             let timing = try await recorder.start(configuration: RecordingStartConfiguration(
                 videoURL: directory.appendingPathComponent(SessionWriter.videoFileName),
-                audioURL: command.includeAudio
-                    ? directory.appendingPathComponent(SessionWriter.audioFileName)
-                    : nil,
+                audioURL: command.live == nil ? audioURL : nil,
                 displayId: command.display.displayId,
                 excludeProcessIds: command.excludeProcessIds
             ))
+            if let live = command.live, let liveAudio, let audioURL {
+                let sink = liveEventSink
+                activeLiveSession = try await liveAudio.makeSession(
+                    configuration: LiveAudioStartConfiguration(
+                        sessionId: command.sessionId,
+                        audioURL: audioURL,
+                        locale: live.locale,
+                        captureOriginUptimeNanoseconds: timing.captureOriginUptimeNanoseconds
+                    ),
+                    eventSink: sink
+                )
+            }
             try await inputMonitor.start(
                 sessionId: command.sessionId,
                 startedAtUptimeNanoseconds: timing.captureOriginUptimeNanoseconds,
@@ -395,6 +440,8 @@ public actor SidecarService {
             }
             active = runtime
         } catch {
+            await activeLiveSession?.stop()
+            activeLiveSession = nil
             await inputMonitor.stop()
             try? await recorder.stop()
             let interruptionReason = error as? SidecarOperationError == .noVideoFrames
@@ -425,6 +472,8 @@ public actor SidecarService {
             throw SidecarOperationError.invalidState("The requested session is not active.")
         }
 
+        await activeLiveSession?.stop()
+        activeLiveSession = nil
         await inputMonitor.stop()
         let eventStorageHealthy = await active.isHealthy()
         let recorderHealthy = await recorder.isHealthy()
@@ -564,6 +613,25 @@ public actor SidecarService {
     private func requirePermission(_ permission: PermissionKind) async throws {
         guard await permissions.snapshot()[permission] == .granted else {
             throw SidecarOperationError.permissionDenied(permission)
+        }
+    }
+
+    private func requireLiveSession() throws -> LiveAudioControlling {
+        guard let activeLiveSession else {
+            throw SidecarOperationError.invalidState("No live session is active.")
+        }
+        return activeLiveSession
+    }
+
+    private func prepareLiveAudio(_ command: LivePrepareCommand) async throws -> SidecarResponseResult {
+        guard let liveAudio else {
+            throw SidecarOperationError.unsupported("Live audio requires macOS 26 or newer.")
+        }
+        switch try await liveAudio.prepare(locale: command.locale) {
+        case .ready:
+            return SidecarResponseResult(type: .liveReady)
+        case .preparing:
+            return SidecarResponseResult(type: .livePreparing)
         }
     }
 

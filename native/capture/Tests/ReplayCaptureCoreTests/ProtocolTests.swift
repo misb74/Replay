@@ -193,6 +193,38 @@ import Testing
     #expect(command.live?.locale == "en-GB")
 }
 
+@Test func livePrepareCommandRoundTrips() throws {
+    let commands: [SidecarCommand] = [
+        .livePrepare(.init()),
+        .livePrepare(.init(locale: "en-GB")),
+    ]
+
+    for command in commands {
+        let envelope = SidecarCommandEnvelope(requestId: "request-1", command: command)
+        let decoded = try JSONDecoder.replay.decode(
+            SidecarCommandEnvelope.self,
+            from: JSONEncoder.replay.encode(envelope)
+        )
+        #expect(decoded == envelope)
+    }
+}
+
+@Test func livePrepareResultTypesEncodeAsSnakeCase() throws {
+    let preparing = try #require(
+        JSONSerialization.jsonObject(
+            with: JSONEncoder.replay.encode(SidecarResponseResult(type: .livePreparing))
+        ) as? [String: Any]
+    )
+    let ready = try #require(
+        JSONSerialization.jsonObject(
+            with: JSONEncoder.replay.encode(SidecarResponseResult(type: .liveReady))
+        ) as? [String: Any]
+    )
+
+    #expect(preparing["type"] as? String == "live_preparing")
+    #expect(ready["type"] as? String == "live_ready")
+}
+
 @Test func liveEventsHaveNoRequestId() throws {
     let transcript = SidecarLiveEventEnvelope(
         event: .transcript,

@@ -517,6 +517,280 @@ import Testing
     #expect(await actions.lastScreenshotCreateDirectories == false)
 }
 
+@Test func recordWithLiveStartsTheSessionOnTheCaptureClock() async throws {
+    let live = FakeLiveAudio()
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let response = await service.handle(liveRecordCommand(directory: directory))
+
+    #expect(response.ok)
+    let configuration = try #require(live.lastConfiguration)
+    #expect(configuration.sessionId == "session-live")
+    #expect(configuration.locale == "en-GB")
+    #expect(configuration.audioURL.lastPathComponent == "audio.m4a")
+}
+
+@Test func recordWithLiveFailsWhenLiveAudioIsUnavailable() async throws {
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: nil
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let response = await service.handle(liveRecordCommand(directory: directory))
+
+    #expect(!response.ok)
+    #expect(response.error?.code == .unsupported)
+}
+
+@Test func recordWithLiveRequiresNarration() async throws {
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: FakeLiveAudio()
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let response = await service.handle(.init(
+        requestId: "request-live",
+        command: .record(.init(
+            sessionId: "session-live",
+            sessionDirectory: directory.path,
+            includeAudio: false,
+            display: .init(width: 100, height: 50, scale: 1),
+            live: .init()
+        ))
+    ))
+
+    #expect(!response.ok)
+    #expect(response.error?.code == .invalidState)
+}
+
+@Test func liveAudioFailureRollsBackTheWholeRecording() async throws {
+    let live = FakeLiveAudio(startError: SidecarOperationError.permissionDenied(.microphone))
+    let recorder = FakeRecorder()
+    let service = SidecarService(
+        recorder: recorder,
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let response = await service.handle(liveRecordCommand(directory: directory))
+
+    #expect(!response.ok)
+    #expect(response.error?.code == .permissionDenied)
+    let metadata = try JSONDecoder.replay.decode(
+        SessionMetadata.self,
+        from: Data(contentsOf: directory.appendingPathComponent("meta.json"))
+    )
+    #expect(metadata.status == .interrupted)
+
+    // A second recording must be possible, so nothing stayed active.
+    let second = await service.handle(.init(
+        requestId: "request-plain",
+        command: .record(.init(
+            sessionId: "session-plain",
+            sessionDirectory: directory.appendingPathComponent("second").path,
+            includeAudio: false,
+            display: .init(width: 100, height: 50, scale: 1)
+        ))
+    ))
+    #expect(second.ok)
+}
+
+@Test func liveCommandsReachTheSessionOnlyWhileRecording() async throws {
+    let live = FakeLiveAudio()
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let idle = await service.handle(.init(
+        requestId: "request-speak-idle",
+        command: .liveSpeak(.init(utteranceId: "utterance-1", text: "Hello."))
+    ))
+    #expect(idle.error?.code == .invalidState)
+
+    _ = await service.handle(liveRecordCommand(directory: directory))
+    let speaking = await service.handle(.init(
+        requestId: "request-speak",
+        command: .liveSpeak(.init(utteranceId: "utterance-1", text: "Both totals match."))
+    ))
+    let pausing = await service.handle(.init(
+        requestId: "request-pause",
+        command: .liveSetPaused(.init(paused: true))
+    ))
+
+    #expect(speaking.result?.type == .speechQueued)
+    #expect(pausing.result?.type == .livePaused)
+    #expect(await live.session.spoken == ["Both totals match."])
+    #expect(await live.session.pausedValues == [true])
+}
+
+@Test func stoppingTheRecordingStopsTheLiveSession() async throws {
+    let live = FakeLiveAudio()
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    _ = await service.handle(liveRecordCommand(directory: directory))
+    _ = await service.handle(.init(requestId: "request-stop", command: .stop(.init(sessionId: "session-live"))))
+
+    #expect(await live.session.stopped)
+}
+
+@Test func livePrepareReportsPreparingThenReady() async throws {
+    let live = FakeLiveAudio(preparationResults: [.preparing, .ready])
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+
+    let first = await service.handle(.init(
+        requestId: "prepare-1",
+        command: .livePrepare(.init(locale: "en-GB"))
+    ))
+    let second = await service.handle(.init(
+        requestId: "prepare-2",
+        command: .livePrepare(.init(locale: "en-GB"))
+    ))
+
+    #expect(first.result?.type == .livePreparing)
+    #expect(second.result?.type == .liveReady)
+    #expect(live.preparedLocales == ["en-GB", "en-GB"])
+}
+
+@Test func livePrepareWithoutAProviderIsUnsupported() async throws {
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: nil
+    )
+
+    let response = await service.handle(.init(
+        requestId: "prepare-no-provider",
+        command: .livePrepare(.init())
+    ))
+
+    #expect(!response.ok)
+    #expect(response.error?.code == .unsupported)
+}
+
+@Test func livePrepareFailureKeepsItsCode() async throws {
+    let live = FakeLiveAudio(preparationError: SidecarOperationError.captureFailed)
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+
+    let response = await service.handle(.init(
+        requestId: "prepare-failure",
+        command: .livePrepare(.init(locale: "en-GB"))
+    ))
+
+    #expect(!response.ok)
+    #expect(response.error?.code == .captureFailed)
+}
+
+@Test func recordWithLiveRefusesWhileTheModelIsPreparing() async throws {
+    let live = FakeLiveAudio(preparationResults: [.preparing])
+    let recorder = FakeRecorder()
+    let service = SidecarService(
+        recorder: recorder,
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let response = await service.handle(liveRecordCommand(directory: directory))
+
+    #expect(!response.ok)
+    #expect(response.error?.code == .invalidState)
+    #expect(!FileManager.default.fileExists(atPath: directory.path))
+    #expect(recorder.startCallCount() == 0)
+    #expect(live.lastConfiguration == nil)
+
+    // A plain record command afterwards still succeeds.
+    let second = await service.handle(.init(
+        requestId: "request-plain",
+        command: .record(.init(
+            sessionId: "session-plain",
+            sessionDirectory: directory.appendingPathComponent("second").path,
+            includeAudio: false,
+            display: .init(width: 100, height: 50, scale: 1)
+        ))
+    ))
+    #expect(second.ok)
+}
+
+@Test func recordWithLiveChecksTheModelForItsLocale() async throws {
+    let live = FakeLiveAudio()
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: FakeInputMonitor(),
+        permissions: FakePermissions(),
+        actions: FakeActions(),
+        liveAudio: live
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let response = await service.handle(liveRecordCommand(directory: directory))
+
+    #expect(response.ok)
+    let lastLocale = try #require(live.preparedLocales.last)
+    #expect(lastLocale == "en-GB")
+}
+
 @Test func guardrailCannotBeLostWhileSubscriptionIsStarting() async {
     let safety = FakeSafetyMonitor(eventOnStart: .init(type: .killSwitch, timestampMs: 0))
     let received = SafetyEventCollector()
@@ -550,6 +824,7 @@ private final class FakeRecorder: RecordingControlling, @unchecked Sendable {
     private let startError: SidecarOperationError?
     private let stopError: SidecarOperationError?
     private var healthy: Bool
+    private var startCount = 0
 
     init(
         captureOrigin: UInt64 = DispatchTime.now().uptimeNanoseconds,
@@ -564,6 +839,7 @@ private final class FakeRecorder: RecordingControlling, @unchecked Sendable {
     }
 
     func start(configuration: RecordingStartConfiguration) async throws -> RecordingTiming {
+        lock.withLock { startCount += 1 }
         if let startError { throw startError }
         return RecordingTiming(captureOriginUptimeNanoseconds: captureOrigin)
     }
@@ -572,6 +848,7 @@ private final class FakeRecorder: RecordingControlling, @unchecked Sendable {
     }
     func isHealthy() async -> Bool { lock.withLock { healthy } }
     func setHealthy(_ healthy: Bool) { lock.withLock { self.healthy = healthy } }
+    func startCallCount() -> Int { lock.withLock { startCount } }
 }
 
 private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
@@ -730,4 +1007,69 @@ private actor SafetyEventCollector {
     func values() -> [SidecarEventEnvelope] {
         events
     }
+}
+
+private actor FakeLiveSession: LiveAudioControlling {
+    private(set) var spoken: [String] = []
+    private(set) var stopSpeakingCount = 0
+    private(set) var pausedValues: [Bool] = []
+    private(set) var stopped = false
+
+    func speak(utteranceId: String, text: String) async { spoken.append(text) }
+    func stopSpeaking() async { stopSpeakingCount += 1 }
+    func setPaused(_ paused: Bool) async { pausedValues.append(paused) }
+    func stop() async { stopped = true }
+}
+
+private final class FakeLiveAudio: LiveAudioProviding, @unchecked Sendable {
+    let session = FakeLiveSession()
+    private let startError: Error?
+    private let preparationError: Error?
+    private var preparationResults: [LivePreparation]
+    private(set) var lastConfiguration: LiveAudioStartConfiguration?
+    private(set) var preparedLocales: [String?] = []
+
+    init(
+        startError: Error? = nil,
+        preparationResults: [LivePreparation] = [.ready],
+        preparationError: Error? = nil
+    ) {
+        self.startError = startError
+        self.preparationResults = preparationResults
+        self.preparationError = preparationError
+    }
+
+    func prepare(locale: String?) async throws -> LivePreparation {
+        preparedLocales.append(locale)
+        if let preparationError { throw preparationError }
+        // Once the scripted sequence is down to its last entry, keep
+        // returning it — this is what lets a plain `FakeLiveAudio()` answer
+        // `.ready` however many times `prepare` is called.
+        guard preparationResults.count > 1 else {
+            return preparationResults.first ?? .ready
+        }
+        return preparationResults.removeFirst()
+    }
+
+    func makeSession(
+        configuration: LiveAudioStartConfiguration,
+        eventSink: @escaping @Sendable (SidecarLiveEventEnvelope) async -> Void
+    ) async throws -> LiveAudioControlling {
+        lastConfiguration = configuration
+        if let startError { throw startError }
+        return session
+    }
+}
+
+private func liveRecordCommand(directory: URL, sessionId: String = "session-live") -> SidecarCommandEnvelope {
+    .init(
+        requestId: "request-live",
+        command: .record(.init(
+            sessionId: sessionId,
+            sessionDirectory: directory.path,
+            includeAudio: true,
+            display: .init(width: 100, height: 50, scale: 1),
+            live: .init(locale: "en-GB")
+        ))
+    )
 }
