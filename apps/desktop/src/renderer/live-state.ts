@@ -17,18 +17,29 @@ export function liveStateLabel(state: LiveState): string {
 
 /**
  * The wiring reports a failed turn or a failed session with a code, not a
- * sentence — `live_timing_invalid` from the sidecar client, the sidecar's own
- * `live_audio_failed` fallback, and the model transport's `LiveModelErrorCode`s
- * (`unauthenticated`, `unavailable`, `timeout`, `failed`), alongside
- * `"capture stopped"`, already spec §8's own words for a sidecar exit. This is
- * where every one of them is given a short sentence a person can act on. An
- * unrecognised code — a new one from the Swift side, say — still reads as a
- * sentence rather than as raw wiring.
+ * sentence — `live_timing_invalid` from the sidecar client; the Mac audio
+ * session's own wire codes (`audio_route_changed`, `recogniser_failed`,
+ * `narration_write_failed`, `audio_engine_stopped`) and its coordinator's
+ * error mapping (`permission_denied`, `capture_failed`, `io_failed`), both
+ * from `native/capture`; its `live_audio_failed` fallback for anything else;
+ * and the model transport's `LiveModelErrorCode`s (`unauthenticated`,
+ * `unavailable`, `timeout`, `failed`) — alongside `"capture stopped"`,
+ * already spec §8's own words for a sidecar exit. This is where every one of
+ * them is given a short sentence a person can act on. An unrecognised code —
+ * a new one from the Swift side, say — still reads as a sentence rather than
+ * as raw wiring.
  */
 const FAILURE_REASONS: Record<string, string> = {
   "capture stopped": "capture stopped",
   live_timing_invalid: "capture timing was invalid",
   live_audio_failed: "live audio failed",
+  audio_route_changed: "audio route changed",
+  recogniser_failed: "speech recognition stopped working",
+  narration_write_failed: "narration could not be saved",
+  audio_engine_stopped: "audio engine stopped",
+  permission_denied: "microphone permission was refused",
+  capture_failed: "microphone or speech model failed to start",
+  io_failed: "session file could not be saved",
   unauthenticated: "Claude needs a valid API key",
   unavailable: "Claude unavailable",
   timeout: "Claude timed out",

@@ -106,6 +106,34 @@ describe("liveFailureReason", () => {
     expect(liveFailureReason("live_audio_failed")).toBe("live audio failed");
   });
 
+  it("names an audio route change — the native README's live-tutor checklist plugs in headphones and expects this by name", () => {
+    expect(liveFailureReason("audio_route_changed")).toBe("audio route changed");
+  });
+
+  it("names a speech recogniser that stopped working", () => {
+    expect(liveFailureReason("recogniser_failed")).toBe("speech recognition stopped working");
+  });
+
+  it("names a narration file that could not be written", () => {
+    expect(liveFailureReason("narration_write_failed")).toBe("narration could not be saved");
+  });
+
+  it("names the audio engine stopping", () => {
+    expect(liveFailureReason("audio_engine_stopped")).toBe("audio engine stopped");
+  });
+
+  it("names a refused microphone permission", () => {
+    expect(liveFailureReason("permission_denied")).toBe("microphone permission was refused");
+  });
+
+  it("names the microphone or speech model failing to start", () => {
+    expect(liveFailureReason("capture_failed")).toBe("microphone or speech model failed to start");
+  });
+
+  it("names a session file that could not be written", () => {
+    expect(liveFailureReason("io_failed")).toBe("session file could not be saved");
+  });
+
   it("names a rejected key", () => {
     expect(liveFailureReason("unauthenticated")).toBe("Claude needs a valid API key");
   });
