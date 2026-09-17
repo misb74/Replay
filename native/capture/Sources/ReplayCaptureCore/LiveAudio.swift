@@ -168,15 +168,22 @@ public protocol LiveAudioProviding: AnyObject, Sendable {
 ///    only sent if it is still true at the moment it is actually sent —
 ///    one superseded by a concurrent call while this call was suspended is
 ///    dropped rather than sent stale, and none at all follows `stop()`,
-///    including a `failed` from a `start()` that `stop()` interrupted.
+///    including a `failed` from a `start()` that `stop()` interrupted or
+///    from a `reportFailure(reason:)` that landed after it.
 /// 5. `stop()` does not return until the drain loop has fully quiesced:
 ///    every utterance already dequeued has received its terminal event
 ///    before `stop()`'s caller resumes. `start()`'s failure path does the
 ///    same before it throws.
-/// 6. Once `start()` has failed, or `stop()` has been called, the
+/// 6. Once `start()` has failed, a failure has been reported through
+///    `reportFailure(reason:)`, or `stop()` has been called, the
 ///    coordinator permanently refuses new speech: `speak()` emits
 ///    `.cancelled` immediately rather than queuing, and the recogniser is
-///    left stopped, not still running, in both cases.
+///    left stopped, not still running, in every case. A later
+///    `setPaused(false)` does not resurrect it.
+/// 7. Exactly one `failed` is ever sent, whichever of the two failure
+///    paths gets there first and however often `reportFailure(reason:)`
+///    is called — and only after every utterance's terminal event, never
+///    before.
 ///
 /// Deliberately *not* guaranteed: transcripts are not gated by speech.
 /// `ingest(_:)` only checks `paused`/`stopped`, never whether an utterance
@@ -227,19 +234,24 @@ public protocol LiveAudioProviding: AnyObject, Sendable {
 /// call was asked to set, sending the event only if nothing else has since
 /// changed it or stopped the coordinator entirely. `start()` does the same
 /// for `listening` against `paused`/`stopped`, and for `failed` against a
-/// separate `stopCalled` flag, set only inside `stop()`: the failure path
-/// also sets `stopped` itself, so `stopped` alone cannot tell "did
+/// separate `stopCalled` flag, set only inside `stop()`: both failure
+/// paths set `stopped` themselves, so `stopped` alone cannot tell "did
 /// `stop()` run" from "did sending `failed` set this".
 ///
-/// Mechanism for 1, 5 and 6's failure-path cases: the `start()` failure
-/// path sets `stopped = true`, calls `stopSpeaking()` — not just the flag
-/// — and calls `recogniser.stop()`, then awaits the drain before deciding
-/// anything else, mirroring `stop()` itself (both may now call
-/// `recogniser.stop()`, possibly concurrently — the requirement on
+/// Mechanism for 1, 5, 6's failure-path cases and 7: both failure paths —
+/// `start()`'s own and `reportFailure(reason:)` — set `stopped = true`
+/// synchronously and then run the one shared
+/// `tearDownAndReportFailure(reason:)`, which calls `stopSpeaking()` — not
+/// just the flag — and `recogniser.stop()`, then awaits the drain before
+/// deciding anything else, mirroring `stop()` itself (all of these may now
+/// call `recogniser.stop()`, possibly concurrently — the requirement on
 /// `SpeechRecognizing.stop()` covers this). Anything already queued
 /// (`speak()` has no dependency on `start()` having succeeded first) is
 /// cancelled rather than left stranded, and nothing is sent — `failed` or
-/// otherwise — before every dequeued utterance's terminal event is.
+/// otherwise — before every dequeued utterance's terminal event is. That
+/// one path also checks and sets `failureReported` in a single await-free
+/// stretch, which is what makes 7's "exactly one" hold when a reported
+/// failure and a failing `start()` both arrive.
 /// `clearDrain()` also refuses to restart the drain once `stopped`, which
 /// would otherwise be a second way for the same utterances to be lost:
 /// without it, a queue left non-empty while stopped — which should not
@@ -248,9 +260,9 @@ public protocol LiveAudioProviding: AnyObject, Sendable {
 /// forever, each exiting and immediately re-triggering the other.
 ///
 /// As with `queue`, every read of `generation`/`inFlightUtteranceId`/
-/// `paused`/`stopped`/`stopCalled` used to decide whether to act is paired
-/// with its mutation in the same await-free stretch — no `await` separates
-/// a check from the state it is checking.
+/// `paused`/`stopped`/`stopCalled`/`failureReported` used to decide
+/// whether to act is paired with its mutation in the same await-free
+/// stretch — no `await` separates a check from the state it is checking.
 public actor LiveAudioCoordinator: LiveAudioControlling {
     private struct QueuedUtterance {
         let id: String
@@ -270,11 +282,16 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
     private var drain: Task<Void, Never>?
     private var paused = false
     private var stopped = false
-    /// Set only by `stop()`, never by the `start()` failure path (which
-    /// sets `stopped` itself, so `stopped` cannot answer "did `stop()`
-    /// run"). Lets that failure path tell whether `stop()` already tore
-    /// the coordinator down and so must send no `failed` of its own.
+    /// Set only by `stop()`, never by either failure path (both set
+    /// `stopped` themselves, so `stopped` cannot answer "did `stop()`
+    /// run"). Lets a failure tell whether `stop()` already tore the
+    /// coordinator down and so must send no `failed` of its own.
     private var stopCalled = false
+    /// Set once a `failed` has actually been sent, by whichever failure
+    /// path got there first. The two can both run — a failure reported
+    /// while `start()` is suspended leaves that `start()` to throw
+    /// afterwards — and the panel must be told once, not twice.
+    private var failureReported = false
     /// Bumped, synchronously and before any `await`, by anything that means
     /// "abandon whatever speech is in flight": `stopSpeaking()`, and so
     /// transitively `stop()` and `setPaused(true)`. The drain loop compares
@@ -312,35 +329,11 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
             }
         } catch {
             // A failed start leaves the coordinator permanently unusable:
-            // `speak()`'s `!stopped` guard now refuses everything. Also
-            // cancel anything already queued (speak() has no "start()
-            // succeeded first" requirement, so utterances can be queued
-            // while this call is still suspended above) and stop the
-            // recogniser — both idempotent and safe even if stop() is
-            // doing, or has done, the same thing concurrently, per the
-            // requirement now documented on SpeechRecognizing.stop().
+            // `speak()`'s `!stopped` guard now refuses everything. Set
+            // synchronously, before the shared teardown's first await, so
+            // speech is refused from the moment the failure is known.
             stopped = true
-            await stopSpeaking()
-            await recogniser.stop()
-            // Wait for the drain to quiesce before deciding anything else,
-            // mirroring stop(): otherwise a dequeued utterance's terminal
-            // event could still be in flight when this method returns, and
-            // runDrain's own `!stopped` guard plus clearDrain's now-fixed
-            // refusal to restart would leave nothing to make it happen.
-            await drain?.value
-            // stop() may already have run — even concurrently, since the
-            // recogniser.stop() call above (or one from a genuinely
-            // concurrent stop()) can itself be what made recogniser.start()
-            // throw, by aborting a recogniser still mid-start. It already
-            // tore everything down and sent no state event of its own; a
-            // stale `failed` must not follow it.
-            guard !stopCalled else { throw error }
-            await emit(.init(
-                event: .state,
-                sessionId: sessionId,
-                state: .failed,
-                reason: reason(for: error)
-            ))
+            await tearDownAndReportFailure(reason: reason(for: error))
             throw error
         }
         // `stop()`/`setPaused(true)` may have already run while the await
@@ -439,6 +432,67 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
         // and forget it: by the time stop() returns, every utterance
         // already dequeued has received its terminal event.
         await drain?.value
+    }
+
+    /// Reports a failure noticed outside this coordinator — the audio
+    /// route changed, the recogniser's results stream threw, the narration
+    /// file could not be written — as a single `state: failed` carrying
+    /// `reason`. The reason is a wire code, passed through unchanged
+    /// alongside the ones `reason(for:)` produces for a failed `start()`.
+    ///
+    /// Does nothing at all once the coordinator has stopped, has already
+    /// failed, or is tearing down after a failed `start()`: all three set
+    /// `stopped`, which is read here synchronously, before any `await`, so
+    /// no state event can follow `stop()` and a second failure is silent.
+    /// Otherwise the tutor is torn down exactly as a failed `start()`
+    /// tears it down, and a later `stop()` still works, and stays silent.
+    ///
+    /// Only the tutor stops. The caller is the audio engine, not the
+    /// recorder: screen capture, the input monitor and the session writer
+    /// know nothing of this and keep going, which is what spec §8 asks for
+    /// — `audio.m4a` may simply end early.
+    public func reportFailure(reason: String) async {
+        guard !stopped else { return }
+        stopped = true
+        await tearDownAndReportFailure(reason: reason)
+    }
+
+    /// The teardown both failure paths share: `start()`'s own, and
+    /// `reportFailure(reason:)`. Callers set `stopped` synchronously
+    /// before calling, so speech is refused from the instant the failure
+    /// is known rather than from whenever this resumes.
+    ///
+    /// Cancels anything already queued — `speak()` has no "start()
+    /// succeeded first" requirement, so utterances can be queued while
+    /// `start()` is still suspended, and an utterance can be in flight
+    /// when the audio hardware gives out — and stops the recogniser. Both
+    /// are idempotent and safe even if `stop()` is doing, or has done, the
+    /// same thing concurrently, per the requirement documented on
+    /// `SpeechRecognizing.stop()`.
+    ///
+    /// Then waits for the drain to quiesce before deciding anything else,
+    /// mirroring `stop()`: otherwise a dequeued utterance's terminal event
+    /// could still be in flight when `failed` is sent, and `runDrain`'s own
+    /// `!stopped` guard plus `clearDrain`'s refusal to restart would leave
+    /// nothing to make it happen.
+    ///
+    /// Sends nothing at all if `stop()` has run. It may have run
+    /// concurrently — the `recogniser.stop()` call above, or one from a
+    /// genuinely concurrent `stop()`, can itself be what made
+    /// `recogniser.start()` throw, by aborting a recogniser still
+    /// mid-start — and it already tore everything down and sent no state
+    /// event of its own, so a stale `failed` must not follow it. Nor if
+    /// the other failure path has already reported: a route change that
+    /// lands while `start()` is still suspended reports first and leaves
+    /// that same `start()` to throw afterwards, and the panel must be told
+    /// once, not twice.
+    private func tearDownAndReportFailure(reason: String) async {
+        await stopSpeaking()
+        await recogniser.stop()
+        await drain?.value
+        guard !stopCalled, !failureReported else { return }
+        failureReported = true
+        await emit(.init(event: .state, sessionId: sessionId, state: .failed, reason: reason))
     }
 
     /// Waits for the speech queue to empty. Tests only.

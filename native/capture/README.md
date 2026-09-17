@@ -131,6 +131,13 @@ them can be automated, because the suite has no microphone.
       second and the transcript keeps only what was actually said.
 - [ ] Pause: transcripts and speech stop; `audio.m4a` keeps growing.
 - [ ] Stop: the session finalises and `audio.m4a` plays back.
+- [ ] Audio failure: while recording with Live on, plug headphones in. The
+      panel stops saying it is listening and shows the failure with the
+      reason `audio_route_changed`, within about a second. The recording
+      itself carries on — the timer keeps running, `video.mp4` is
+      unaffected, and `audio.m4a` simply ends early. The tutor does not
+      come back on its own; stopping and starting again is what restarts
+      it.
 - [ ] First run: the speech model downloads and the panel shows
       "Preparing speech model" while it does.
 - [ ] macOS 15: the "Talk to Replay while recording" checkbox is disabled

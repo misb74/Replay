@@ -110,9 +110,11 @@ final class MacLiveAudioProvider: LiveAudioProviding, @unchecked Sendable {
         eventSink: @escaping @Sendable (SidecarLiveEventEnvelope) async -> Void
     ) async throws -> LiveAudioControlling {
         let transcriber = try await requireInstalledModel(locale: configuration.locale)
+        let failureReporter = LiveAudioFailureReporter()
         let engine = MacLiveAudioEngine(
             configuration: configuration,
-            transcriber: transcriber
+            transcriber: transcriber,
+            failureReporter: failureReporter
         )
         let coordinator = LiveAudioCoordinator(
             sessionId: configuration.sessionId,
@@ -121,6 +123,15 @@ final class MacLiveAudioProvider: LiveAudioProviding, @unchecked Sendable {
             synthesiser: engine,
             eventSink: eventSink
         )
+        // Connected before the session starts, so audio that fails while
+        // it is still starting up is reported rather than lost, and weakly:
+        // the coordinator owns the engine, which owns the reporter, so a
+        // strong reference here would keep a finished session alive for
+        // good. Only the tutor ends this way — the recording it runs
+        // alongside is the sidecar's, and carries on.
+        failureReporter.connect { [weak coordinator] reason in
+            await coordinator?.reportFailure(reason: reason)
+        }
         try await coordinator.start()
         return coordinator
     }

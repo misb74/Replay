@@ -1124,3 +1124,203 @@ private actor CompletionFlag {
     let events = await collector.events.filter { $0.utteranceId == "ignored" }
     #expect(events.map(\.atMs) == [0])
 }
+
+// MARK: - Task 6b: a failure noticed outside the coordinator — the audio
+// route changed, the recogniser's stream threw, the narration file could
+// not be written — must reach the panel as one `failed` carrying its wire
+// code, and must cost no utterance its terminal event.
+
+@Test func aFailureWhileAnUtteranceIsInFlightEndsItOnceThenReportsTheReason() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let recogniser = FakeRecogniser()
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+    await synthesiser.setAutoCompletes(false)
+
+    // A is genuinely in flight: this fake's speak() suspends until
+    // something resolves it, and the only thing that can here is the
+    // failure path's own targeted stop. The interleaving is driven, not
+    // raced.
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    await coordinator.reportFailure(reason: "audio_route_changed")
+
+    let events = await collector.events
+    let aPhases = events.filter { $0.utteranceId == "A" }.compactMap(\.phase)
+    #expect(aPhases == [.started, .cancelled], "the utterance in flight must still end with exactly one terminal event")
+    let failedIndex = try #require(events.firstIndex { $0.state == .failed }, "the failure must be reported")
+    let aTerminalIndex = try #require(events.firstIndex { $0.utteranceId == "A" && $0.phase == .cancelled })
+    #expect(aTerminalIndex < failedIndex, "reportFailure must await the drain before it emits, as stop() does")
+    #expect(events[failedIndex].reason == "audio_route_changed", "the reason is a wire code, passed through unchanged")
+    #expect(await coordinator.isDrainingForTesting == false, "no drain task may remain once the failure has been reported")
+    #expect(await recogniser.running == false, "a reported failure must leave the recogniser stopped, as a failed start does")
+}
+
+@Test func aFailureCancelsEveryQueuedUtteranceExactlyOnceBeforeItReports() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+    await synthesiser.setAutoCompletes(false)
+
+    // A is dequeued and playing; B and C are still sitting in `queue`,
+    // since the drain loop cannot look at them again until A resolves.
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    await coordinator.speak(utteranceId: "B", text: "Bravo")
+    await coordinator.speak(utteranceId: "C", text: "Charlie")
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    await coordinator.reportFailure(reason: "recogniser_failed")
+
+    let events = await collector.events
+    for id in ["B", "C"] {
+        let phases = events.filter { $0.utteranceId == id }.compactMap(\.phase)
+        #expect(phases == [.cancelled], "\(id) was never dequeued, so it must be cancelled exactly once")
+    }
+    #expect(await synthesiser.spoken == ["Alpha"], "nothing queued when the failure landed may reach the synthesiser")
+    let failedIndex = try #require(events.firstIndex { $0.state == .failed })
+    for id in ["A", "B", "C"] {
+        let terminalIndex = try #require(events.firstIndex {
+            $0.utteranceId == id && ($0.phase == .cancelled || $0.phase == .finished)
+        })
+        #expect(terminalIndex < failedIndex, "\(id)'s terminal event must precede the failure")
+    }
+    #expect(events[failedIndex].reason == "recogniser_failed")
+}
+
+@Test func aFailureAfterStopDoesNothingAtAll() async throws {
+    let collector = EventCollector()
+    let recogniser = FakeRecogniser()
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: FakeSynthesiser(), collector: collector)
+    try await coordinator.start()
+    await coordinator.stop()
+    let eventCountWhenStopReturned = await collector.events.count
+    let recogniserStopsWhenStopReturned = await recogniser.stopCallCount
+
+    await coordinator.reportFailure(reason: "audio_engine_stopped")
+
+    #expect(await collector.events.count == eventCountWhenStopReturned, "nothing may be sent once stop() has returned")
+    let states = await collector.events.compactMap(\.state)
+    #expect(states == [.preparingModel, .listening], "no state event may follow stop(), a failure included")
+    // Not merely silent: a coordinator that has already stopped does
+    // nothing at all, rather than tearing everything down a second time.
+    #expect(
+        await recogniser.stopCallCount == recogniserStopsWhenStopReturned,
+        "a failure after stop() must not reach the recogniser again: stop() already shut it"
+    )
+}
+
+@Test func aFailureThatLandsWhileStopIsStillTearingDownEmitsNothing() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+    await synthesiser.setAutoCompletes(false)
+
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    // stop() is held inside the synthesiser's own stop: it has set the
+    // coordinator's state but has not finished tearing down when the
+    // failure lands, which is the interleaving a real route change hits
+    // when the user stops the recording at the same moment.
+    await synthesiser.setHoldStops(true)
+    let stopTask = Task { await coordinator.stop() }
+    #expect(await waitUntil { await synthesiser.stopCallCount == 1 })
+
+    await coordinator.reportFailure(reason: "audio_route_changed")
+
+    await synthesiser.releaseHeldStop()
+    await stopTask.value
+
+    let states = await collector.events.compactMap(\.state)
+    #expect(states == [.preparingModel, .listening], "a failure landing while stop() is still tearing down must emit nothing")
+}
+
+@Test func twoFailuresReportOnlyTheFirst() async throws {
+    let collector = EventCollector()
+    let coordinator = makeCoordinator(
+        recogniser: FakeRecogniser(),
+        synthesiser: FakeSynthesiser(),
+        collector: collector
+    )
+    try await coordinator.start()
+
+    await coordinator.reportFailure(reason: "audio_route_changed")
+    await coordinator.reportFailure(reason: "narration_write_failed")
+
+    let failures = await collector.events.filter { $0.state == .failed }
+    #expect(failures.count == 1, "a second failure must not report a second time")
+    #expect(failures.first?.reason == "audio_route_changed", "the reason that ended the session is the first one")
+}
+
+@Test func aFailureReportedWhileStartIsStillRunningIsNotReportedAgainWhenThatStartFails() async throws {
+    let collector = EventCollector()
+    let recogniser = FakeRecogniser(startError: SidecarOperationError.captureFailed, holdsStart: true)
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: FakeSynthesiser(), collector: collector)
+
+    let startTask = Task { try? await coordinator.start() }
+    #expect(await waitUntil { await recogniser.isHoldingStart })
+
+    // The audio route changes while the recogniser is still starting up —
+    // which a real engine can do, since the observer is installed before
+    // the engine is started. The start that was already doomed only throws
+    // afterwards.
+    await coordinator.reportFailure(reason: "audio_route_changed")
+    await recogniser.releaseStart()
+    await startTask.value
+
+    let failures = await collector.events.filter { $0.state == .failed }
+    #expect(failures.count == 1, "a start() failing after a failure was reported must not report a second one")
+    #expect(failures.first?.reason == "audio_route_changed", "the reason that ended the session is the first one")
+}
+
+@Test func aFailureWhilePausedIsStillReportedAndSpeechStaysRefused() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+    await coordinator.setPaused(true)
+
+    await coordinator.reportFailure(reason: "narration_write_failed")
+
+    #expect(await collector.events.last?.reason == "narration_write_failed")
+
+    // Unpausing must not resurrect a tutor whose audio has failed: speech
+    // stays refused because the coordinator failed, not merely because it
+    // was paused when the failure landed.
+    await coordinator.setPaused(false)
+    await coordinator.speak(utteranceId: "ignored", text: "should not play")
+
+    let states = await collector.events.compactMap(\.state)
+    #expect(
+        states == [.preparingModel, .listening, .paused, .failed],
+        "a paused tutor whose audio fails must say so, and must not claim to be listening again afterwards"
+    )
+    let phases = await collector.events.filter { $0.utteranceId == "ignored" }.compactMap(\.phase)
+    #expect(phases == [.cancelled])
+    #expect(await synthesiser.spoken.isEmpty)
+}
+
+@Test func afterAFailureSpeakIsRefusedAndALaterStopEmitsNothing() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let recogniser = FakeRecogniser()
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+
+    await coordinator.reportFailure(reason: "audio_engine_stopped")
+
+    await coordinator.speak(utteranceId: "ignored", text: "should not play")
+    let phases = await collector.events.filter { $0.utteranceId == "ignored" }.compactMap(\.phase)
+    #expect(phases == [.cancelled], "a failure refuses further speech exactly as a failed start does")
+    #expect(await synthesiser.spoken.isEmpty)
+
+    let eventCountBeforeStop = await collector.events.count
+    await coordinator.stop()
+
+    #expect(await collector.events.count == eventCountBeforeStop, "a later stop() must still work, and stay silent")
+    #expect(await recogniser.running == false)
+}

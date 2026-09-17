@@ -23,6 +23,11 @@ import Speech
 actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
     private let configuration: LiveAudioStartConfiguration
     private let transcriber: SpeechTranscriber
+    /// Carries a failure noticed here — a changed audio route, a
+    /// recogniser that threw, a narration file that cannot be written, an
+    /// engine that stopped by itself — to the coordinator, which is the
+    /// only thing that can tell the panel.
+    private let failureReporter: LiveAudioFailureReporter
     private let engine = AVAudioEngine()
     private let playback = SpeechPlayback()
     private var tap: MicrophoneTap?
@@ -36,10 +41,19 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
     private var teardownTask: Task<Void, Never>?
     private var stopped = false
     private var tornDown = false
+    /// Whether `engine.start()` ever succeeded. An engine that is not
+    /// running has only stopped by itself if it ran in the first place;
+    /// before that, it is simply not open yet.
+    private var engineStarted = false
 
-    init(configuration: LiveAudioStartConfiguration, transcriber: SpeechTranscriber) {
+    init(
+        configuration: LiveAudioStartConfiguration,
+        transcriber: SpeechTranscriber,
+        failureReporter: LiveAudioFailureReporter
+    ) {
         self.configuration = configuration
         self.transcriber = transcriber
+        self.failureReporter = failureReporter
     }
 
     // MARK: SpeechRecognizing
@@ -56,6 +70,11 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
 
     func stop() async {
         stopped = true
+        // From here on the engine stopping, the analyser's stream ending
+        // and the narration file closing are how a session ends, not why
+        // it failed. Done first, and synchronously, so nothing noticed
+        // during the teardown below is reported as a failure.
+        failureReporter.invalidate()
         if let teardownTask {
             await teardownTask.value
             return
@@ -128,7 +147,8 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
                 audioURL: configuration.audioURL,
                 tapFormat: tapFormat,
                 analyzerFormat: analyzerFormat,
-                analyzerInput: continuation
+                analyzerInput: continuation,
+                failureReporter: failureReporter
             )
         } catch {
             continuation.finish()
@@ -150,8 +170,13 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
             // reason to open it at all; the teardown that this task is
             // serialised ahead of unwinds everything built above.
             guard !stopped else { return }
+            // Installed before the engine is started, so a hardware change
+            // cannot slip through the gap between opening the microphone
+            // and watching for one.
+            failureReporter.observeConfigurationChanges(of: engine)
             engine.prepare()
             try engine.start()
+            engineStarted = true
         } catch {
             throw SidecarOperationError.captureFailed
         }
@@ -168,7 +193,7 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
         // results loop cannot then interleave with a start or a teardown
         // suspended mid-step, and it needs nothing from here but the tap's
         // first buffer time, which is lock-protected.
-        resultsTask = Task.detached { [transcriber] in
+        resultsTask = Task.detached { [transcriber, failureReporter] in
             var index = 0
             do {
                 for try await result in transcriber.results {
@@ -194,9 +219,15 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
                     ))
                 }
             } catch {
-                // A finished or cancelled analysis ends this loop, which is
-                // the normal way a session closes. The coordinator reports a
-                // genuine failure through its own state event.
+                // A finished or cancelled analysis ends this loop too,
+                // which is the normal way a session closes — but the
+                // reporter is invalidated the moment a stop is asked for,
+                // before any of that, so only a throw with the session
+                // still running reaches the panel. Recognition stopping
+                // mid-recording is precisely the failure that used to be
+                // invisible: the tutor hears nothing more and the panel
+                // went on saying it was listening.
+                failureReporter.report("recogniser_failed")
             }
         }
     }
@@ -232,7 +263,18 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
         // engine can stop itself without being asked — an audio route
         // change is the usual way. Refusing the utterance reports that
         // honestly; playing into a stopped engine would not.
-        guard engine.isRunning else { return false }
+        guard engine.isRunning else {
+            // An engine that has run and is no longer running stopped by
+            // itself, and there is no notification for that on macOS: this
+            // check, which every utterance already makes, is the only
+            // signal short of polling. A route change reports itself
+            // sooner and more precisely; this catches whatever else can
+            // stop an engine, at the next thing the tutor tries to say.
+            // Before it ever ran, this is only speech queued while the
+            // session was still starting up, which is not a failure.
+            if engineStarted { failureReporter.report("audio_engine_stopped") }
+            return false
+        }
         guard playback.begin(text: text, utteranceId: utteranceId) else { return false }
         return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             playback.attach(continuation, to: utteranceId)
@@ -541,6 +583,7 @@ final class MicrophoneTap: @unchecked Sendable {
     private let analyzerFormat: AVAudioFormat
     private let fileConverter: AVAudioConverter
     private let analyzerConverter: AVAudioConverter
+    private let failureReporter: LiveAudioFailureReporter
     private let narrationQueue = DispatchQueue(label: "Replay live narration", qos: .userInitiated)
     private let lock = NSLock()
     /// Confined to `narrationQueue`: nothing else reads or writes these
@@ -563,7 +606,8 @@ final class MicrophoneTap: @unchecked Sendable {
         audioURL: URL,
         tapFormat: AVAudioFormat,
         analyzerFormat: AVAudioFormat,
-        analyzerInput: AsyncStream<AnalyzerInput>.Continuation
+        analyzerInput: AsyncStream<AnalyzerInput>.Continuation,
+        failureReporter: LiveAudioFailureReporter
     ) throws {
         // Mono at the tap's own sample rate. AAC rejects the channel count
         // voice processing exposes outright, and the narration file a
@@ -614,6 +658,7 @@ final class MicrophoneTap: @unchecked Sendable {
         self.analyzerFormat = analyzerFormat
         self.fileConverter = fileConverter
         self.analyzerConverter = analyzerConverter
+        self.failureReporter = failureReporter
         self.analyzerInput = analyzerInput
     }
 
@@ -717,25 +762,29 @@ final class MicrophoneTap: @unchecked Sendable {
         }
     }
 
-    /// On `narrationQueue`. The first failure is recorded rather than
-    /// discarded, and writing then stops: a format the encoder rejects
-    /// fails on every single buffer, so `try?` here would both hide it and
-    /// repeat it for the length of the recording.
+    /// On `narrationQueue`. Writing stops at the first failure rather than
+    /// being retried: a format the encoder rejects fails on every single
+    /// buffer, so `try?` here would both hide it and repeat it for the
+    /// length of the recording.
     private func write(_ buffer: AVAudioPCMBuffer) {
         guard let file, firstNarrationFailure == nil else { return }
         do {
             try file.write(from: buffer)
         } catch {
-            firstNarrationFailure = error
-            self.file = nil
+            recordNarrationFailure(error)
         }
     }
 
-    /// On `narrationQueue`.
+    /// On `narrationQueue`. The one place a narration failure is recorded,
+    /// whether the buffer could not be converted or could not be written,
+    /// so that writing stops and the session says so exactly once. Nobody
+    /// read this before: `audio.m4a` stopped growing, and the panel went
+    /// on saying the tutor was listening.
     private func recordNarrationFailure(_ error: Error) {
         guard firstNarrationFailure == nil else { return }
         firstNarrationFailure = error
         file = nil
+        failureReporter.report("narration_write_failed")
     }
 }
 
