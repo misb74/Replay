@@ -249,7 +249,10 @@ export class LiveTutor {
     // Forgotten with the panel it was for, so the panel of whatever recording
     // comes next never briefly replays a line that belonged to this one.
     this.#lastUpdate = undefined;
-    if (panel && !panel.isDestroyed()) withoutFailing(() => panel.close());
+    // The window is asked whether it is still there inside the guard, not
+    // outside it: `end()` is what a quit waits on, and it must not be able to
+    // fail on the way to closing a window.
+    if (panel) withoutFailing(() => { if (!panel.isDestroyed()) panel.close(); });
   }
 
   /**
@@ -261,6 +264,6 @@ export class LiveTutor {
     this.#lastUpdate = update;
     withoutFailing(() => this.#options.publish(update));
     const panel = this.#panel;
-    if (panel && !panel.isDestroyed()) withoutFailing(() => panel.send(ipcChannels.liveUpdate, update));
+    if (panel) withoutFailing(() => { if (!panel.isDestroyed()) panel.send(ipcChannels.liveUpdate, update); });
   }
 }

@@ -107,7 +107,10 @@ app.on("before-quit", (event) => {
   if (tutor?.isRunning) {
     event.preventDefault();
     quitting = true;
-    void tutor.end().then(() => {
+    // Whatever becomes of the conversation, the quit still happens. A
+    // rejection that left `quitting` set would have every later press take the
+    // branch above, making force quit the only way out of the app.
+    void tutor.end().catch(() => undefined).finally(() => {
       quitting = false;
       app.quit();
     });

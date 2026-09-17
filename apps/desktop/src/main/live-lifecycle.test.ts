@@ -373,6 +373,17 @@ describe("LiveTutor", () => {
     await expect(tutor.setPaused(false)).resolves.toBeUndefined();
   });
 
+  it("never fails because the panel cannot say whether it is still there", async () => {
+    const { tutor, panels } = harness();
+    await startLive(tutor);
+    panels[0]!.isDestroyed = () => { throw new Error("the panel is gone"); };
+
+    // `end()` is what a quit waits on, and a rejection there would leave the
+    // app deferring its own quit for ever.
+    await expect(tutor.end("capture stopped")).resolves.toBeUndefined();
+    await expect(tutor.end()).resolves.toBeUndefined();
+  });
+
   it("never lets a window failure reach the conversation", async () => {
     const panels: FakePanel[] = [];
     const conversations: FakeConversation[] = [];
