@@ -40,8 +40,18 @@ public protocol SpeechSynthesizing: AnyObject, Sendable {
     /// Speaks one utterance, identified by `utteranceId`. Returns true when
     /// it played to completion and false when it was stopped.
     ///
-    /// The coordinator only ever calls this for one utterance at a time,
-    /// waiting for it to return before calling it again.
+    /// What callers guarantee, which conformances may rely on:
+    /// - An utterance id is never reused.
+    /// - `speak(_:utteranceId:)` is never called while an earlier call has
+    ///   not yet returned. The coordinator speaks one utterance at a time.
+    ///
+    /// Registering an utterance forgets every id this synthesiser was
+    /// holding a stop for (see `stopSpeaking(utteranceId:)`). Each of those
+    /// names an utterance whose own `speak(_:utteranceId:)` has already
+    /// returned — including one that finished on its own just before its
+    /// stop arrived — so, ids never being reused, nothing can ever claim
+    /// them. Forgetting them is what keeps the remembered set from growing
+    /// for the life of the session.
     func speak(_ text: String, utteranceId: String) async -> Bool
     /// Stops the utterance named by `utteranceId`. Named apart from
     /// `SpeechRecognizing.stop()` so one type can conform to both
@@ -50,14 +60,15 @@ public protocol SpeechSynthesizing: AnyObject, Sendable {
     /// Required semantics:
     /// - If `utteranceId` is the utterance currently playing, it stops,
     ///   and its `speak(_:utteranceId:)` call returns false.
-    /// - If `utteranceId`'s `speak(_:utteranceId:)` has not been called
-    ///   yet, the stop is remembered: the next `speak(_:utteranceId:)`
-    ///   call for that same id returns false immediately, without
-    ///   playing.
-    /// - A stop naming any other id, or an utterance that has already
-    ///   finished, has no effect.
-    /// - A remembered id is forgotten once its matching
-    ///   `speak(_:utteranceId:)` call returns.
+    /// - Otherwise the stop is remembered for that id alone: a later
+    ///   `speak(_:utteranceId:)` call for the same id returns false
+    ///   immediately, without playing. This covers both a stop that
+    ///   overtook its own `speak(_:utteranceId:)` call and one that
+    ///   arrived after its utterance had already finished — which look
+    ///   the same from here, and which the second is harmless for,
+    ///   because that id will never be spoken again and the next
+    ///   utterance to register forgets it.
+    /// - Either way, a stop never affects an utterance it did not name.
     ///
     /// Scoping this by id, rather than a single global "a stop was
     /// requested" flag, is what lets the coordinator target exactly the

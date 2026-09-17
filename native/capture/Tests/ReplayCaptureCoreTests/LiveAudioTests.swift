@@ -103,14 +103,20 @@ private actor FakeSynthesiser: SpeechSynthesizing {
     private var autoCompletes = true
     private var holdStops = false
     private var heldStop: CheckedContinuation<Void, Never>?
-    /// Ids stopped before their `speak(_:utteranceId:)` call registered.
-    /// Scoped per id, unlike round 2's single global flag: a stop
-    /// remembered for one id can never be misapplied to a later, unrelated
-    /// one, even if it is never claimed (an id that has already finished
-    /// is never spoken again, so an entry left over for it is harmless).
+    /// Ids a stop arrived for while they were not playing. Scoped per id,
+    /// unlike round 2's single global flag: a stop remembered for one id
+    /// can never be misapplied to a later, unrelated one. An entry may
+    /// name an utterance that had already finished, which is harmless —
+    /// that id is never spoken again, and registering the next utterance
+    /// forgets it.
     private var pendingStopIds: Set<String> = []
 
     var isSpeaking: Bool { current != nil }
+
+    /// The ids this synthesiser is still holding a stop for. Exposed so a
+    /// test can check directly that remembered stops do not accumulate,
+    /// rather than inferring it from a later utterance's outcome.
+    var rememberedStopIds: Set<String> { pendingStopIds }
 
     func setAutoCompletes(_ value: Bool) {
         autoCompletes = value
@@ -132,6 +138,10 @@ private actor FakeSynthesiser: SpeechSynthesizing {
         if pendingStopIds.remove(utteranceId) != nil {
             return false
         }
+        // Registering this utterance forgets every other remembered id:
+        // each names an utterance whose speak() has already returned, and
+        // ids are never reused, so none of them can ever be claimed.
+        pendingStopIds.removeAll()
         if autoCompletes { return true }
         return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             current = (utteranceId, continuation)
@@ -156,15 +166,14 @@ private actor FakeSynthesiser: SpeechSynthesizing {
         if let c = current, c.id == utteranceId {
             current = nil
             c.continuation.resume(returning: false)
-        } else if current == nil {
-            // Not registered yet (or already finished, which looks the
-            // same here and is harmless: this id will never be spoken
-            // again). Remembered for its own matching speak() call only.
-            pendingStopIds.insert(utteranceId)
+            return
         }
-        // A stop naming a different id than whatever is currently playing
-        // has no effect, and in particular is not remembered — only "not
-        // yet registered" latches, not "registered as something else".
+        // This id is not the one playing: it has not registered yet, or it
+        // already finished (which looks the same from here, and is
+        // harmless — it will never be spoken again, and the next utterance
+        // to register forgets it). Remembered for its own matching speak()
+        // call only, so it can never affect any other utterance.
+        pendingStopIds.insert(utteranceId)
     }
 
     func releaseHeldStop() {
@@ -724,6 +733,32 @@ private actor CompletionFlag {
 
     #expect(completed == false, "a stop remembered for an id must apply to that same id's speak() call")
     #expect(await synthesiser.isSpeaking == false, "a remembered stop must return immediately, without ever actually playing")
+    #expect(await synthesiser.rememberedStopIds.isEmpty, "the stop was claimed by its own utterance, so nothing is left holding it")
+}
+
+/// A stop can only arrive after its utterance has already finished on its
+/// own — the coordinator decides to stop whatever is in flight, and that
+/// utterance can finish before the call lands. Such a stop is remembered
+/// for an id that will never be spoken again, so the next utterance that
+/// actually registers must clear it. Otherwise remembered ids accumulate
+/// for the life of the session.
+@Test func aStopForAnAlreadyFinishedUtteranceIsForgottenWhenTheNextSpeakRegisters() async {
+    let synthesiser = FakeSynthesiser()
+
+    #expect(await synthesiser.speak("Alpha", utteranceId: "A"), "A plays to completion before anything stops it")
+    await synthesiser.stopSpeaking(utteranceId: "A")
+    #expect(await synthesiser.rememberedStopIds == ["A"], "a stop that finds nothing playing is remembered")
+
+    await synthesiser.setAutoCompletes(false)
+    let speakTask = Task { await synthesiser.speak("Bravo", utteranceId: "B") }
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    #expect(
+        await synthesiser.rememberedStopIds.isEmpty,
+        "registering B must forget A's stop: A's speak() has already returned, so nothing can ever claim it"
+    )
+    await synthesiser.finishCurrent()
+    #expect(await speakTask.value, "B must be unaffected by the stop that named A")
 }
 
 @Test func aStopForADifferentIdHasNoEffectOnTheUtterancePlaying() async {

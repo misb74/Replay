@@ -159,6 +159,12 @@ public final class MacScreenRecorder: NSObject, RecordingControlling, SCStreamDe
             throw SidecarOperationError.captureFailed
         }
 
+        // Nil for a live recording, even though narration is on: the live
+        // audio engine writes `audio.m4a` itself, from the same
+        // voice-processed input its recogniser hears, so the tutor's own
+        // voice is cancelled out of the narration as well as out of the
+        // transcript. Two recorders on one microphone would also be fighting
+        // over one file.
         var microphone: AVAudioRecorder?
         do {
             if let audioURL = configuration.audioURL {

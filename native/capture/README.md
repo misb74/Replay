@@ -119,3 +119,19 @@ Before shipping a signed app bundle, manually verify on a clean macOS account:
 
 These checks require real TCC grants and cannot be made reliable in a headless
 unit-test process.
+
+### Live tutor (macOS 26 or newer)
+
+Run these on a clean account before distributing a signed build. None of
+them can be automated, because the suite has no microphone.
+
+- [ ] Echo: with Live on, speak, let the tutor reply, and confirm its own
+      words never appear in `transcript.json`.
+- [ ] Barge-in: speak while the tutor is speaking; it stops within about a
+      second and the transcript keeps only what was actually said.
+- [ ] Pause: transcripts and speech stop; `audio.m4a` keeps growing.
+- [ ] Stop: the session finalises and `audio.m4a` plays back.
+- [ ] First run: the speech model downloads and the panel shows
+      "Preparing speech model" while it does.
+- [ ] macOS 15: the "Talk to Replay while recording" checkbox is disabled
+      and explains that it needs macOS 26.
