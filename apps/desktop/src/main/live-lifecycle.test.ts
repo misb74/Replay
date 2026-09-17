@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PermissionStatus } from "../shared/contracts.js";
-import { liveAvailability, withDeadline, withoutFailing } from "./live-availability.js";
+import { liveAvailability, withDeadline, withoutFailing } from "./live-lifecycle.js";
 
 function permissions(microphone: PermissionStatus["state"]): PermissionStatus[] {
   return [

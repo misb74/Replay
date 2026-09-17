@@ -17,7 +17,7 @@ import type { CompileRequest, LiveUpdate, PermissionName, ProcessSessionIpcResul
 import { ipcChannels } from "../shared/contracts.js";
 import { CompilerService } from "./compiler-service.js";
 import { LiveAssistService, type LiveSidecar, type LiveSpeechSignal, type LiveStateSignal, type LiveTranscriptSignal } from "./live-assist-service.js";
-import { liveAvailability, withDeadline, withoutFailing } from "./live-availability.js";
+import { liveAvailability, withDeadline, withoutFailing } from "./live-lifecycle.js";
 import { LiveEventsTail } from "./live-events-tail.js";
 import { createClaudeLiveTransport } from "./live-model.js";
 import { DesktopPipelineService } from "./pipeline-service.js";
@@ -97,6 +97,10 @@ app.on("before-quit", (event) => {
     return;
   }
   sidecar?.close();
+  // Belt and braces: every path that opens the panel opens it with a live
+  // session, and every path that ends one already closes the panel above —
+  // but a quit is not the place to find out that invariant slipped.
+  closeLivePanel();
   globalShortcut.unregisterAll();
   tray?.destroy();
 });
@@ -107,14 +111,72 @@ function sendToWindow(channel: string, value: unknown): void {
 
 /** The conversation reaches both the main window's record card and the floating panel. */
 function publishLiveUpdate(update: LiveUpdate): void {
+  // Kept so a panel that opens (or reloads) after the update was sent still
+  // shows the current state rather than "Starting" until the next change.
+  lastLiveUpdate = update;
   sendToWindow(ipcChannels.liveUpdate, update);
   sendToPanel(ipcChannels.liveUpdate, update);
 }
 
-// Task 17 replaces these three with the floating panel window.
-function openLivePanel(): void {}
-function closeLivePanel(): void {}
-function sendToPanel(_channel: string, _value: unknown): void {}
+let panelWindow: BrowserWindow | undefined;
+let lastLiveUpdate: LiveUpdate | undefined;
+
+/**
+ * The always-on-top HUD for the live conversation (spec §6.3). `type: "panel"`
+ * adds macOS's non-activating panel style mask (`NSWindowStyleMaskNonactivatingPanel`),
+ * so showing it — and clicking its buttons — never brings Replay frontmost or
+ * takes focus from whatever the user is recording; `showInactive()` is the
+ * other half of that (Electron 44 docs, `structures/base-window-options.md`
+ * and `base-window.md`: "Shows the window but doesn't focus on it").
+ */
+function openLivePanel(): void {
+  if (panelWindow && !panelWindow.isDestroyed()) return;
+  const display = screen.getPrimaryDisplay().workArea;
+  panelWindow = new BrowserWindow({
+    width: 340,
+    height: 150,
+    x: display.x + display.width - 360,
+    y: display.y + display.height - 170,
+    type: "panel",
+    frame: false,
+    resizable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    show: false,
+    backgroundColor: "#0b1220",
+    webPreferences: {
+      preload: join(app.getAppPath(), "dist/preload/index.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+    },
+  });
+  panelWindow.setAlwaysOnTop(true, "floating");
+  panelWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  panelWindow.once("ready-to-show", () => panelWindow?.showInactive());
+  panelWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  panelWindow.webContents.on("will-navigate", (event) => event.preventDefault());
+  // The panel's own subscription starts empty: without this, it would say
+  // "Starting" until the next change, however far into the conversation it
+  // opened (spec §8's states are meant to be read live, not guessed at).
+  panelWindow.webContents.on("did-finish-load", () => {
+    if (lastLiveUpdate) sendToPanel(ipcChannels.liveUpdate, lastLiveUpdate);
+  });
+  const developmentUrl = process.env.REPLAY_DEV_SERVER_URL;
+  void (developmentUrl
+    ? panelWindow.loadURL(`${developmentUrl}/panel.html`)
+    : panelWindow.loadFile(join(app.getAppPath(), "dist/renderer/panel.html")));
+}
+
+function closeLivePanel(): void {
+  if (panelWindow && !panelWindow.isDestroyed()) panelWindow.close();
+  panelWindow = undefined;
+}
+
+function sendToPanel(channel: string, value: unknown): void {
+  if (panelWindow && !panelWindow.isDestroyed()) panelWindow.webContents.send(channel, value);
+}
 
 /**
  * Ends the live conversation, if one is running, and closes its panel. The

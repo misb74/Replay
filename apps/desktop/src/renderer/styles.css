@@ -148,3 +148,27 @@ input:focus, textarea:focus, select:focus { outline: 3px solid rgba(225,29,72,.1
   .review-grid { grid-template-columns: 41% 59%; }
   .evidence-pane { padding: 16px; }
 }
+
+/* Task 17: the floating live panel (spec §6.3). A small always-on-top HUD,
+   dark so it reads over whatever the user is recording, independent of the
+   main window's light theme. `.panel-body` overrides the shared `body` rule
+   above, which sizes the main window's shell and would otherwise clip a
+   340×150 panel to one corner of an assumed 1040px-wide page. */
+body.panel-body { min-width: 0; min-height: 0; overflow: hidden; background: #0b1220; }
+.live-panel { box-sizing: border-box; width: 100%; height: 100vh; padding: 10px 12px; display: flex; flex-direction: column; gap: 5px; background: #0b1220; color: #cbd5e1; font-size: 11px; -webkit-app-region: drag; }
+.live-panel-head { display: flex; align-items: center; gap: 8px; flex: none; }
+.live-panel-state { padding: 3px 8px; border-radius: 99px; background: #1e293b; color: #cbd5e1; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+.live-panel-state.paused { background: #422006; color: #fbbf24; }
+.live-panel-state.failed { background: #450a0a; color: #f87171; }
+.live-share-dot { width: 8px; height: 8px; margin-left: auto; border-radius: 50%; background: #334155; flex: none; }
+.live-share-dot.on { background: #34d399; box-shadow: 0 0 0 3px rgba(52,211,153,.25); }
+.live-panel-heard, .live-panel-said, .live-panel-error { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.live-panel-heard { color: #94a3b8; font-size: 11px; }
+.live-panel-said { color: #f8fafc; font-size: 11px; font-weight: 600; }
+.live-panel-error { color: #f87171; font-size: 10px; }
+.live-panel-note { flex: none; color: #94a3b8; font-size: 9px; }
+.live-panel-actions { margin-top: auto; display: flex; gap: 6px; flex: none; }
+.live-panel-actions button { flex: 1; padding: 6px 8px; border: 1px solid #334155; border-radius: 7px; background: #1e293b; color: #e2e8f0; font-size: 10px; font-weight: 700; cursor: pointer; -webkit-app-region: no-drag; }
+.live-panel-actions button:hover { background: #334155; }
+.live-panel-actions button:last-child { border-color: #7f1d1d; background: #450a0a; color: #fecaca; }
+.live-panel-actions button:last-child:hover { background: #5c1414; }

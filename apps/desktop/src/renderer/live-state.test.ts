@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { liveAvailabilityNote, liveStateLabel, liveStatusLabel, recordControlState } from "./live-state.js";
+import {
+  liveAvailabilityNote,
+  liveFailureReason,
+  liveFailureText,
+  livePanelPaused,
+  livePanelShowsPause,
+  liveStateLabel,
+  liveStatusLabel,
+  recordControlState,
+} from "./live-state.js";
 
 describe("liveStateLabel", () => {
   it("names every state in the words the service uses", () => {
@@ -81,5 +90,84 @@ describe("liveStatusLabel", () => {
   it("still shows the speech model being prepared once the recording it belongs to exists", () => {
     expect(liveStatusLabel({ sessionId: "session-1", state: "preparing_model", sharing: false }, "session-1"))
       .toBe("Live · Preparing speech model");
+  });
+});
+
+describe("liveFailureReason", () => {
+  it("names a sidecar exit in the words the panel already uses", () => {
+    expect(liveFailureReason("capture stopped")).toBe("capture stopped");
+  });
+
+  it("names a live event that arrived without usable capture times", () => {
+    expect(liveFailureReason("live_timing_invalid")).toBe("capture timing was invalid");
+  });
+
+  it("names the sidecar's own audio failure", () => {
+    expect(liveFailureReason("live_audio_failed")).toBe("live audio failed");
+  });
+
+  it("names a rejected key", () => {
+    expect(liveFailureReason("unauthenticated")).toBe("Claude needs a valid API key");
+  });
+
+  it("names Claude being unreachable, in spec's own words", () => {
+    expect(liveFailureReason("unavailable")).toBe("Claude unavailable");
+  });
+
+  it("names a request that ran past the cap", () => {
+    expect(liveFailureReason("timeout")).toBe("Claude timed out");
+  });
+
+  it("names a plain failed request", () => {
+    expect(liveFailureReason("failed")).toBe("Claude failed to respond");
+  });
+
+  it("falls back to a readable sentence for a code it does not recognise", () => {
+    expect(liveFailureReason("a_future_swift_code")).toBe("something went wrong");
+  });
+});
+
+describe("liveFailureText", () => {
+  it("shows nothing while the state is not failed, even with an error code on the update", () => {
+    // One turn failing sets `error` without failing the session (spec §8's
+    // single retry before the tutor apologises and keeps listening); the
+    // panel says nothing about it until the state itself is `failed`.
+    expect(liveFailureText("listening", "timeout")).toBeUndefined();
+  });
+
+  it("shows nothing once failed if the service never published a reason", () => {
+    expect(liveFailureText("failed", undefined)).toBeUndefined();
+  });
+
+  it("shows the mapped reason once the state is failed", () => {
+    expect(liveFailureText("failed", "capture stopped")).toBe("capture stopped");
+  });
+
+  it("falls back for an unrecognised code while failed", () => {
+    expect(liveFailureText("failed", "a_future_swift_code")).toBe("something went wrong");
+  });
+});
+
+describe("livePanelPaused", () => {
+  it("is paused once the service's own state says so", () => {
+    expect(livePanelPaused("paused")).toBe(true);
+  });
+
+  it("is not paused for any other state", () => {
+    for (const state of ["starting", "preparing_model", "listening", "thinking", "speaking", "failed", "ended"] as const) {
+      expect(livePanelPaused(state)).toBe(false);
+    }
+  });
+});
+
+describe("livePanelShowsPause", () => {
+  it("hides Pause once the session has failed", () => {
+    expect(livePanelShowsPause("failed")).toBe(false);
+  });
+
+  it("shows Pause in every other state", () => {
+    for (const state of ["starting", "preparing_model", "listening", "thinking", "speaking", "paused", "ended"] as const) {
+      expect(livePanelShowsPause(state)).toBe(true);
+    }
   });
 });

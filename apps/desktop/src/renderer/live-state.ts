@@ -15,6 +15,57 @@ export function liveStateLabel(state: LiveState): string {
   return LABELS[state];
 }
 
+/**
+ * The wiring reports a failed turn or a failed session with a code, not a
+ * sentence — `live_timing_invalid` from the sidecar client, the sidecar's own
+ * `live_audio_failed` fallback, and the model transport's `LiveModelErrorCode`s
+ * (`unauthenticated`, `unavailable`, `timeout`, `failed`), alongside
+ * `"capture stopped"`, already spec §8's own words for a sidecar exit. This is
+ * where every one of them is given a short sentence a person can act on. An
+ * unrecognised code — a new one from the Swift side, say — still reads as a
+ * sentence rather than as raw wiring.
+ */
+const FAILURE_REASONS: Record<string, string> = {
+  "capture stopped": "capture stopped",
+  live_timing_invalid: "capture timing was invalid",
+  live_audio_failed: "live audio failed",
+  unauthenticated: "Claude needs a valid API key",
+  unavailable: "Claude unavailable",
+  timeout: "Claude timed out",
+  failed: "Claude failed to respond",
+};
+
+export function liveFailureReason(code: string): string {
+  return FAILURE_REASONS[code] ?? "something went wrong";
+}
+
+/**
+ * What the panel shows for `update.error`: only once the session itself has
+ * failed, and only when the service actually published a reason. A single
+ * turn's failure sets `error` too (spec §8's one retry before the tutor
+ * apologises and keeps listening), but that is not the session failing, so
+ * the panel says nothing about it until the state itself is `failed`.
+ */
+export function liveFailureText(state: LiveState, error: string | undefined): string | undefined {
+  if (state !== "failed" || error === undefined) return undefined;
+  return liveFailureReason(error);
+}
+
+/**
+ * Pause is the service's own state, not a toggle the panel remembers:
+ * Task 14's policy can pause the tutor by itself after repeated failures, and
+ * the button has to agree with that the moment it happens rather than the
+ * moment the panel was last clicked.
+ */
+export function livePanelPaused(state: LiveState): boolean {
+  return state === "paused";
+}
+
+/** Pause has nothing left to do once the session has failed; End Live still does. */
+export function livePanelShowsPause(state: LiveState): boolean {
+  return state !== "failed";
+}
+
 export function liveAvailabilityNote(availability: LiveAvailability): string | undefined {
   if (availability.available) return undefined;
   return availability.reason ?? "Unavailable on this Mac";
