@@ -1,6 +1,7 @@
-import { mkdtemp } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LiveUpdate } from "../shared/contracts.js";
 import {
@@ -45,6 +46,15 @@ class FakeSidecar implements LiveSidecar {
   speechListeners: Array<(event: LiveSpeechSignal) => void> = [];
   stateListeners: Array<(event: LiveStateSignal) => void> = [];
   readonly #held = new Map<HeldCommand, Array<() => void>>();
+  #screenshotsFail = false;
+
+  /**
+   * Makes every later screenshot fail once its path has been handed over, as
+   * a request fails when the sidecar client stops waiting for it.
+   */
+  failScreenshots() {
+    this.#screenshotsFail = true;
+  }
 
   /** Holds back the replies to `command` until `release(command)`. */
   hold(command: HeldCommand) {
@@ -59,6 +69,7 @@ class FakeSidecar implements LiveSidecar {
 
   async screenshot(outputPath: string) {
     this.screenshots.push(outputPath);
+    if (this.#screenshotsFail) throw new Error("The capture sidecar did not answer act_screenshot in time.");
     await this.#reply("screenshot");
     return { path: outputPath };
   }
@@ -337,6 +348,18 @@ describe("LiveAssistService turns", () => {
     expect(harness.updates.at(-1)?.state).toBe("listening");
   });
 
+  it("builds the turn from final segments only", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport });
+
+    harness.emitTranscript("Which field", true);
+    harness.emitTranscript("is the tot", false);
+    harness.emitTranscript("is the total?", true);
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(model.requests[0]?.userText).toBe("Which field is the total?");
+  });
+
   it("re-sends the whole turn when the user carries on before the reply has said anything", async () => {
     const model = heldTransport();
     const harness = await makeHarness({ transport: model.transport });
@@ -463,6 +486,37 @@ describe("LiveAssistService screenshots", () => {
     expect(harness.removedImages).toEqual(harness.sidecar.screenshots);
     expect(model.requests).toHaveLength(0);
     expect(harness.updates.at(-1)).toMatchObject({ state: "listening", sharing: false, error: "failed" });
+  });
+
+  it("removes the screenshot even when taking it fails", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport });
+    harness.sidecar.failScreenshots();
+
+    harness.emitTranscript("Question?", true);
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(harness.sidecar.screenshots).toHaveLength(1);
+    expect(harness.removedImages).toEqual(harness.sidecar.screenshots);
+    expect(model.requests).toHaveLength(0);
+  });
+
+  it("keeps screenshots in a private directory that end() removes, with anything written late", async () => {
+    const harness = await makeHarness({ transport: heldTransport().transport });
+    harness.sidecar.failScreenshots();
+
+    harness.emitTranscript("Question?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    const [late] = harness.sidecar.screenshots;
+    const directory = dirname(late!);
+    expect((await stat(directory)).mode & 0o777).toBe(0o700);
+
+    // The sidecar finishes writing only after the request has failed and the
+    // screenshot's own removal has already run.
+    await writeFile(late!, "late screenshot");
+    await harness.service.end();
+
+    expect(existsSync(directory)).toBe(false);
   });
 
   it("sends nothing to Claude when a pause lands while the screenshot is being taken", async () => {
@@ -598,6 +652,42 @@ describe("LiveAssistService interleavings", () => {
     expect(harness.sidecar.stopSpeakingCount).toBe(1);
     expect(harness.service.state).toBe("ended");
     expect(harness.updates.at(-1)).toMatchObject({ state: "ended", sharing: false });
+  });
+
+  it("takes no screenshot when End lands the instant the turn closes", async () => {
+    const model = heldTransport();
+    const harness = await makeHarness({ transport: model.transport });
+    let ending: Promise<void> | undefined;
+    harness.whenUpdated((update) => {
+      // End lands the instant the panel is told the tutor is thinking.
+      if (update.state === "thinking" && ending === undefined) ending = harness.service.end();
+    });
+
+    harness.emitTranscript("Question?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    await ending;
+
+    expect(harness.sidecar.screenshots).toEqual([]);
+    expect(model.requests).toHaveLength(0);
+    expect(harness.service.state).toBe("ended");
+  });
+
+  it("keeps a newer reply speaking when a late report settles a sentence it already stopped", async () => {
+    const harness = await makeHarness({ transport: transportYielding([{ kind: "text", text: "Answer." }]) });
+    harness.emitTranscript("First question?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    const [stopped] = harness.sidecar.spoken;
+
+    // The user barges in, and the second reply speaks and finishes streaming.
+    harness.emitTranscript("Second question?", true);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(harness.sidecar.spoken).toHaveLength(2);
+
+    harness.emitSpeech(stopped!.utteranceId, "finished");
+    expect(harness.service.state).toBe("speaking");
+
+    harness.emitTranscript("And another thing", false);
+    expect(harness.sidecar.stopSpeakingCount).toBe(2);
   });
 
   it("checks and hands over a sentence in one step, so End pressed at that instant still silences it", async () => {

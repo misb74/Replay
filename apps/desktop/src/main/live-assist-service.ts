@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { unlink } from "node:fs/promises";
+import { chmod, mkdtemp, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LiveState, LiveUpdate } from "../shared/contracts.js";
@@ -117,10 +117,14 @@ interface Reply {
  * 4. `end()` is final and waits for the work. Before its first await it
  *    supersedes the reply, stops speech, detaches from the sidecar, and
  *    publishes `ended`; it resolves only once every reply has unwound. It
- *    must therefore never be awaited from inside a reply.
+ *    must therefore never be awaited from inside a reply. A reply is tracked
+ *    before it is announced, so this holds even for an `end()` called from
+ *    that announcement.
  * 5. A screenshot is removed from disk in a `finally` as soon as it has been
  *    read, so before any request carries it, and whether or not reading it
- *    succeeded.
+ *    succeeded. Every screenshot is written inside one owner-only directory
+ *    made at `start()`, which `end()` removes whole, sweeping any screenshot
+ *    the sidecar wrote after its request had stopped waiting for it.
  */
 export class LiveAssistService {
   readonly #options: LiveAssistOptions &
@@ -141,7 +145,10 @@ export class LiveAssistService {
   readonly #utterances = new Set<string>();
   /** Every reply still running, current or superseded. */
   readonly #running = new Set<Promise<void>>();
+  #starting: Promise<void> | undefined;
   #ending: Promise<void> | undefined;
+  /** The owner-only directory every screenshot is written into, and that `end()` removes. */
+  #screenshotDirectory: string | undefined;
   #detach: Array<() => void> = [];
   #history: LiveHistoryItem[] = [];
 
@@ -167,7 +174,17 @@ export class LiveAssistService {
   }
 
   async start(): Promise<void> {
-    if (this.#started || this.#ended) return;
+    this.#starting ??= this.#start();
+    await this.#starting;
+  }
+
+  async #start(): Promise<void> {
+    if (this.#ended) return;
+    // Recorded as soon as it exists, so that `end()`, which waits for
+    // starting to settle, removes it even when ending arrived meanwhile.
+    this.#screenshotDirectory = await mkdtemp(join(tmpdir(), "replay-live-"));
+    await chmod(this.#screenshotDirectory, 0o700);
+    if (this.#ended) return;
     this.#started = true;
     const { sidecar } = this.#options;
     this.#detach.push(
@@ -199,11 +216,23 @@ export class LiveAssistService {
       const stopping = this.#stopSpeaking();
       for (const detach of this.#detach.splice(0)) detach();
       this.#publish();
-      // The recording stops once this resolves, so ending waits for the stop
-      // and for every reply to unwind, but never fails because one of them did.
-      this.#ending = Promise.allSettled([stopping, ...this.#running]).then(() => undefined);
+      this.#ending = this.#finishEnding(stopping);
     }
     await this.#ending;
+  }
+
+  /**
+   * The recording stops once `end()` resolves, so this waits for the stop, for
+   * starting, and for every reply to unwind, but never fails because one of
+   * them did. Only then does it remove the screenshot directory whole, which
+   * also sweeps a screenshot the sidecar finished writing after its request
+   * had stopped waiting for it.
+   */
+  async #finishEnding(stopping: Promise<void> | undefined): Promise<void> {
+    await Promise.allSettled([stopping, this.#starting, ...this.#running]);
+    if (this.#screenshotDirectory === undefined) return;
+    // Nothing is left to report a failed removal to.
+    await rm(this.#screenshotDirectory, { recursive: true, force: true }).catch(() => undefined);
   }
 
   #onTranscript(event: LiveTranscriptSignal): void {
@@ -246,14 +275,18 @@ export class LiveAssistService {
     this.#turn = "";
     const reply: Reply = { userText, controller: new AbortController(), spoke: false, timedOut: false };
     this.#reply = reply;
-    this.#publish();
-    const running = this.#respond(reply);
+    // The reply is tracked before `thinking` is published but starts only
+    // after, so a control call made from that update both supersedes it before
+    // any screenshot is taken and, if it is `end()`, waits for it.
+    const running = Promise.resolve().then(() => this.#respond(reply));
     this.#running.add(running);
     const forget = () => { this.#running.delete(running); };
     running.then(forget, forget);
+    this.#publish();
   }
 
   async #respond(reply: Reply): Promise<void> {
+    if (!this.#shouldContinue(reply)) return;
     const timeout = setTimeout(() => {
       reply.timedOut = true;
       reply.controller.abort();
@@ -325,7 +358,8 @@ export class LiveAssistService {
   }
 
   async #captureScreenshot(): Promise<{ base64: string }> {
-    const path = join(tmpdir(), `replay-live-${randomUUID()}.png`);
+    if (this.#screenshotDirectory === undefined) throw new Error("The live conversation has not started.");
+    const path = join(this.#screenshotDirectory, `${randomUUID()}.png`);
     try {
       await this.#options.sidecar.screenshot(path);
       return { base64: await this.#options.readImage(path) };
