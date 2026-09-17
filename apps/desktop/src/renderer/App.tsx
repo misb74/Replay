@@ -16,7 +16,7 @@ import type {
   StepView,
   WorkflowView,
 } from "../shared/contracts.js";
-import { liveStateLabel, recordControlState } from "./live-state.js";
+import { liveStatusLabel, recordControlState } from "./live-state.js";
 import { createMockApi } from "./mock-api.js";
 import { activeRecording, buildableRecording, latestUnprocessedRecording } from "./recording-state.js";
 import { editWorkflow, isWorkflowReviewValid, type WorkflowEdit } from "./workflow-state.js";
@@ -80,7 +80,7 @@ export function App() {
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => api.onProcessingUpdate(setProcessing), [api]);
   useEffect(() => api.onRunUpdate(setRun), [api]);
-  useEffect(() => { void api.getLiveAvailability().then(setLiveAvailability); }, [api]);
+  useEffect(() => { void api.getLiveAvailability().then(setLiveAvailability).catch(() => undefined); }, [api]);
   useEffect(() => api.onLiveUpdate(setLiveUpdate), [api]);
 
   const receiveWorkflow = useCallback((workflow: WorkflowView) => {
@@ -107,6 +107,7 @@ export function App() {
           setError("The recording was interrupted before it finished, so Replay will not offer it for building. Please make a new recording.");
         }
       } else {
+        setLiveUpdate(undefined);
         const started = await api.startRecording({ microphone: microphone || live, live });
         setSessions((items) => [started, ...items.filter((item) => item.id !== started.id)]);
       }
@@ -208,6 +209,7 @@ function Sidebar(props: {
   const [live, setLive] = useState(false);
   const controls = recordControlState(props.liveAvailability, live);
   const isRecording = props.recording?.state === "recording";
+  const liveStatus = liveStatusLabel(props.liveUpdate, props.recording?.id);
   return (
     <aside className="sidebar">
       <div className="app-brand"><BrandLockup /></div>
@@ -219,9 +221,7 @@ function Sidebar(props: {
         {isRecording
           ? <>
               <RecordingClock startedAt={props.recording!.startedAt} />
-              {props.liveUpdate && props.liveUpdate.state !== "ended"
-                ? <div className="live-status">Live · {liveStateLabel(props.liveUpdate.state)}</div>
-                : undefined}
+              {liveStatus ? <div className="live-status">{liveStatus}</div> : undefined}
             </>
           : <>
               <label className="mic-toggle">

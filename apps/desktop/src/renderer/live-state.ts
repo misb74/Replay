@@ -1,4 +1,4 @@
-import type { LiveAvailability, LiveState } from "../shared/contracts.js";
+import type { LiveAvailability, LiveState, LiveUpdate } from "../shared/contracts.js";
 
 const LABELS: Record<LiveState, string> = {
   starting: "Starting",
@@ -29,4 +29,11 @@ export function recordControlState(
     note: liveAvailabilityNote(availability),
     narrationLocked: liveChosen,
   };
+}
+
+export function liveStatusLabel(update: LiveUpdate | undefined, recordingId: string | undefined): string | undefined {
+  if (!update || !recordingId) return undefined;
+  if (update.sessionId !== recordingId) return undefined;
+  if (update.state === "ended") return undefined;
+  return `Live · ${liveStateLabel(update.state)}`;
 }
