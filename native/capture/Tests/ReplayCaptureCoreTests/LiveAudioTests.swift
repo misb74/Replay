@@ -48,6 +48,11 @@ private actor FakeRecogniser: SpeechRecognizing {
     private let holdsStart: Bool
     private var startContinuation: CheckedContinuation<Void, Never>?
     private(set) var stopCallCount = 0
+    /// Models whether a real recogniser would currently be running: set
+    /// once `start()` actually completes (after any hold), cleared by
+    /// `stop()`. Lets a test tell "stop() was called" apart from "the
+    /// recogniser is actually stopped".
+    private(set) var running = false
 
     var isHoldingStart: Bool { startContinuation != nil }
 
@@ -64,6 +69,7 @@ private actor FakeRecogniser: SpeechRecognizing {
         }
         if let startError { throw startError }
         self.handler = handler
+        running = true
     }
 
     func releaseStart() {
@@ -73,6 +79,7 @@ private actor FakeRecogniser: SpeechRecognizing {
 
     func stop() async {
         stopCallCount += 1
+        running = false
     }
 
     func emit(_ segment: RecognisedSegment) async {
@@ -102,9 +109,12 @@ private actor FakeSynthesiser: SpeechSynthesizing {
         autoCompletes = value
     }
 
-    /// Makes `stopSpeaking()` suspend after it is entered (so a test can
-    /// observe that it was called before letting it actually resolve
-    /// anything), released by `releaseHeldStop()`.
+    /// Makes the *next* `stopSpeaking()` call suspend after it is entered
+    /// (so a test can observe that it was called before letting it
+    /// actually resolve anything), released by `releaseHeldStop()`. One
+    /// shot, not sticky: a second, later `stopSpeaking()` call (e.g. from
+    /// `stop()` racing a held `setPaused(true)`) proceeds normally rather
+    /// than overwriting the first call's still-held continuation.
     func setHoldStops(_ hold: Bool) {
         holdStops = hold
     }
@@ -127,6 +137,7 @@ private actor FakeSynthesiser: SpeechSynthesizing {
     func stopSpeaking() async {
         stopCallCount += 1
         if holdStops {
+            holdStops = false
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 heldStop = continuation
             }
@@ -171,6 +182,17 @@ private func waitUntil(
         try? await Task.sleep(nanoseconds: 2_000_000)
     }
     return await condition()
+}
+
+/// This process's total CPU time so far, in seconds. Used only to catch a
+/// busy-loop: the bug it targets (`clearDrain()` restarting forever) is
+/// silent in the event log, since the only place `runDrain`'s loop emits
+/// anything is inside a loop body that a spin never reaches.
+private func cpuSeconds() -> Double {
+    var usage = rusage()
+    getrusage(RUSAGE_SELF, &usage)
+    return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec)
+        + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
 }
 
 // MARK: - Original coverage
@@ -551,6 +573,15 @@ private func waitUntil(
 
 // MARK: - stop() waits for the drain to quiesce.
 
+/// Records whether a background `Task` has completed yet. Used instead of
+/// racing a `Task` against a timer: paired with a held collector event, it
+/// turns "did stop() return too early" from something to catch in time into
+/// something that is structurally impossible while the hold is in place.
+private actor CompletionFlag {
+    private(set) var isSet = false
+    func set() { isSet = true }
+}
+
 @Test func stopDoesNotReturnUntilTheInFlightUtteranceHasItsTerminalEvent() async throws {
     let collector = EventCollector()
     let synthesiser = FakeSynthesiser()
@@ -561,12 +592,142 @@ private func waitUntil(
     await coordinator.speak(utteranceId: "A", text: "Alpha")
     #expect(await waitUntil { await synthesiser.isSpeaking })
 
-    await coordinator.stop()
+    // Hold A's terminal event: stop() cannot return until the drain loop
+    // has actually sent it (that send is on the same task stop() awaits),
+    // so holding it makes "stop() has not returned yet" a certainty to
+    // check rather than a race to win against real time. The previous
+    // version of this test raced stop() against nothing and, against an
+    // unfixed coordinator, happened to observe the (wrong) already-returned
+    // state only 989/1000 times.
+    await collector.setGate { $0.utteranceId == "A" && ($0.phase == .finished || $0.phase == .cancelled) }
+    let stopReturned = CompletionFlag()
+    let stopTask = Task {
+        await coordinator.stop()
+        await stopReturned.set()
+    }
+    #expect(await waitUntil { await collector.heldCount == 1 })
 
-    // No drainForTesting(), no sleep: by the time stop() itself returns,
-    // A's terminal event must already be recorded.
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    #expect(await stopReturned.isSet == false, "stop() must not return before A's terminal event has actually been sent")
+
+    await collector.release()
+    await stopTask.value
+
+    #expect(await stopReturned.isSet)
     let phases = await collector.events.filter { $0.utteranceId == "A" }.compactMap(\.phase)
     #expect(phases == [.started, .cancelled])
+}
+
+// MARK: - Important 2 remainder: stop() during start() must leave the
+// recogniser genuinely stopped, not just tell it to stop while it was
+// still starting up.
+
+@Test func stoppingDuringStartLeavesTheRecogniserNotRunning() async throws {
+    let collector = EventCollector()
+    let recogniser = FakeRecogniser(holdsStart: true)
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: FakeSynthesiser(), collector: collector)
+
+    let startTask = Task { try await coordinator.start() }
+    #expect(await waitUntil { await recogniser.isHoldingStart })
+
+    let stopTask = Task { await coordinator.stop() }
+    #expect(await waitUntil { await recogniser.stopCallCount == 1 })
+    await stopTask.value
+    // stop()'s first call to recogniser.stop() happened while start() was
+    // still suspended -- confirm that ordering, since it is the premise of
+    // the bug: a real recogniser has nothing running yet to stop at this
+    // point.
+    #expect(await recogniser.isHoldingStart, "stop() must not itself have unblocked start()")
+
+    await recogniser.releaseStart()
+    try await startTask.value
+
+    #expect(await recogniser.stopCallCount == 2, "recogniser.stop() must be called again once it has actually finished starting")
+    #expect(await recogniser.running == false, "the recogniser must not be left running once both calls have returned")
+}
+
+// MARK: - New Important: a failed start() must not strand queued speech or
+// spin the drain forever trying to redeliver it.
+
+@Test func failedStartCancelsQueuedSpeechAndStopsTheDrainFromSpinning() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let recogniser = FakeRecogniser(startError: SidecarOperationError.captureFailed, holdsStart: true)
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: synthesiser, collector: collector)
+    await synthesiser.setAutoCompletes(false)
+
+    let startTask = Task { try? await coordinator.start() }
+    #expect(await waitUntil { await recogniser.isHoldingStart })
+
+    // speak() has no dependency on start() having already succeeded.
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    await coordinator.speak(utteranceId: "B", text: "Bravo")
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    await recogniser.releaseStart()
+    await startTask.value
+
+    // A was genuinely in flight when start() failed; let it settle so
+    // nothing is left artificially suspended by this test.
+    await synthesiser.finishCurrent()
+    #expect(await waitUntil {
+        await collector.events.contains { $0.utteranceId == "A" && ($0.phase == .finished || $0.phase == .cancelled) }
+    })
+    #expect(await waitUntil {
+        await collector.events.contains { $0.utteranceId == "B" && $0.phase == .cancelled }
+    })
+
+    // Give a spinning clearDrain()/startDrainIfNeeded() cycle a real
+    // chance to show up as CPU burn before measuring an idle window: the
+    // bug is silent in the event log (runDrain's loop body, the only place
+    // it emits anything, never runs while `stopped`), so events alone
+    // cannot distinguish "stopped cleanly" from "still spinning silently".
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    let before = cpuSeconds()
+    try? await Task.sleep(nanoseconds: 300_000_000)
+    let after = cpuSeconds()
+
+    let aPhases = await collector.events.filter { $0.utteranceId == "A" }.compactMap(\.phase)
+    let aTerminals = aPhases.filter { $0 == .finished || $0 == .cancelled }
+    #expect(aTerminals.count == 1, "A must get exactly one terminal event, not be left stranded: \(aPhases)")
+    let bPhases = await collector.events.filter { $0.utteranceId == "B" }.compactMap(\.phase)
+    #expect(bPhases == [.cancelled])
+    #expect(after - before < 0.1, "the drain must not still be spinning: burned \(after - before)s of CPU over a 300ms idle window")
+}
+
+// MARK: - Folded in: no state event may follow stop().
+
+@Test func noStateEventFollowsStop() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let recogniser = FakeRecogniser()
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+    await synthesiser.setAutoCompletes(false)
+
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    await synthesiser.setHoldStops(true)
+    let pauseTask = Task { await coordinator.setPaused(true) }
+    #expect(await waitUntil { await synthesiser.stopCallCount == 1 })
+
+    // stop() runs to completion while setPaused(true) is still stuck
+    // waiting for the synthesiser to acknowledge A's stop (that stop is
+    // now one-shot held, so stop()'s own, unheld stopSpeaking() call is
+    // free to resolve A itself and let stop() finish).
+    await coordinator.stop()
+    let eventCountWhenStopReturned = await collector.events.count
+
+    // Neither of these may add anything: not the still-suspended pause
+    // call, once it resumes, and not this direct call either.
+    await coordinator.setPaused(false)
+    await synthesiser.releaseHeldStop()
+    await pauseTask.value
+
+    let states = await collector.events.compactMap(\.state)
+    #expect(states == [.preparingModel, .listening], "no state event may follow stop(), from the still-suspended pause or the later unpause")
+    #expect(await collector.events.count == eventCountWhenStopReturned, "nothing may be sent once stop() has returned")
 }
 
 // MARK: - Folded-in coverage: refusal paths and the failure reason string.

@@ -32,9 +32,20 @@ public protocol SpeechRecognizing: AnyObject, Sendable {
 public protocol SpeechSynthesizing: AnyObject, Sendable {
     /// Speaks one utterance. Returns true when it played to completion and
     /// false when it was stopped.
+    ///
+    /// The coordinator only ever calls this for one utterance at a time,
+    /// waiting for it to return before calling it again.
     func speak(_ text: String) async -> Bool
     /// Named apart from `SpeechRecognizing.stop()` so one type can conform to
     /// both protocols without one method silently satisfying both.
+    ///
+    /// Requirement this relies on: the coordinator may call this for an
+    /// utterance immediately before calling `speak(_:)` for that same
+    /// utterance, rather than strictly after. Conforming types must still
+    /// apply the stop to that utterance rather than letting the following
+    /// `speak(_:)` call silently proceed as if it had never been
+    /// requested — in particular, `speak(_:)` must not itself clear a stop
+    /// that was already requested for the call it is about to start.
     func stopSpeaking() async
 }
 
@@ -76,31 +87,39 @@ public protocol LiveAudioProviding: AnyObject, Sendable {
 /// Owns the speech queue, the pause gate, and the conversion from host uptime
 /// to capture-relative milliseconds. It knows nothing about audio hardware.
 ///
-/// Guaranteed under actor reentrancy (each point is exercised by a
-/// deterministic interleaving test in `LiveAudioTests.swift`, using fakes
-/// that suspend until released rather than fakes that always run to
-/// completion):
+/// Guaranteed under actor reentrancy, each point exercised by a
+/// deterministic interleaving test in `LiveAudioTests.swift` (fakes that
+/// suspend until released, not fakes that always run to completion):
 ///
 /// 1. Every utterance that is ever queued emits exactly one `started` (or
 ///    none, if it is refused before it is ever dequeued) followed by
 ///    exactly one terminal event, `finished` or `cancelled`. Never zero
-///    terminal events, never two.
+///    terminal events, never two — including when `start()` itself fails
+///    with utterances already queued.
 /// 2. `stopSpeaking()` and `stop()` cancel whichever utterance is actually
-///    in flight at the instant they are called, if any. They never let that
-///    utterance play to completion, and they never land on a later,
-///    unrelated utterance instead.
+///    in flight at the instant they are called, if any, rather than
+///    letting it play to completion. This assumes calls into this actor
+///    are never themselves concurrent with each other from *outside* it —
+///    true because the sidecar awaits each command before reading the
+///    next, so it never has two of this coordinator's methods in flight
+///    at once — and it assumes `SpeechSynthesizing` conformances honour
+///    the ordering requirement documented on `stopSpeaking()`. Given both,
+///    a stop is never left to land on a later, unrelated utterance
+///    instead.
 /// 3. `setPaused(true)` stops an in-flight utterance the same way, and
 ///    cancels everything still queued rather than letting it start.
 /// 4. A state event (`preparingModel`/`listening`/`paused`/`failed`) is
-///    only sent if it is still true at the moment it is actually sent — one
-///    superseded by a concurrent call while this call was suspended is
-///    dropped rather than sent stale.
+///    only sent if it is still true at the moment it is actually sent —
+///    one superseded by a concurrent call while this call was suspended is
+///    dropped rather than sent stale, and none at all follows `stop()`.
 /// 5. `stop()` does not return until the drain loop has fully quiesced:
 ///    every utterance already dequeued has received its terminal event
 ///    before `stop()`'s caller resumes.
 /// 6. Once `start()` has failed, or `stop()` has been called, the
 ///    coordinator permanently refuses new speech: `speak()` emits
-///    `.cancelled` immediately rather than queuing.
+///    `.cancelled` immediately rather than queuing, and a `start()` that
+///    fails or is interrupted by a concurrent `stop()` leaves the
+///    recogniser stopped, not still running.
 ///
 /// Deliberately *not* guaranteed: transcripts are not gated by speech.
 /// `ingest(_:)` only checks `paused`/`stopped`, never whether an utterance
@@ -125,14 +144,27 @@ public protocol LiveAudioProviding: AnyObject, Sendable {
 /// could delay that call past the point where a later utterance has
 /// already started on the synthesiser.
 ///
-/// Mechanism for 4: the branch of `setPaused(_:)` that follows an `await`
-/// re-reads `self.paused` and compares it with the value this call was
-/// asked to set, sending the event only if nothing else has since changed
-/// it. `start()` does the same for `listening` against `paused`/`stopped`.
+/// Mechanism for 4: every branch of `setPaused(_:)` that follows an `await`
+/// re-reads `self.paused`/`stopped` and compares against the value this
+/// call was asked to set, sending the event only if nothing else has since
+/// changed it or stopped the coordinator entirely. `start()` does the same
+/// for `listening` against `paused`/`stopped`.
+///
+/// Mechanism for 1 and 6's queued-utterance case: the `start()` failure
+/// path sets `stopped = true` and calls `stopSpeaking()` — not just the
+/// flag — before sending `failed`, so anything already queued (`speak()`
+/// has no dependency on `start()` having succeeded first) is cancelled
+/// rather than left stranded. `clearDrain()` also refuses to restart the
+/// drain once `stopped`, which would otherwise be a second way for the
+/// same utterances to be lost: without it, a queue left non-empty while
+/// stopped — which should not happen given the above, but this is the
+/// backstop — would have made `runDrain`'s own `!stopped` loop guard and
+/// `clearDrain`'s restart fight forever, each exiting and immediately
+/// re-triggering the other.
 ///
 /// As with `queue`, every read of `generation`/`inFlightUtteranceId`/
 /// `paused`/`stopped` used to decide whether to act is paired with its
-/// mutation in the same award-free stretch — no `await` separates a check
+/// mutation in the same await-free stretch — no `await` separates a check
 /// from the state it is checking.
 public actor LiveAudioCoordinator: LiveAudioControlling {
     private struct QueuedUtterance {
@@ -184,8 +216,15 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
             }
         } catch {
             // A failed start leaves the coordinator permanently unusable:
-            // `speak()`'s `!stopped` guard now refuses everything.
+            // `speak()`'s `!stopped` guard now refuses everything. Also
+            // cancel anything already queued (speak() has no "start()
+            // succeeded first" requirement, so utterances can be queued
+            // while this call is still suspended above): runDrain's own
+            // loop condition also checks `!stopped`, so left uncancelled
+            // they could never be drained, and clearDrain would otherwise
+            // restart the drain forever trying.
             stopped = true
+            await stopSpeaking()
             await emit(.init(
                 event: .state,
                 sessionId: sessionId,
@@ -196,8 +235,17 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
         }
         // `stop()`/`setPaused(true)` may have already run while the await
         // above was suspended — a real recogniser can still be mid-start
-        // when that happens. Only claim listening if that is still true.
-        guard !stopped, !paused else { return }
+        // when that happens.
+        guard !stopped else {
+            // stop() ran concurrently and already called recogniser.stop()
+            // once, but that call landed while recogniser.start() was
+            // still suspended, before a real recogniser would have had
+            // anything running to stop. Tell it again now that it
+            // genuinely has started.
+            await recogniser.stop()
+            return
+        }
+        guard !paused else { return }
         await emit(.init(event: .state, sessionId: sessionId, state: .listening))
     }
 
@@ -236,19 +284,25 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
     }
 
     public func setPaused(_ paused: Bool) async {
-        guard self.paused != paused else { return }
+        guard !stopped, self.paused != paused else { return }
         self.paused = paused
         if paused {
             await stopSpeaking()
-            // A concurrent setPaused(false) (or another setPaused(true))
+            // A concurrent setPaused(false)/setPaused(true), or stop(),
             // may have run while the await above was suspended. Only
-            // report paused if that is still the current, intended state.
-            guard self.paused == paused else { return }
+            // report paused if that is still the current, intended state,
+            // and never once stopped: stop() itself sends no state event,
+            // so nothing may follow it.
+            guard !stopped, self.paused == paused else { return }
             await emit(.init(event: .state, sessionId: sessionId, state: .paused))
         } else {
             // No await precedes this: the assignment above and this emit
-            // are the same synchronous stretch, so there is nothing to
-            // re-check.
+            // are the same synchronous stretch, so the only thing that
+            // could have changed `stopped` is already covered by the guard
+            // at the top of this call. Re-checked anyway, so that "once
+            // stopped, no state event is sent" holds at every emit site on
+            // its own, not just by tracing back through the whole call.
+            guard !stopped else { return }
             await emit(.init(event: .state, sessionId: sessionId, state: .listening))
         }
     }
@@ -297,7 +351,13 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
 
     private func clearDrain() {
         drain = nil
-        if !queue.isEmpty { startDrainIfNeeded() }
+        // Never restart once stopped: runDrain's own loop condition also
+        // checks `!stopped`, so if something ever left the queue
+        // non-empty while stopped (defence in depth — stopSpeaking() in
+        // stop()/the failure path above should already have emptied it),
+        // restarting here would just recreate a task that exits
+        // immediately and asks to be restarted again, forever.
+        if !queue.isEmpty, !stopped { startDrainIfNeeded() }
     }
 
     private func runDrain() async {
