@@ -125,9 +125,12 @@ public protocol LiveAudioProviding: AnyObject, Sendable {
     ///   returns `.preparing` without waiting. There is at most one
     ///   installation per locale at a time, however often `prepare` is
     ///   called; a later call joins the running one.
-    /// - It throws when the locale is unsupported, or when the most recent
-    ///   installation failed. A failure is reported once; the call after
-    ///   that starts a fresh installation.
+    /// - It throws when the locale is unsupported; when the most recent
+    ///   installation failed, which is reported once, the call after that
+    ///   starting a fresh installation; and when installing has repeatedly
+    ///   found nothing to install and yet left the model uninstalled,
+    ///   which no further attempt could change and which would otherwise
+    ///   answer `.preparing` for the rest of the session.
     func prepare(locale: String?) async throws -> LivePreparation
 
     func makeSession(

@@ -155,3 +155,98 @@ private func checkConversionRun(
     let loudest = samples(of: converted).map(abs).max() ?? 0
     #expect(loudest > 0.1, "a downmix must carry channel 1's signal, not just read channel 0: peak was \(loudest)")
 }
+
+// MARK: - Between one utterance and the next
+
+/// `UtteranceAudioConverter` is what the synthesiser's playback path runs
+/// every buffer through. It holds an `AVAudioConverter` and nothing else —
+/// no engine, no synthesiser, no device — so the rule it exists to enforce
+/// can be checked here directly.
+///
+/// The shape is the real one: what `AVSpeechSynthesizer` produces, into
+/// what the main mixer wants.
+private let synthesisFormat = AVAudioFormat(standardFormatWithSampleRate: 22_050, channels: 1)
+private let mixerFormat = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)
+private let utteranceBufferFrames: AVAudioFrameCount = 4_096
+private let buffersPerUtterance = 8
+/// Frames of filter tail a resampler emits past the arithmetic count once
+/// it is told its stream has ended. Measured at 69 for this shape.
+private let allowedTailFrames = 512
+
+private func makeTone(_ format: AVAudioFormat, frames: AVAudioFrameCount, amplitude: Float) -> AVAudioPCMBuffer? {
+    guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
+    buffer.frameLength = frames
+    guard let channels = buffer.floatChannelData else { return nil }
+    for channel in 0..<Int(format.channelCount) {
+        for frame in 0..<Int(frames) {
+            channels[channel][frame] = amplitude
+        }
+    }
+    return buffer
+}
+
+/// How many frames at the head of `buffer` are audible — that is, how much
+/// of a previous utterance came through into a silent one.
+private func audibleLeadingFrames(of buffer: AVAudioPCMBuffer) -> Int {
+    guard let channels = buffer.floatChannelData else { return 0 }
+    let samples = UnsafeBufferPointer(start: channels[0], count: Int(buffer.frameLength))
+    return samples.prefix { abs($0) > 0.2 }.count
+}
+
+@Test func anUtteranceKeepsItsOwnTailAndLeavesNoneOfItForTheNext() throws {
+    let source = try #require(synthesisFormat)
+    let target = try #require(mixerFormat)
+    let converter = UtteranceAudioConverter(renderFormat: target)
+    let loud = try #require(makeTone(source, frames: utteranceBufferFrames, amplitude: 1))
+    let silent = try #require(makeTone(source, frames: utteranceBufferFrames, amplitude: 0))
+
+    converter.beginUtterance()
+    var spoken = 0
+    for _ in 0..<buffersPerUtterance {
+        spoken += Int(converter.convert(loud)?.frameLength ?? 0)
+    }
+    spoken += Int(converter.finishUtterance()?.frameLength ?? 0)
+
+    let ideal = Int((Double(utteranceBufferFrames) * Double(buffersPerUtterance)
+        * target.sampleRate / source.sampleRate).rounded())
+    #expect(
+        ideal - spoken <= allowedTailFrames,
+        "an utterance must not end with its last fragment still inside the converter (emitted \(spoken) of \(ideal))"
+    )
+    #expect(spoken - ideal <= allowedTailFrames, "and must not gain audio either (emitted \(spoken) of \(ideal))")
+
+    // The next utterance is silent, so anything audible in it can only have
+    // come from the one before.
+    converter.beginUtterance()
+    let next = try #require(converter.convert(silent))
+    #expect(
+        audibleLeadingFrames(of: next) == 0,
+        "the next utterance began with \(audibleLeadingFrames(of: next)) frames of the previous one's audio"
+    )
+}
+
+/// The barge-in case, and the one that matters most: an utterance the user
+/// interrupted is never finished, so nothing flushes it. Whatever it left
+/// inside the converter must be discarded when the reply registers, not
+/// played at the head of the reply.
+@Test func anUtteranceStoppedPartWayLeavesNothingForTheNext() throws {
+    let source = try #require(synthesisFormat)
+    let target = try #require(mixerFormat)
+    let converter = UtteranceAudioConverter(renderFormat: target)
+    let loud = try #require(makeTone(source, frames: utteranceBufferFrames, amplitude: 1))
+    let silent = try #require(makeTone(source, frames: utteranceBufferFrames, amplitude: 0))
+
+    converter.beginUtterance()
+    for _ in 0..<buffersPerUtterance {
+        _ = converter.convert(loud)
+    }
+    // No `finishUtterance()`: the user spoke over it.
+
+    converter.beginUtterance()
+    let reply = try #require(converter.convert(silent))
+
+    #expect(
+        audibleLeadingFrames(of: reply) == 0,
+        "the reply began with \(audibleLeadingFrames(of: reply)) frames of the utterance that was stopped"
+    )
+}

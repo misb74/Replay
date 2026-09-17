@@ -296,11 +296,14 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
 /// Two disciplines, deliberately separate:
 ///
 /// - `lock` guards the bookkeeping, and **no AVFoundation call is ever made
-///   while it is held**. `player.stop()` completes every buffer it
-///   discards, and those completions reach `didPlayBuffer` on the node's
-///   own thread, which takes this lock — so holding it across a node call
-///   would be the two halves of an ordering cycle between a lock this code
-///   owns and one it does not.
+///   while it is held** — only references are read out of it, including
+///   the converter's. `player.stop()` completes every buffer it discards,
+///   and those completions reach `didPlayBuffer` on the node's own thread,
+///   which takes this lock, so holding it across a node call would be the
+///   two halves of an ordering cycle between a lock this code owns and one
+///   it does not. (`UtteranceAudioConverter` does hold its own lock across
+///   `AVAudioConverter` calls, which is a different matter: a converter is
+///   not a node and calls nothing back into this object.)
 /// - `playerQueue` owns every `AVAudioPlayerNode` call, so they happen in
 ///   one known order on one known thread. Each scheduling decision is taken
 ///   on that queue, immediately before the buffer is handed over, which is
@@ -335,8 +338,10 @@ final class SpeechPlayback: @unchecked Sendable {
     /// node with no running engine behind it.
     private var renderFormat: AVAudioFormat?
     private var engineProbe: EngineRunningProbe?
-    private var converter: AVAudioConverter?
-    private var converterSourceFormat: AVAudioFormat?
+    /// Reused across utterances, but told where each one begins and ends —
+    /// see `UtteranceAudioConverter` for why that is load-bearing. Only the
+    /// reference is read under `lock`; its own calls are made outside.
+    private var utteranceConverter: UtteranceAudioConverter?
     private var utterance: Utterance?
     /// Ids a stop arrived for while they were not playing: either the stop
     /// overtook its own `speak`, or that `speak` had already returned.
@@ -344,9 +349,11 @@ final class SpeechPlayback: @unchecked Sendable {
     private var closed = false
 
     fileprivate func prepare(renderFormat: AVAudioFormat, engineProbe: EngineRunningProbe) {
+        let converter = UtteranceAudioConverter(renderFormat: renderFormat)
         lock.replayWithLock {
             self.renderFormat = renderFormat
             self.engineProbe = engineProbe
+            self.utteranceConverter = converter
         }
     }
 
@@ -370,8 +377,14 @@ final class SpeechPlayback: @unchecked Sendable {
         stoppedIds.removeAll()
         utterance = Utterance(id: utteranceId)
         let probe = engineProbe
+        let converter = utteranceConverter
         lock.unlock()
 
+        // Outside the lock, like every other AVFoundation call here.
+        // Discards anything a previous utterance left inside the converter
+        // — including, deliberately, the tail of one the user barged in
+        // on, which must not prefix this reply.
+        converter?.beginUtterance()
         playerQueue.async { [self] in
             // Re-checked here rather than only at the call site: the engine
             // can stop itself in between, and `play()` on a stopped engine
@@ -451,8 +464,7 @@ final class SpeechPlayback: @unchecked Sendable {
             continuation = current.continuation
             utterance = continuation == nil ? current : nil
         }
-        converter = nil
-        converterSourceFormat = nil
+        utteranceConverter = nil
         renderFormat = nil
         engineProbe = nil
         lock.unlock()
@@ -472,44 +484,64 @@ final class SpeechPlayback: @unchecked Sendable {
     private func receive(_ buffer: AVAudioBuffer, for utteranceId: String) {
         guard let pcm = buffer as? AVAudioPCMBuffer else { return }
         guard pcm.frameLength > 0 else {
-            markSynthesisFinished(for: utteranceId)
+            finishSynthesis(for: utteranceId)
             return
         }
-        let prepared: (converter: AVAudioConverter, format: AVAudioFormat)? = lock.replayWithLock {
-            guard utterance?.id == utteranceId,
-                  utterance?.outcome == nil,
-                  let renderFormat else { return nil }
-            if converterSourceFormat != pcm.format {
-                converter = AVAudioConverter(from: pcm.format, to: renderFormat)
-                converterSourceFormat = converter == nil ? nil : pcm.format
-            }
-            guard let converter else { return nil }
-            return (converter, renderFormat)
-        }
-        guard let prepared,
-              case let .success(rendered) = convertAudioBuffer(pcm, using: prepared.converter, to: prepared.format),
-              rendered.frameLength > 0 else { return }
+        // Only the reference is taken under the lock; the conversion itself
+        // happens outside it, and the converter guards its own state.
+        guard let converter = currentConverter(for: utteranceId),
+              let rendered = converter.convert(pcm) else { return }
         let handoff = BufferHandoff(rendered)
         playerQueue.async { [self] in
             guard let ready = handoff.take() else { return }
-            // Decided here, on the queue that owns the node, rather than
-            // before the hop: a stop that lands in between has already set
-            // `outcome`, so this refuses instead of scheduling onto a node
-            // that has just been flushed. Counted before it is handed over,
-            // so a completion that fires at once cannot overtake its own
-            // buffer. The lock is released before the node is touched.
-            let accepted: Bool = lock.replayWithLock {
-                guard utterance?.id == utteranceId, utterance?.outcome == nil else { return false }
-                utterance?.scheduledBuffers += 1
-                return true
+            schedule(ready, for: utteranceId)
+        }
+    }
+
+    /// Synthesis has produced its last buffer. Whatever the converter is
+    /// still holding is this utterance's own tail — about 35ms of it — so
+    /// it is converted and scheduled *before* the utterance is allowed to
+    /// settle. Both steps go through `playerQueue` in that order, because
+    /// an utterance that settled first would refuse its own tail.
+    private func finishSynthesis(for utteranceId: String) {
+        let tail = currentConverter(for: utteranceId)?.finishUtterance()
+        let handoff = tail.map(BufferHandoff.init)
+        playerQueue.async { [self] in
+            if let ready = handoff?.take() {
+                schedule(ready, for: utteranceId)
             }
-            guard accepted else { return }
-            // An utterance has finished playing when its last buffer's
-            // `.dataPlayedBack` completion fires: the only signal that the
-            // speaker, rather than just the synthesiser, is done with it.
-            player.scheduleBuffer(ready, completionCallbackType: .dataPlayedBack) { @Sendable _ in
-                self.didPlayBuffer(for: utteranceId)
-            }
+            markSynthesisFinished(for: utteranceId)
+        }
+    }
+
+    /// The converter, but only while `utteranceId` is still the utterance
+    /// being spoken: a stopped utterance's synthesis can keep calling back,
+    /// and none of it should reach the speaker.
+    private func currentConverter(for utteranceId: String) -> UtteranceAudioConverter? {
+        lock.replayWithLock {
+            guard utterance?.id == utteranceId, utterance?.outcome == nil else { return nil }
+            return utteranceConverter
+        }
+    }
+
+    /// On `playerQueue`. Counted before it is handed over, so a completion
+    /// that fires at once cannot overtake its own buffer, and refused
+    /// outright if a stop has landed since — a stop sets `outcome` under
+    /// the lock before flushing the node, so this cannot schedule onto a
+    /// node that has just been flushed. The lock is released before the
+    /// node is touched.
+    private func schedule(_ buffer: AVAudioPCMBuffer, for utteranceId: String) {
+        let accepted: Bool = lock.replayWithLock {
+            guard utterance?.id == utteranceId, utterance?.outcome == nil else { return false }
+            utterance?.scheduledBuffers += 1
+            return true
+        }
+        guard accepted else { return }
+        // An utterance has finished playing when its last buffer's
+        // `.dataPlayedBack` completion fires: the only signal that the
+        // speaker, rather than just the synthesiser, is done with it.
+        player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { @Sendable _ in
+            self.didPlayBuffer(for: utteranceId)
         }
     }
 
@@ -690,10 +722,16 @@ final class MicrophoneTap: @unchecked Sendable {
     /// No more audio for the analyser. Called before the analyser is asked
     /// to finish, so it can complete through the end of its input.
     func finishAnalyzerInput() {
-        let continuation = lock.replayWithLock { () -> AsyncStream<AnalyzerInput>.Continuation? in
-            let taken = analyzerInput
-            analyzerInput = nil
-            return taken
+        lock.lock()
+        // At most a frame or two on this path, unlike the synthesiser's —
+        // but it is the session's last audio, and the converter will not
+        // give it up on its own.
+        let tail = flushAudioConverter(analyzerConverter, to: analyzerFormat)
+        let continuation = analyzerInput
+        analyzerInput = nil
+        lock.unlock()
+        if let tail {
+            continuation?.yield(AnalyzerInput(buffer: tail))
         }
         continuation?.finish()
     }
@@ -701,6 +739,13 @@ final class MicrophoneTap: @unchecked Sendable {
     /// Synchronous, so everything already queued is written before the file
     /// is released — which is what writes its trailer and closes it.
     func closeNarration() {
+        let tail = lock.replayWithLock { flushAudioConverter(fileConverter, to: fileFormat) }
+        if let tail {
+            let handoff = BufferHandoff(tail)
+            narrationQueue.async { [self] in
+                if let ready = handoff.take() { write(ready) }
+            }
+        }
         narrationQueue.sync { [self] in file = nil }
     }
 
@@ -727,7 +772,11 @@ final class MicrophoneTap: @unchecked Sendable {
     }
 
     private func writeNarration(_ buffer: AVAudioPCMBuffer) {
-        switch convertAudioBuffer(buffer, using: fileConverter, to: fileFormat) {
+        // Under the lock because teardown flushes this same converter, and
+        // `removeTap` does not promise that no callback is still in flight.
+        // An `AVAudioConverter` is not a node and calls nothing back into
+        // this object, so there is no ordering hazard in holding it here.
+        switch lock.replayWithLock({ convertAudioBuffer(buffer, using: fileConverter, to: fileFormat) }) {
         case let .success(converted):
             guard converted.frameLength > 0 else { return }
             let handoff = BufferHandoff(converted)
@@ -741,7 +790,8 @@ final class MicrophoneTap: @unchecked Sendable {
     }
 
     private func feedAnalyzer(_ buffer: AVAudioPCMBuffer) {
-        switch convertAudioBuffer(buffer, using: analyzerConverter, to: analyzerFormat) {
+        // Under the lock, for the same reason as `writeNarration`.
+        switch lock.replayWithLock({ convertAudioBuffer(buffer, using: analyzerConverter, to: analyzerFormat) }) {
         case let .success(converted):
             guard converted.frameLength > 0 else { return }
             // No `bufferStartTime`: the analyser then takes each buffer as
@@ -835,18 +885,21 @@ private final class BufferHandoff: @unchecked Sendable {
     }
 }
 
-/// Headroom beyond the arithmetic frame count, so the converter is never
-/// the one running out of room.
+/// Headroom on a converted buffer, so one conversion is never capped by
+/// the room it was given.
 ///
-/// `AVAudioConverter` works in fixed internal blocks — measured at 4096
-/// output frames on this hardware, for both a channel downmix and a 3:1
-/// resample — and emits whole blocks rather than matching its output to the
-/// buffer it was just given. Any leftover is held and comes out with a
-/// later call, so an output buffer sized to the arithmetic count alone caps
-/// every call short and leaves a backlog that never clears. With this much
-/// headroom the backlog is always emptied, and the frames out match the
-/// frames in exactly over a run of buffers, which is what the analyser's
-/// contiguous timeline and the narration file's duration both rest on.
+/// `AVAudioConverter` emits in fixed internal blocks — measured at 4096
+/// output frames — rather than matching its output to the buffer it was
+/// just handed, so a single call can legitimately want to emit more frames
+/// than that buffer alone accounts for.
+///
+/// This constant is deliberately *not* what makes the frames out match the
+/// frames in: that is the input block supplying its buffer exactly once. A
+/// larger margin is not more conservative, and on a shape whose rates do
+/// not divide evenly a larger one leaves a slightly bigger residue than a
+/// small one. It only stops a call being truncated, and gives the
+/// end-of-stream flush below somewhere to put whatever is still held, which
+/// cannot be more than one such block.
 private let conversionMarginFrames: AVAudioFrameCount = 4_096
 
 /// Converts one buffer into `format`. The narration file and the analyser
@@ -883,6 +936,94 @@ func convertAudioBuffer(
         return .failure(error ?? SidecarOperationError.captureFailed)
     @unknown default:
         return .failure(error ?? SidecarOperationError.captureFailed)
+    }
+}
+
+/// Converts whatever `converter` is still holding, by telling it the stream
+/// has ended.
+///
+/// `AVAudioConverter.h` is explicit that this is the only way to get it
+/// out: input that could not be turned into a whole output block "may be
+/// converted to output only if/when more input is provided or the
+/// end-of-stream is indicated". Without this an audio stream simply loses
+/// its last fragment. Nil when nothing was held.
+func flushAudioConverter(
+    _ converter: AVAudioConverter,
+    to format: AVAudioFormat
+) -> AVAudioPCMBuffer? {
+    guard let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: conversionMarginFrames) else {
+        return nil
+    }
+    var error: NSError?
+    _ = converter.convert(to: output, error: &error) { _, status in
+        status.pointee = .endOfStream
+        return nil
+    }
+    guard error == nil, output.frameLength > 0 else { return nil }
+    return output
+}
+
+/// The synthesiser's converter, reused across utterances — the voice and
+/// the render format do not change — but told where each one begins and
+/// ends.
+///
+/// That telling is load-bearing. A converter holds input it could not turn
+/// into a whole output block, so left to itself it ends every utterance
+/// still holding a fragment of it, measured at about 35ms at the
+/// synthesiser's own rate, and hands that fragment to whatever is converted
+/// next, at full volume. The audible result is that each sentence is
+/// clipped and the next one opens with the clipping — worst exactly where
+/// it is most noticeable, since barge-in would put the words the user
+/// interrupted at the head of the reply.
+///
+/// Its own lock, because a stopped utterance's synthesis can still be
+/// delivering buffers while the next utterance is already being converted.
+final class UtteranceAudioConverter: @unchecked Sendable {
+    private let renderFormat: AVAudioFormat
+    private let lock = NSLock()
+    private var converter: AVAudioConverter?
+    private var sourceFormat: AVAudioFormat?
+
+    init(renderFormat: AVAudioFormat) {
+        self.renderFormat = renderFormat
+    }
+
+    /// A new utterance is about to be converted. Anything a previous one
+    /// left behind is discarded rather than carried into it — including,
+    /// deliberately, the tail of an utterance the user barged in on, which
+    /// was stopped precisely so that it would not be heard.
+    func beginUtterance() {
+        lock.replayWithLock { converter?.reset() }
+    }
+
+    /// Converts one of the synthesiser's buffers into what the mixer wants.
+    func convert(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+        if converter == nil || sourceFormat != source.format {
+            let built = AVAudioConverter(from: source.format, to: renderFormat)
+            // As on both tap converters: no priming, so nothing is shifted
+            // into a later buffer.
+            built?.primeMethod = .none
+            converter = built
+            sourceFormat = built == nil ? nil : source.format
+        }
+        guard let converter,
+              case let .success(output) = convertAudioBuffer(source, using: converter, to: renderFormat),
+              output.frameLength > 0 else { return nil }
+        return output
+    }
+
+    /// Whatever is still held now that synthesis has ended: this
+    /// utterance's own last fragment, which would otherwise be dropped.
+    /// The converter is reset afterwards, because it has now been told its
+    /// stream ended and a new one may not follow on from that.
+    func finishUtterance() -> AVAudioPCMBuffer? {
+        lock.replayWithLock {
+            guard let converter else { return nil }
+            defer { converter.reset() }
+            return flushAudioConverter(converter, to: renderFormat)
+        }
     }
 }
 
