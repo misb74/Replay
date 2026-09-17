@@ -47,15 +47,23 @@ export class LiveEventsTail {
 
   constructor(private readonly path: string) {}
 
-  /** Every action appended to the log since the previous call to `read`. */
+  /**
+   * Every action appended to the log since the previous call to `read`.
+   * Resolves only once it has looked at the log, or found that the log does
+   * not exist yet, and rejects if the log cannot be opened for any other
+   * reason, or read, so that a caller never mistakes a read that could not
+   * look for one that found nothing new.
+   */
   async read(): Promise<ObservedAction[]> {
     let handle: FileHandle;
     try {
       handle = await open(this.path, "r");
-    } catch {
-      // Recording may not have started yet, or the session directory has
-      // not been created. Either way there is nothing new to report.
-      return [];
+    } catch (cause) {
+      // Only a log that does not exist yet has nothing new to report: the
+      // recorder creates it once, with the session, and never replaces it.
+      // Any other failure to open it, such as EMFILE or EIO, is passed on.
+      if ((cause as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return [];
+      throw cause;
     }
     try {
       const stats = await handle.stat();

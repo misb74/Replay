@@ -205,11 +205,14 @@ type Reply = Answer | Check;
  * The action's own `timestampMs` is not used. It counts from the recording's
  * capture origin on the sidecar's uptime clock, which the service cannot
  * read, and which stops while the Mac sleeps. The reads of the event log place
- * each action instead. A read returns every action whose line was complete in
- * the log when it looked, and the log yields each action once. So an action a
- * read returns was not yet complete when the last successful read before it
- * began, and was taken after that moment, less the time the recorder took to
- * write it. `notBefore` is that moment.
+ * each action instead. `LiveEventsTail.read` resolves only once it has looked
+ * at the log, or found that the log does not exist yet, and it rejects if it
+ * could not look. A read that resolves returns every action whose line was
+ * complete in the log when it looked, and the log yields each action once. So
+ * an action a read returns was not yet complete when the last successful read
+ * before it began, and was taken after that moment, less the time the
+ * recorder took to write it. `notBefore` is that moment. A read that rejects
+ * moves nothing.
  *
  * Error bound: the action can have been taken before `notBefore` by at most
  * the recorder's delay from the input event to a complete line in the log (an
@@ -408,6 +411,8 @@ export class LiveAssistService {
       sidecar.onState((event) => this.#onSidecarState(event)),
     );
     this.#pollTimer = setInterval(() => this.#considerAsking(), PROACTIVE_POLL_MS);
+    // The poll must never keep the process alive by itself; `end()` stops it.
+    this.#pollTimer.unref?.();
     this.#publish();
   }
 

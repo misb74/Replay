@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile, appendFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -101,6 +101,27 @@ describe("LiveEventsTail", () => {
     const directory = await mkdtemp(join(tmpdir(), "replay-tail-missing-"));
     const tail = new LiveEventsTail(join(directory, "events.jsonl"));
     expect(await tail.read()).toEqual([]);
+  });
+
+  it("rejects when the log cannot be opened for any other reason, and loses no action by it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-tail-unopenable-"));
+    const session = join(root, "session");
+    await mkdir(session);
+    const path = join(session, "events.jsonl");
+    await writeFile(path, clickLine("event-1", "Approve invoice"));
+    const tail = new LiveEventsTail(path);
+
+    // A regular file where the session directory was makes opening the log
+    // fail with ENOTDIR, standing in for a passing EMFILE or EIO.
+    await rename(session, `${session}-aside`);
+    await writeFile(session, "");
+    await expect(tail.read()).rejects.toMatchObject({ code: "ENOTDIR" });
+
+    await rm(session);
+    await rename(`${session}-aside`, session);
+    expect((await tail.read()).map((action) => action.description)).toEqual([
+      'clicked "Approve invoice" in Northstar Ledger — Invoice review',
+    ]);
   });
 
   it("describeActions returns only the last `limit` descriptions, in order, or all of them if there are fewer", async () => {

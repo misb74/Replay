@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,7 +16,7 @@ import {
   type LiveStateSignal,
   type LiveTranscriptSignal,
 } from "./live-assist-service.js";
-import type { ObservedAction } from "./live-events-tail.js";
+import { LiveEventsTail, type ObservedAction } from "./live-events-tail.js";
 import {
   LiveModelError,
   type LiveCheckRequest,
@@ -1351,6 +1351,19 @@ describe("speaking first", () => {
     ]);
   });
 
+  it("never keeps the process alive with its poll", async () => {
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+    try {
+      await makeHarness();
+      const poll = setIntervalSpy.mock.calls.findIndex(([, delay]) => delay === 5_000);
+
+      expect(poll).not.toBe(-1);
+      expect((setIntervalSpy.mock.results[poll]?.value as NodeJS.Timeout).hasRef()).toBe(false);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("reports a check that fails, and says nothing", async () => {
     const harness = await makeHarness({
       transport: checkingTransport(() => { throw new LiveModelError("unavailable"); }).transport,
@@ -1596,6 +1609,62 @@ describe("what the tutor may ask about", () => {
     await harness.at(200_000);
 
     expect(checks).toHaveLength(0);
+  });
+
+  it("never asks about an action taken while paused when the resume's read could not open the log", async () => {
+    const root = await mkdtemp(join(tmpdir(), "replay-live-log-"));
+    const session = join(root, "session");
+    await mkdir(session);
+    const path = join(session, "events.jsonl");
+    await writeFile(path, "");
+    // The real tail, since what matters is how it reports a log it could not
+    // open. Fake timers cannot wait for its file reads, so the test waits for
+    // every read under way before the clock moves on.
+    const tail = new LiveEventsTail(path);
+    const underWay: Array<Promise<unknown>> = [];
+    const { transport, checks } = checkingTransport(() => ({ ask: true, question: "Why?" }));
+    const harness = await makeHarness({
+      transport,
+      events: { read: () => { const read = tail.read(); underWay.push(read); return read; } },
+    });
+    const readsDone = async () => {
+      while (underWay.length > 0) await Promise.allSettled(underWay.splice(0));
+      await harness.settle();
+    };
+
+    await harness.at(20_000);
+    await readsDone();
+    await harness.service.setPaused(true);
+    await harness.at(30_000);
+    await appendFile(path, `${JSON.stringify({
+      schemaVersion: 1,
+      id: "event-1",
+      sessionId: "session-1",
+      timestampMs: 30_000,
+      type: "click",
+      target: { role: "AXButton", label: "Flag for follow-up", windowTitle: "Northstar Ledger" },
+    })}\n`);
+
+    // A regular file where the session directory was makes the resume's read
+    // fail to open the log, as a passing EMFILE or EIO would.
+    await rename(session, `${session}-aside`);
+    await writeFile(session, "");
+    await harness.at(40_000);
+    await harness.service.setPaused(false);
+    await readsDone();
+    await rm(session);
+    await rename(`${session}-aside`, session);
+
+    // The next read returns the click; the first chance to check is at 85 s.
+    await harness.at(45_000);
+    await readsDone();
+    await harness.at(85_000);
+    await readsDone();
+    await harness.at(90_000);
+    await readsDone();
+
+    expect(checks).toHaveLength(0);
+    expect(harness.sidecar.spoken).toEqual([]);
   });
 });
 
