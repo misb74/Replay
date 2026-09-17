@@ -4,167 +4,6 @@ import Foundation
 import ReplayCaptureCore
 import Speech
 
-/// Returns a provider on systems with on-device streaming speech, and nil
-/// elsewhere. The sidecar turns nil into an `unsupported` error.
-///
-/// Nothing here touches audio hardware. The provider only holds the state
-/// that tracks speech-model installation; the microphone is not opened, and
-/// no sound is produced, until `makeSession` builds a live session.
-public func makeLiveAudioProvider() -> LiveAudioProviding? {
-    if #available(macOS 26, *) {
-        return MacLiveAudioProvider()
-    }
-    return nil
-}
-
-// MARK: - Provider
-
-/// Owns the speech model's installation state, and builds one live session
-/// per recording.
-@available(macOS 26, *)
-final class MacLiveAudioProvider: LiveAudioProviding, @unchecked Sendable {
-    private struct ResolvedModel {
-        let locale: Locale
-        let transcriber: SpeechTranscriber
-    }
-
-    /// At most one installation per resolved locale, plus the failure an
-    /// installation left behind if it threw. Guarded by a lock rather than
-    /// actor isolation so that "is one already running?" is asked and
-    /// acted on in the same uninterrupted stretch.
-    private let lock = NSLock()
-    private var installations: [String: Task<Void, Error>] = [:]
-    private var unreportedFailures: [String: Error] = [:]
-
-    func prepare(locale: String?) async throws -> LivePreparation {
-        let model = try await resolveModel(locale: locale)
-        let identifier = model.locale.identifier
-
-        // Report a previous failure before looking at anything else, and
-        // only once: this call throws, and the call after it finds nothing
-        // recorded and starts a fresh installation.
-        if let failure = lock.replayWithLock({ unreportedFailures.removeValue(forKey: identifier) }) {
-            throw failure
-        }
-
-        switch await AssetInventory.status(forModules: [model.transcriber]) {
-        case .installed:
-            return .ready
-        case .unsupported:
-            // `supportedLocale(equivalentTo:)` already filtered the locale,
-            // so this means the assets themselves cannot be had here.
-            throw SidecarOperationError.unsupported(Self.unsupportedMessage(for: model.locale))
-        case .supported, .downloading:
-            // `.downloading` can mean an installation this process never
-            // started — another app's, or an earlier run's. Asking again is
-            // safe: the SDK documents that the system consolidates download
-            // and installation requests without downloading anything twice.
-            break
-        @unknown default:
-            break
-        }
-
-        startInstallingIfNeeded(model.transcriber, identifier: identifier)
-        return .preparing
-    }
-
-    func makeSession(
-        configuration: LiveAudioStartConfiguration,
-        eventSink: @escaping @Sendable (SidecarLiveEventEnvelope) async -> Void
-    ) async throws -> LiveAudioControlling {
-        let model = try await resolveModel(locale: configuration.locale)
-        // Never downloads. A recording must not stall behind a first-run
-        // model download, so the sidecar refuses to start one until
-        // `prepare(locale:)` has reported `.ready`.
-        guard await AssetInventory.status(forModules: [model.transcriber]) == .installed else {
-            throw SidecarOperationError.invalidState("The speech model is not ready yet.")
-        }
-        let engine = MacLiveAudioEngine(
-            configuration: configuration,
-            transcriber: model.transcriber
-        )
-        let coordinator = LiveAudioCoordinator(
-            sessionId: configuration.sessionId,
-            captureOriginUptimeNanoseconds: configuration.captureOriginUptimeNanoseconds,
-            recogniser: engine,
-            synthesiser: engine,
-            eventSink: eventSink
-        )
-        try await coordinator.start()
-        return coordinator
-    }
-
-    /// Resolves `locale` to one the on-device transcriber supports, and
-    /// builds a transcriber configured for it. `prepare(locale:)` and
-    /// `makeSession(configuration:eventSink:)` both come through here, so
-    /// they can never disagree about which model a request means.
-    private func resolveModel(locale: String?) async throws -> ResolvedModel {
-        let requested = locale.map(Locale.init(identifier:)) ?? Locale.current
-        guard let supported = await SpeechTranscriber.supportedLocale(equivalentTo: requested) else {
-            throw SidecarOperationError.unsupported(Self.unsupportedMessage(for: requested))
-        }
-        return ResolvedModel(
-            locale: supported,
-            transcriber: SpeechTranscriber(
-                locale: supported,
-                transcriptionOptions: [],
-                reportingOptions: [.volatileResults],
-                attributeOptions: [.audioTimeRange]
-            )
-        )
-    }
-
-    private func startInstallingIfNeeded(_ transcriber: SpeechTranscriber, identifier: String) {
-        lock.lock()
-        guard installations[identifier] == nil else {
-            lock.unlock()
-            return
-        }
-        // Unstructured on purpose. `prepare` returns `.preparing` without
-        // awaiting this, and an unstructured task inherits no cancellation
-        // from whichever command happened to ask first, so a first-run
-        // download outlives that command rather than being abandoned.
-        let installation = Task { [weak self] in
-            do {
-                try await Self.install(transcriber)
-                self?.finishInstalling(identifier: identifier, failure: nil)
-            } catch {
-                self?.finishInstalling(identifier: identifier, failure: error)
-                throw error
-            }
-        }
-        installations[identifier] = installation
-        lock.unlock()
-    }
-
-    private func finishInstalling(identifier: String, failure: Error?) {
-        lock.replayWithLock {
-            installations.removeValue(forKey: identifier)
-            if let failure {
-                unreportedFailures[identifier] = failure
-            }
-        }
-    }
-
-    private static func install(_ transcriber: SpeechTranscriber) async throws {
-        // Reserving the locale is not a step of its own: the SDK documents
-        // that `AssetInventory` assigns the app's asset reservations to the
-        // locale automatically when an installation request needs it.
-        guard let request = try await AssetInventory.assetInstallationRequest(
-            supporting: [transcriber]
-        ) else {
-            // Nothing to install: the assets were preinstalled, or another
-            // app or an earlier call already fetched them.
-            return
-        }
-        try await request.downloadAndInstall()
-    }
-
-    private static func unsupportedMessage(for locale: Locale) -> String {
-        "Live speech recognition is not available for \(locale.identifier) on this Mac."
-    }
-}
-
 // MARK: - The engine
 
 /// One `AVAudioEngine` with voice processing enabled. The input tap feeds
@@ -319,7 +158,10 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
         // Only now may anything be spoken: `AVAudioPlayerNode.play()` needs
         // a running engine, and the coordinator can queue speech while this
         // method is still suspended above.
-        playback.prepare(renderFormat: engine.mainMixerNode.outputFormat(forBus: 0))
+        playback.prepare(
+            renderFormat: engine.mainMixerNode.outputFormat(forBus: 0),
+            engineProbe: EngineRunningProbe(engine)
+        )
 
         let origin = configuration.captureOriginUptimeNanoseconds
         // Detached, so delivering a transcript never enters this actor: the
@@ -337,6 +179,13 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
                     // has finished setting the recording up.
                     let anchor = tap.firstBufferUptimeNanoseconds ?? origin
                     await handler(RecognisedSegment(
+                        // A serial number, not an identity. With volatile
+                        // results the transcriber reissues one phrase
+                        // several times as it refines it, and each reissue
+                        // gets its own id here; nothing downstream keys on
+                        // this to replace an earlier partial. Keying it on
+                        // `result.range` is what to do if anything ever
+                        // needs to.
                         segmentId: "segment-\(index)",
                         text: String(result.text.characters),
                         isFinal: result.isFinal,
@@ -397,14 +246,28 @@ actor MacLiveAudioEngine: SpeechRecognizing, SpeechSynthesizing {
 
 // MARK: - The speaking half
 
-/// Everything the synthesiser and the player node touch, behind one lock.
+/// Everything the synthesiser and the player node touch.
 /// `AVSpeechSynthesizer` delivers its buffers, and `AVAudioPlayerNode` its
 /// playback completions, on AVFoundation's own threads, so none of this may
 /// rely on actor isolation.
 ///
-/// Implements `SpeechSynthesizing`'s per-utterance contract: a stop names
-/// the utterance it means, and a stop that finds that utterance not playing
-/// is remembered for that id alone.
+/// Two disciplines, deliberately separate:
+///
+/// - `lock` guards the bookkeeping, and **no AVFoundation call is ever made
+///   while it is held**. `player.stop()` completes every buffer it
+///   discards, and those completions reach `didPlayBuffer` on the node's
+///   own thread, which takes this lock — so holding it across a node call
+///   would be the two halves of an ordering cycle between a lock this code
+///   owns and one it does not.
+/// - `playerQueue` owns every `AVAudioPlayerNode` call, so they happen in
+///   one known order on one known thread. Each scheduling decision is taken
+///   on that queue, immediately before the buffer is handed over, which is
+///   what stops a buffer being scheduled just after a stop has flushed the
+///   node and then playing into whatever speaks next.
+///
+/// Together they implement `SpeechSynthesizing`'s per-utterance contract: a
+/// stop names the utterance it means, and a stop that finds that utterance
+/// not playing is remembered for that id alone.
 @available(macOS 26, *)
 final class SpeechPlayback: @unchecked Sendable {
     /// One utterance's progress from registered to decided.
@@ -422,15 +285,14 @@ final class SpeechPlayback: @unchecked Sendable {
 
     let player = AVAudioPlayerNode()
     private let synthesiser = AVSpeechSynthesizer()
-    /// Recursive, because `player.stop()` completes every buffer it
-    /// discards and is held under this lock — see `stop(utteranceId:)` for
-    /// why that ordering is what keeps a stopped utterance's last buffers
-    /// from playing into the next one.
-    private let lock = NSRecursiveLock()
-    /// What the main mixer wants. Nil until the engine is actually running,
-    /// which is also what stops an utterance being handed to a player node
-    /// that has no engine behind it yet.
+    private let playerQueue = DispatchQueue(label: "Replay live speech", qos: .userInitiated)
+    private let lock = NSLock()
+    /// What the main mixer wants, and whether the engine behind the player
+    /// node is still running. Both nil until the engine has actually
+    /// started, which is what keeps an utterance from reaching a player
+    /// node with no running engine behind it.
     private var renderFormat: AVAudioFormat?
+    private var engineProbe: EngineRunningProbe?
     private var converter: AVAudioConverter?
     private var converterSourceFormat: AVAudioFormat?
     private var utterance: Utterance?
@@ -439,8 +301,11 @@ final class SpeechPlayback: @unchecked Sendable {
     private var stoppedIds: Set<String> = []
     private var closed = false
 
-    func prepare(renderFormat: AVAudioFormat) {
-        lock.replayWithLock { self.renderFormat = renderFormat }
+    fileprivate func prepare(renderFormat: AVAudioFormat, engineProbe: EngineRunningProbe) {
+        lock.replayWithLock {
+            self.renderFormat = renderFormat
+            self.engineProbe = engineProbe
+        }
     }
 
     /// Registers `utteranceId` and starts synthesising it. Returns false,
@@ -462,13 +327,16 @@ final class SpeechPlayback: @unchecked Sendable {
         // never reused, so none of them can ever be claimed.
         stoppedIds.removeAll()
         utterance = Utterance(id: utteranceId)
-        // Under the lock, so it can never land after `close()` has stopped
-        // the player and the engine behind it.
-        player.play()
+        let probe = engineProbe
         lock.unlock()
 
-        // Outside the lock: the buffer callback takes it, and
-        // `AVSpeechSynthesizer` is free to call back on any thread.
+        playerQueue.async { [self] in
+            // Re-checked here rather than only at the call site: the engine
+            // can stop itself in between, and `play()` on a stopped engine
+            // is an error rather than a no-op.
+            guard probe?.isRunning == true else { return }
+            player.play()
+        }
         synthesiser.write(AVSpeechUtterance(string: text)) { @Sendable buffer in
             self.receive(buffer, for: utteranceId)
         }
@@ -512,15 +380,14 @@ final class SpeechPlayback: @unchecked Sendable {
         // Held with its outcome until `attach` claims it, if `speak` has
         // not reached that point yet.
         utterance = continuation == nil ? current : nil
-        // Both calls stay under the lock, so that a buffer the synthesiser
-        // is in the middle of handing over is either already scheduled —
-        // and so discarded by `player.stop()` along with the rest — or
-        // blocked in `receive` and then refused by the outcome just set.
-        // Outside the lock, a straggler could be scheduled just after the
-        // flush and would then play into whatever spoke next.
-        synthesiser.stopSpeaking(at: .immediate)
-        player.stop()
         lock.unlock()
+
+        // The outcome above is set before either of these, so a scheduling
+        // decision still to be taken on `playerQueue` will refuse, and one
+        // already taken queued its buffer ahead of this flush, which
+        // discards it. Neither call is made under the lock.
+        synthesiser.stopSpeaking(at: .immediate)
+        playerQueue.async { [self] in player.stop() }
         continuation?.resume(returning: false)
     }
 
@@ -545,10 +412,16 @@ final class SpeechPlayback: @unchecked Sendable {
         converter = nil
         converterSourceFormat = nil
         renderFormat = nil
-        // Under the lock, for the same reason as `stop(utteranceId:)`.
-        synthesiser.stopSpeaking(at: .immediate)
-        if wasRunning { player.stop() }
+        engineProbe = nil
         lock.unlock()
+
+        synthesiser.stopSpeaking(at: .immediate)
+        if wasRunning {
+            // Synchronous, so the node is genuinely stopped before the
+            // engine behind it is. Safe to block: nothing on this queue
+            // waits on anything this thread holds.
+            playerQueue.sync { [self] in player.stop() }
+        }
         continuation?.resume(returning: false)
     }
 
@@ -572,21 +445,29 @@ final class SpeechPlayback: @unchecked Sendable {
             return (converter, renderFormat)
         }
         guard let prepared,
-              case let .success(rendered) = convert(pcm, using: prepared.converter, to: prepared.format),
+              case let .success(rendered) = convertAudioBuffer(pcm, using: prepared.converter, to: prepared.format),
               rendered.frameLength > 0 else { return }
-        // Counted and handed over in one stretch, under the same lock a
-        // stop flushes the player under, so this buffer cannot slip in
-        // just after that flush. Counted first, so a completion that fires
-        // at once cannot overtake its own buffer.
-        lock.lock()
-        defer { lock.unlock() }
-        guard utterance?.id == utteranceId, utterance?.outcome == nil else { return }
-        utterance?.scheduledBuffers += 1
-        // An utterance has finished playing when its last buffer's
-        // `.dataPlayedBack` completion fires: the only signal that the
-        // speaker, rather than just the synthesiser, is done with it.
-        player.scheduleBuffer(rendered, completionCallbackType: .dataPlayedBack) { @Sendable _ in
-            self.didPlayBuffer(for: utteranceId)
+        let handoff = BufferHandoff(rendered)
+        playerQueue.async { [self] in
+            guard let ready = handoff.take() else { return }
+            // Decided here, on the queue that owns the node, rather than
+            // before the hop: a stop that lands in between has already set
+            // `outcome`, so this refuses instead of scheduling onto a node
+            // that has just been flushed. Counted before it is handed over,
+            // so a completion that fires at once cannot overtake its own
+            // buffer. The lock is released before the node is touched.
+            let accepted: Bool = lock.replayWithLock {
+                guard utterance?.id == utteranceId, utterance?.outcome == nil else { return false }
+                utterance?.scheduledBuffers += 1
+                return true
+            }
+            guard accepted else { return }
+            // An utterance has finished playing when its last buffer's
+            // `.dataPlayedBack` completion fires: the only signal that the
+            // speaker, rather than just the synthesiser, is done with it.
+            player.scheduleBuffer(ready, completionCallbackType: .dataPlayedBack) { @Sendable _ in
+                self.didPlayBuffer(for: utteranceId)
+            }
         }
     }
 
@@ -636,18 +517,23 @@ final class SpeechPlayback: @unchecked Sendable {
 
 // MARK: - The listening half
 
-/// Everything the microphone tap touches, behind one lock. AVFAudio
-/// delivers tap buffers on its own realtime queue, so this may not rely on
-/// actor isolation either.
+/// Everything the microphone tap touches. AVFAudio delivers tap buffers on
+/// its own realtime queue, so this may not rely on actor isolation either.
 ///
 /// It has two independent jobs, each with its own converter, because the
 /// voice-processed tap format is neither something AAC can encode (it had
 /// nine channels on the spike's Mac, all carrying the same signal) nor
 /// something the analyser accepts.
+///
+/// Two disciplines again. `lock` guards the timing and the analyser's
+/// continuation, both of which the tap callback touches directly.
+/// `narrationQueue` owns the narration file: encoding AAC has no business
+/// in a realtime callback with an ~85ms budget, least of all the leading
+/// silence, which can be seconds of it.
 @available(macOS 26, *)
 final class MicrophoneTap: @unchecked Sendable {
     /// A clock reading that made no sense would otherwise ask for an
-    /// unbounded allocation of silence.
+    /// unbounded amount of silence to be encoded.
     private static let maximumLeadingSilenceSeconds = 30.0
 
     private let captureOriginUptimeNanoseconds: UInt64
@@ -655,19 +541,16 @@ final class MicrophoneTap: @unchecked Sendable {
     private let analyzerFormat: AVAudioFormat
     private let fileConverter: AVAudioConverter
     private let analyzerConverter: AVAudioConverter
+    private let narrationQueue = DispatchQueue(label: "Replay live narration", qos: .userInitiated)
     private let lock = NSLock()
+    /// Confined to `narrationQueue`: nothing else reads or writes these
+    /// once this object exists, and `init` sets them up before it does.
     private var file: AVAudioFile?
+    private var firstNarrationFailure: Error?
+    /// Guarded by `lock`.
     private var analyzerInput: AsyncStream<AnalyzerInput>.Continuation?
     private var firstBufferUptime: UInt64?
-    /// The first narration failure, recorded rather than discarded, after
-    /// which writing stops. A format the encoder rejects fails on every
-    /// single buffer, so `try?` in the callback would both hide it and
-    /// repeat it for the length of the recording.
-    private(set) var firstNarrationFailure: Error?
-    /// The first failed conversion on the way to the analyser. Unlike the
-    /// narration file, this does not stop anything: a dropped buffer costs
-    /// recognition a fraction of a second and the analyser carries on.
-    private(set) var firstAnalyzerFailure: Error?
+    private var firstAnalyzerFailure: Error?
 
     /// The host uptime of the first buffer the microphone delivered, which
     /// is the analyser's own time zero.
@@ -699,6 +582,13 @@ final class MicrophoneTap: @unchecked Sendable {
         // time-codes against the host times recorded here.
         fileConverter.primeMethod = .none
         analyzerConverter.primeMethod = .none
+        // Mix the tap's channels down rather than remapping the first one.
+        // On the spike's Mac all nine carried the same signal, so either
+        // would do; on hardware where they genuinely differ, a remap could
+        // record silence. Deliberately not done for the analyser: its whole
+        // value here rests on the echo-cancelled signal, and mixing in a
+        // channel that turned out to be raw microphone could undo that.
+        fileConverter.downmix = true
         do {
             file = try AVAudioFile(
                 forWriting: audioURL,
@@ -709,13 +599,16 @@ final class MicrophoneTap: @unchecked Sendable {
                     AVEncoderBitRateKey: 96_000
                 ]
             )
+            // Not `try?`: narration is the user's own voice, so a file left
+            // readable by other accounts is a privacy failure rather than a
+            // cosmetic one.
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: audioURL.path
+            )
         } catch {
             throw SidecarOperationError.ioFailed
         }
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: audioURL.path
-        )
         self.captureOriginUptimeNanoseconds = captureOriginUptimeNanoseconds
         self.fileFormat = fileFormat
         self.analyzerFormat = analyzerFormat
@@ -743,7 +636,7 @@ final class MicrophoneTap: @unchecked Sendable {
             return AVAudioFrameCount((seconds * fileFormat.sampleRate).rounded())
         }
         if leadingSilence > 0 {
-            writeLeadingSilence(frames: leadingSilence)
+            narrationQueue.async { [self] in writeLeadingSilence(frames: leadingSilence) }
         }
         writeNarration(buffer)
         feedAnalyzer(buffer)
@@ -760,16 +653,17 @@ final class MicrophoneTap: @unchecked Sendable {
         continuation?.finish()
     }
 
-    /// Releasing the file writes its trailer and closes it.
+    /// Synchronous, so everything already queued is written before the file
+    /// is released — which is what writes its trailer and closes it.
     func closeNarration() {
-        lock.replayWithLock { file = nil }
+        narrationQueue.sync { [self] in file = nil }
     }
 
     /// `audio.m4a` must keep the invariant that its time zero is the
     /// capture origin, because Build transcribes it whenever
-    /// `transcript.json` is absent. This engine starts after screen
-    /// capture does, so the gap goes in ahead of the first real buffer as
-    /// silence.
+    /// `transcript.json` is absent. This engine starts after screen capture
+    /// does, so the gap goes in ahead of the first real buffer as silence.
+    /// On `narrationQueue`.
     private func writeLeadingSilence(frames: AVAudioFrameCount) {
         let chunkFrames = min(frames, AVAudioFrameCount(fileFormat.sampleRate / 4))
         guard chunkFrames > 0,
@@ -780,27 +674,41 @@ final class MicrophoneTap: @unchecked Sendable {
             channels[channel].update(repeating: 0, count: Int(chunkFrames))
         }
         var remaining = frames
-        while remaining > 0 {
+        while remaining > 0, file != nil {
             silence.frameLength = min(remaining, chunkFrames)
-            guard write(silence) else { return }
+            write(silence)
             remaining -= silence.frameLength
         }
     }
 
     private func writeNarration(_ buffer: AVAudioPCMBuffer) {
-        switch convert(buffer, using: fileConverter, to: fileFormat) {
+        switch convertAudioBuffer(buffer, using: fileConverter, to: fileFormat) {
         case let .success(converted):
             guard converted.frameLength > 0 else { return }
-            _ = write(converted)
+            let handoff = BufferHandoff(converted)
+            narrationQueue.async { [self] in
+                guard let ready = handoff.take() else { return }
+                write(ready)
+            }
         case let .failure(error):
-            recordNarrationFailure(error)
+            narrationQueue.async { [self] in recordNarrationFailure(error) }
         }
     }
 
     private func feedAnalyzer(_ buffer: AVAudioPCMBuffer) {
-        switch convert(buffer, using: analyzerConverter, to: analyzerFormat) {
+        switch convertAudioBuffer(buffer, using: analyzerConverter, to: analyzerFormat) {
         case let .success(converted):
             guard converted.frameLength > 0 else { return }
+            // No `bufferStartTime`: the analyser then takes each buffer as
+            // following straight on from the last, which is exactly right
+            // as long as the converted frames match the captured ones, and
+            // `LiveAudioConversionTests` pins that they do. Labelling each
+            // buffer with its source's own time-code would be worse, not
+            // better — `AVAudioConverter` emits in fixed internal blocks
+            // rather than one output buffer per input buffer, and the SDK
+            // warns specifically that a converted buffer whose audio has
+            // been shifted like that must not carry its source's start
+            // time.
             lock.replayWithLock { analyzerInput }?.yield(AnalyzerInput(buffer: converted))
         case let .failure(error):
             lock.replayWithLock {
@@ -809,71 +717,124 @@ final class MicrophoneTap: @unchecked Sendable {
         }
     }
 
-    /// Holds the lock across the write, so closing the file can never race
-    /// one. The tap is serial and nothing else contends for it, so this
-    /// costs the audio thread nothing it was not already paying.
-    private func write(_ buffer: AVAudioPCMBuffer) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let file, firstNarrationFailure == nil else { return false }
+    /// On `narrationQueue`. The first failure is recorded rather than
+    /// discarded, and writing then stops: a format the encoder rejects
+    /// fails on every single buffer, so `try?` here would both hide it and
+    /// repeat it for the length of the recording.
+    private func write(_ buffer: AVAudioPCMBuffer) {
+        guard let file, firstNarrationFailure == nil else { return }
         do {
             try file.write(from: buffer)
-            return true
         } catch {
             firstNarrationFailure = error
             self.file = nil
-            return false
         }
     }
 
+    /// On `narrationQueue`.
     private func recordNarrationFailure(_ error: Error) {
-        lock.replayWithLock {
-            guard firstNarrationFailure == nil else { return }
-            firstNarrationFailure = error
-            file = nil
-        }
+        guard firstNarrationFailure == nil else { return }
+        firstNarrationFailure = error
+        file = nil
     }
 }
 
 // MARK: - Shared audio helpers
 
-/// Hands a buffer to `AVAudioConverter`'s `@Sendable` input block.
-/// `AVAudioPCMBuffer` is not `Sendable`, and the block is called
-/// synchronously, on this thread, before `convert` returns — so there is
-/// nothing to make thread-safe, only a capture rule to satisfy honestly
-/// rather than by suppressing the diagnostic across the whole file.
-private final class PCMBufferBox: @unchecked Sendable {
-    let buffer: AVAudioPCMBuffer
+/// Lets the speaking half ask, from the thread that owns the player node,
+/// whether the engine behind it is still running — which
+/// `AVAudioPlayerNode.play()` requires, and which an audio route change can
+/// end without anything here being told. `AVAudioEngine` is not `Sendable`;
+/// `isRunning` is a plain state read, and the engine serialises its own
+/// control operations.
+private final class EngineRunningProbe: @unchecked Sendable {
+    private let engine: AVAudioEngine
+
+    init(_ engine: AVAudioEngine) {
+        self.engine = engine
+    }
+
+    var isRunning: Bool { engine.isRunning }
+}
+
+/// Hands one `AVAudioPCMBuffer` across a `@Sendable` boundary — a
+/// converter's input block, or a dispatch queue hop — and gives it up on
+/// the first `take()`.
+///
+/// `AVAudioPCMBuffer` is not `Sendable`, and both of those boundaries
+/// require what they capture to be. Neither side needs a lock: each
+/// hand-off has exactly one taker, and a queue hop carries the memory
+/// barrier that makes the buffer visible there.
+///
+/// Giving it up is what matters for the converter.
+/// `convertToBuffer:error:withInputFromBlock:` fills the output to its
+/// *capacity*, and `AVAudioConverter.h` says of the block's packet count
+/// that "you may supply more or less than this amount. If less, then the
+/// input block will get called again" — so a block that keeps handing back
+/// the same buffer makes the converter read it again from frame zero and
+/// append the repeat to the output.
+private final class BufferHandoff: @unchecked Sendable {
+    private var buffer: AVAudioPCMBuffer?
 
     init(_ buffer: AVAudioPCMBuffer) {
         self.buffer = buffer
     }
+
+    func take() -> AVAudioPCMBuffer? {
+        defer { buffer = nil }
+        return buffer
+    }
 }
 
-/// Converts one buffer into `format`. Both the narration file and the
-/// analyser need this, at different sample rates, which is why neither can
-/// use the tap's buffers as they arrive.
-private func convert(
+/// Headroom beyond the arithmetic frame count, so the converter is never
+/// the one running out of room.
+///
+/// `AVAudioConverter` works in fixed internal blocks — measured at 4096
+/// output frames on this hardware, for both a channel downmix and a 3:1
+/// resample — and emits whole blocks rather than matching its output to the
+/// buffer it was just given. Any leftover is held and comes out with a
+/// later call, so an output buffer sized to the arithmetic count alone caps
+/// every call short and leaves a backlog that never clears. With this much
+/// headroom the backlog is always emptied, and the frames out match the
+/// frames in exactly over a run of buffers, which is what the analyser's
+/// contiguous timeline and the narration file's duration both rest on.
+private let conversionMarginFrames: AVAudioFrameCount = 4_096
+
+/// Converts one buffer into `format`. The narration file and the analyser
+/// each need their own, at different sample rates and channel counts, which
+/// is why neither can use the tap's buffers as they arrive.
+func convertAudioBuffer(
     _ source: AVAudioPCMBuffer,
     using converter: AVAudioConverter,
     to format: AVAudioFormat
 ) -> Result<AVAudioPCMBuffer, Error> {
-    let capacity = AVAudioFrameCount(
-        Double(source.frameLength) * format.sampleRate / source.format.sampleRate
-    ) + 1_024
+    let resampled = Double(source.frameLength) * format.sampleRate / source.format.sampleRate
+    let capacity = AVAudioFrameCount(resampled.rounded(.up)) + conversionMarginFrames
     guard let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else {
         return .failure(SidecarOperationError.captureFailed)
     }
-    let input = PCMBufferBox(source)
+    let input = BufferHandoff(source)
     var error: NSError?
-    converter.convert(to: output, error: &error) { _, status in
+    let status = converter.convert(to: output, error: &error) { _, status in
+        guard let next = input.take() else {
+            status.pointee = .noDataNow
+            return nil
+        }
         status.pointee = .haveData
-        return input.buffer
+        return next
     }
-    if let error {
-        return .failure(error)
+    switch status {
+    case .haveData, .inputRanDry, .endOfStream:
+        // `.inputRanDry` is the ordinary outcome here, not a failure: this
+        // converter is given one buffer at a time, so it all but always
+        // stops short of the headroom reserved above. The output buffer's
+        // own `frameLength` is what was actually converted.
+        return .success(output)
+    case .error:
+        return .failure(error ?? SidecarOperationError.captureFailed)
+    @unknown default:
+        return .failure(error ?? SidecarOperationError.captureFailed)
     }
-    return .success(output)
 }
 
 /// A `CMTime` from the analyser as a non-negative offset in nanoseconds.
