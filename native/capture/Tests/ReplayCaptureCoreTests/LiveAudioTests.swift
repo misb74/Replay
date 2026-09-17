@@ -4,9 +4,33 @@ import Testing
 
 private actor EventCollector {
     private(set) var events: [SidecarLiveEventEnvelope] = []
+    private var gate: (@Sendable (SidecarLiveEventEnvelope) -> Bool)?
+    private var held: [CheckedContinuation<Void, Never>] = []
 
-    func record(_ event: SidecarLiveEventEnvelope) {
+    func record(_ event: SidecarLiveEventEnvelope) async {
         events.append(event)
+        if let gate, gate(event) {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                held.append(continuation)
+            }
+        }
+    }
+
+    /// Holds any future `record(_:)` whose event matches `predicate` until
+    /// `release()` is called, so a test can suspend the coordinator at a
+    /// precise point in its own event stream and drive an interleaving
+    /// deterministically instead of racing it.
+    func setGate(_ predicate: (@Sendable (SidecarLiveEventEnvelope) -> Bool)?) {
+        gate = predicate
+    }
+
+    var heldCount: Int { held.count }
+
+    func release() {
+        let toRelease = held
+        held.removeAll()
+        gate = nil
+        for continuation in toRelease { continuation.resume() }
     }
 
     nonisolated var sink: @Sendable (SidecarLiveEventEnvelope) async -> Void {
@@ -14,22 +38,41 @@ private actor EventCollector {
     }
 }
 
-private final class FakeRecogniser: SpeechRecognizing, @unchecked Sendable {
+/// An honestly Sendable fake: an actor, not a class with `@unchecked
+/// Sendable` and unguarded mutable state. `holdsStart` lets a test suspend
+/// `start()` at will, to drive interleavings with `stop()`/`setPaused(_:)`
+/// that land while a real recogniser would still be starting up.
+private actor FakeRecogniser: SpeechRecognizing {
     private var handler: (@Sendable (RecognisedSegment) async -> Void)?
     private let startError: Error?
-    private(set) var stopped = false
+    private let holdsStart: Bool
+    private var startContinuation: CheckedContinuation<Void, Never>?
+    private(set) var stopCallCount = 0
 
-    init(startError: Error? = nil) {
+    var isHoldingStart: Bool { startContinuation != nil }
+
+    init(startError: Error? = nil, holdsStart: Bool = false) {
         self.startError = startError
+        self.holdsStart = holdsStart
     }
 
     func start(handler: @escaping @Sendable (RecognisedSegment) async -> Void) async throws {
+        if holdsStart {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                startContinuation = continuation
+            }
+        }
         if let startError { throw startError }
         self.handler = handler
     }
 
+    func releaseStart() {
+        startContinuation?.resume()
+        startContinuation = nil
+    }
+
     func stop() async {
-        stopped = true
+        stopCallCount += 1
     }
 
     func emit(_ segment: RecognisedSegment) async {
@@ -37,17 +80,67 @@ private final class FakeRecogniser: SpeechRecognizing, @unchecked Sendable {
     }
 }
 
+/// A synthesiser fake whose `speak(_:)` suspends until the test releases it
+/// (`finishCurrent()`/`stopSpeaking()`) rather than always running to
+/// completion, and whose `stopSpeaking()` only ever affects whichever
+/// `speak(_:)` call is currently suspended — matching a real synthesiser,
+/// which cannot cancel audio it has not started playing yet. `autoCompletes`
+/// (on by default) makes `speak(_:)` return `true` immediately instead, for
+/// tests that only care about ordering, not about driving a specific
+/// interleaving.
 private actor FakeSynthesiser: SpeechSynthesizing {
     private(set) var spoken: [String] = []
-    private var stopRequested = false
+    private(set) var stopCallCount = 0
+    private var current: CheckedContinuation<Bool, Never>?
+    private var autoCompletes = true
+    private var holdStops = false
+    private var heldStop: CheckedContinuation<Void, Never>?
+
+    var isSpeaking: Bool { current != nil }
+
+    func setAutoCompletes(_ value: Bool) {
+        autoCompletes = value
+    }
+
+    /// Makes `stopSpeaking()` suspend after it is entered (so a test can
+    /// observe that it was called before letting it actually resolve
+    /// anything), released by `releaseHeldStop()`.
+    func setHoldStops(_ hold: Bool) {
+        holdStops = hold
+    }
 
     func speak(_ text: String) async -> Bool {
         spoken.append(text)
-        return !stopRequested
+        if autoCompletes { return true }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            current = continuation
+        }
+    }
+
+    func finishCurrent() {
+        if let c = current {
+            current = nil
+            c.resume(returning: true)
+        }
     }
 
     func stopSpeaking() async {
-        stopRequested = true
+        stopCallCount += 1
+        if holdStops {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                heldStop = continuation
+            }
+        }
+        if let c = current {
+            current = nil
+            c.resume(returning: false)
+        }
+    }
+
+    func releaseHeldStop() {
+        holdStops = false
+        heldStop?.resume()
+        heldStop = nil
     }
 }
 
@@ -64,6 +157,23 @@ private func makeCoordinator(
         eventSink: collector.sink
     )
 }
+
+/// Polls `condition` until it is true or `timeout` elapses, so tests can
+/// synchronise with a background `Task` deterministically instead of
+/// sleeping a fixed, arbitrary amount.
+private func waitUntil(
+    timeout: TimeInterval = 2,
+    _ condition: @Sendable () async -> Bool
+) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if await condition() { return true }
+        try? await Task.sleep(nanoseconds: 2_000_000)
+    }
+    return await condition()
+}
+
+// MARK: - Original coverage
 
 @Test func startReportsModelPreparationThenListening() async throws {
     let collector = EventCollector()
@@ -219,4 +329,294 @@ private func makeCoordinator(
         .filter { $0.phase == .cancelled }
         .compactMap(\.utteranceId)
     #expect(cancelled.contains("utterance-2"))
+}
+
+// MARK: - P1: a stop/pause that lands while `started` is still being sent
+// must never let the utterance reach the synthesiser.
+
+@Test func stopSpeakingDuringStartedEmitCancelsRatherThanLettingItPlay() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+
+    await collector.setGate { $0.event == .speech && $0.phase == .started && $0.utteranceId == "A" }
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    #expect(await waitUntil { await collector.heldCount == 1 })
+
+    // Nothing has reached the synthesiser yet (the drain loop is still
+    // suspended sending `started`), so this returns without touching it —
+    // fully, before the gate below is released.
+    await coordinator.stopSpeaking()
+
+    await collector.release()
+    #expect(await waitUntil {
+        await collector.events.contains { $0.utteranceId == "A" && $0.phase == .cancelled }
+    })
+
+    #expect(await synthesiser.spoken.isEmpty, "A must never reach the synthesiser: stopSpeaking landed before it was sent")
+    let phases = await collector.events.filter { $0.utteranceId == "A" }.compactMap(\.phase)
+    #expect(phases == [.started, .cancelled])
+}
+
+@Test func pausingDuringStartedEmitCancelsRatherThanLettingItPlay() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+
+    await collector.setGate { $0.event == .speech && $0.phase == .started && $0.utteranceId == "A" }
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    #expect(await waitUntil { await collector.heldCount == 1 })
+
+    await coordinator.setPaused(true)
+
+    await collector.release()
+    #expect(await waitUntil {
+        await collector.events.contains { $0.utteranceId == "A" && $0.phase == .cancelled }
+    })
+
+    #expect(await synthesiser.spoken.isEmpty, "A must never reach the synthesiser: the pause landed before it was sent")
+    let phases = await collector.events.filter { $0.utteranceId == "A" }.compactMap(\.phase)
+    #expect(phases == [.started, .cancelled])
+    let states = await collector.events.compactMap(\.state)
+    #expect(states.last == .paused)
+}
+
+@Test func stoppingDuringStartedEmitCancelsRatherThanLettingItPlay() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let recogniser = FakeRecogniser()
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+
+    await collector.setGate { $0.event == .speech && $0.phase == .started && $0.utteranceId == "A" }
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    #expect(await waitUntil { await collector.heldCount == 1 })
+
+    // stop() blocks on the drain quiescing, which cannot happen until the
+    // gate below is released, so it has to run in the background. Once
+    // recogniser.stop() has been called, stopSpeaking() (and so the
+    // generation bump) has already returned.
+    let stopTask = Task { await coordinator.stop() }
+    #expect(await waitUntil { await recogniser.stopCallCount == 1 })
+
+    await collector.release()
+    await stopTask.value
+
+    #expect(await synthesiser.spoken.isEmpty, "A must never reach the synthesiser: stop landed before it was sent")
+    let phases = await collector.events.filter { $0.utteranceId == "A" }.compactMap(\.phase)
+    #expect(phases == [.started, .cancelled])
+}
+
+// MARK: - P2: a state event superseded while its call was suspended must
+// not be sent stale.
+
+@Test func unpausingWhilePauseIsStillStoppingSpeechSuppressesTheStalePausedEvent() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+    await synthesiser.setAutoCompletes(false)
+
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    await synthesiser.setHoldStops(true)
+    let pauseTask = Task { await coordinator.setPaused(true) }
+    #expect(await waitUntil { await synthesiser.stopCallCount == 1 })
+
+    // Runs to completion while setPaused(true) is still stuck waiting for
+    // the synthesiser to acknowledge A's stop.
+    await coordinator.setPaused(false)
+    await coordinator.speak(utteranceId: "D", text: "Delta")
+
+    await synthesiser.releaseHeldStop()
+    await pauseTask.value
+    #expect(await waitUntil { await synthesiser.spoken.contains("Delta") })
+    await synthesiser.finishCurrent()
+    await coordinator.drainForTesting()
+
+    let states = await collector.events.compactMap(\.state)
+    #expect(!states.contains(.paused), "setPaused(true)'s stop resolved only after it was superseded by setPaused(false); its .paused report must be dropped")
+    #expect(states.last == .listening)
+    let aPhases = await collector.events.filter { $0.utteranceId == "A" }.compactMap(\.phase)
+    #expect(aPhases == [.started, .cancelled])
+    let dPhases = await collector.events.filter { $0.utteranceId == "D" }.compactMap(\.phase)
+    #expect(dPhases == [.started, .finished], "the coordinator must still be genuinely usable, not stuck reporting paused")
+}
+
+// MARK: - P3: a stop's synthesiser call must never land on a later,
+// unrelated utterance.
+
+@Test func stopSpeakingNeverCancelsALaterUtteranceThatStartedAfterTheStopWasRequested() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+    await synthesiser.setAutoCompletes(false)
+
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    await coordinator.speak(utteranceId: "B", text: "Bravo")
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    await synthesiser.setHoldStops(true)
+    let stopTask = Task { await coordinator.stopSpeaking() }
+    #expect(await waitUntil { await synthesiser.stopCallCount == 1 })
+
+    // Queued while stopSpeaking()'s synthesiser call for A is held: this
+    // must never be touched by that stale, still-in-flight stop.
+    await coordinator.speak(utteranceId: "C", text: "Charlie")
+
+    await synthesiser.releaseHeldStop()
+    #expect(await waitUntil { await synthesiser.spoken.contains("Charlie") })
+    await stopTask.value
+
+    #expect(await synthesiser.isSpeaking, "C must have reached the synthesiser and still be playing, untouched by A's stop")
+    await synthesiser.finishCurrent()
+    await coordinator.drainForTesting()
+
+    let aPhases = await collector.events.filter { $0.utteranceId == "A" }.compactMap(\.phase)
+    #expect(aPhases == [.started, .cancelled])
+    let bPhases = await collector.events.filter { $0.utteranceId == "B" }.compactMap(\.phase)
+    #expect(bPhases == [.cancelled])
+    let cPhases = await collector.events.filter { $0.utteranceId == "C" }.compactMap(\.phase)
+    #expect(cPhases == [.started, .finished], "C must finish normally: the stale stop meant for A must not cancel it")
+}
+
+// MARK: - P5: a state event must reflect what is still true, even when
+// start() is still in flight.
+
+@Test func pausingDuringStartDoesNotClaimListeningOnceItCompletes() async throws {
+    let collector = EventCollector()
+    let recogniser = FakeRecogniser(holdsStart: true)
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: FakeSynthesiser(), collector: collector)
+
+    let startTask = Task { try await coordinator.start() }
+    #expect(await waitUntil { await recogniser.isHoldingStart })
+    await coordinator.setPaused(true)
+    await recogniser.releaseStart()
+    try await startTask.value
+
+    let states = await collector.events.compactMap(\.state)
+    #expect(states == [.preparingModel, .paused], "start() must not append .listening once a concurrent pause landed first")
+}
+
+@Test func stoppingDuringStartNeverClaimsListening() async throws {
+    let collector = EventCollector()
+    let recogniser = FakeRecogniser(holdsStart: true)
+    let coordinator = makeCoordinator(recogniser: recogniser, synthesiser: FakeSynthesiser(), collector: collector)
+
+    let startTask = Task { try await coordinator.start() }
+    #expect(await waitUntil { await recogniser.isHoldingStart })
+    // stop() calls recogniser.stop() before recogniser.start() has even
+    // returned — exercised explicitly, since a real recogniser could still
+    // be mid-start at that point.
+    let stopTask = Task { await coordinator.stop() }
+    #expect(await waitUntil { await recogniser.stopCallCount == 1 })
+    await recogniser.releaseStart()
+    try await startTask.value
+    await stopTask.value
+
+    let states = await collector.events.compactMap(\.state)
+    #expect(states == [.preparingModel], "start() must not claim listening once stop() landed first")
+
+    await coordinator.speak(utteranceId: "ignored", text: "no")
+    let phases = await collector.events.filter { $0.utteranceId == "ignored" }.compactMap(\.phase)
+    #expect(phases == [.cancelled])
+}
+
+// MARK: - stop() waits for the drain to quiesce.
+
+@Test func stopDoesNotReturnUntilTheInFlightUtteranceHasItsTerminalEvent() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+    await synthesiser.setAutoCompletes(false)
+
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    await coordinator.stop()
+
+    // No drainForTesting(), no sleep: by the time stop() itself returns,
+    // A's terminal event must already be recorded.
+    let phases = await collector.events.filter { $0.utteranceId == "A" }.compactMap(\.phase)
+    #expect(phases == [.started, .cancelled])
+}
+
+// MARK: - Folded-in coverage: refusal paths and the failure reason string.
+
+@Test func speakWhilePausedIsRefusedWithoutReachingTheSynthesiser() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+    await coordinator.setPaused(true)
+
+    await coordinator.speak(utteranceId: "ignored", text: "should not play")
+
+    let phases = await collector.events.filter { $0.utteranceId == "ignored" }.compactMap(\.phase)
+    #expect(phases == [.cancelled])
+    #expect(await synthesiser.spoken.isEmpty)
+}
+
+@Test func speakAfterStopIsRefusedWithoutReachingTheSynthesiser() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(recogniser: FakeRecogniser(), synthesiser: synthesiser, collector: collector)
+    try await coordinator.start()
+    await coordinator.stop()
+
+    await coordinator.speak(utteranceId: "ignored", text: "should not play")
+
+    let phases = await collector.events.filter { $0.utteranceId == "ignored" }.compactMap(\.phase)
+    #expect(phases == [.cancelled])
+    #expect(await synthesiser.spoken.isEmpty)
+}
+
+@Test func speakAfterAFailedStartIsRefused() async {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    let coordinator = makeCoordinator(
+        recogniser: FakeRecogniser(startError: SidecarOperationError.permissionDenied(.microphone)),
+        synthesiser: synthesiser,
+        collector: collector
+    )
+    await #expect(throws: SidecarOperationError.self) { try await coordinator.start() }
+
+    await coordinator.speak(utteranceId: "ignored", text: "should not play")
+
+    let phases = await collector.events.filter { $0.utteranceId == "ignored" }.compactMap(\.phase)
+    #expect(phases == [.cancelled])
+    #expect(await synthesiser.spoken.isEmpty)
+}
+
+@Test func startFailureReasonReflectsTheUnderlyingOperationError() async {
+    let collector = EventCollector()
+    let coordinator = makeCoordinator(
+        recogniser: FakeRecogniser(startError: SidecarOperationError.captureFailed),
+        synthesiser: FakeSynthesiser(),
+        collector: collector
+    )
+
+    await #expect(throws: SidecarOperationError.self) { try await coordinator.start() }
+
+    let reasons = await collector.events.compactMap(\.reason)
+    #expect(reasons == ["capture_failed"])
+}
+
+@Test func unmappedOperationErrorsReportTheGenericReason() async {
+    let collector = EventCollector()
+    let coordinator = makeCoordinator(
+        recogniser: FakeRecogniser(startError: SidecarOperationError.unsupported("live_audio")),
+        synthesiser: FakeSynthesiser(),
+        collector: collector
+    )
+
+    await #expect(throws: SidecarOperationError.self) { try await coordinator.start() }
+
+    let reasons = await collector.events.compactMap(\.reason)
+    #expect(reasons == ["live_audio_failed"])
 }
