@@ -259,3 +259,46 @@ import Testing
     #expect(object["state"] as? String == "failed")
     #expect(object["reason"] as? String == "microphone_unavailable")
 }
+
+@Test func speechEventEncodesAtMs() throws {
+    let envelope = SidecarLiveEventEnvelope(
+        event: .speech,
+        sessionId: "session-1",
+        utteranceId: "utterance-1",
+        phase: .started,
+        atMs: 1_234.5
+    )
+    let object = try #require(
+        JSONSerialization.jsonObject(with: JSONEncoder.replay.encode(envelope)) as? [String: Any]
+    )
+
+    #expect(object["event"] as? String == "live_speech")
+    #expect(object["atMs"] as? Double == 1_234.5)
+}
+
+@Test func transcriptAndStateEventsEncodeNoAtMsKey() throws {
+    let transcript = SidecarLiveEventEnvelope(
+        event: .transcript,
+        sessionId: "session-1",
+        segmentId: "segment-1",
+        text: "Any difference is flagged",
+        isFinal: true,
+        startMs: 1_200,
+        endMs: 2_400
+    )
+    let state = SidecarLiveEventEnvelope(
+        event: .state,
+        sessionId: "session-1",
+        state: .listening
+    )
+
+    let transcriptObject = try #require(
+        JSONSerialization.jsonObject(with: JSONEncoder.replay.encode(transcript)) as? [String: Any]
+    )
+    let stateObject = try #require(
+        JSONSerialization.jsonObject(with: JSONEncoder.replay.encode(state)) as? [String: Any]
+    )
+
+    #expect(transcriptObject["atMs"] == nil)
+    #expect(stateObject["atMs"] == nil)
+}

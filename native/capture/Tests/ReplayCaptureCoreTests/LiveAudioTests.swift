@@ -174,17 +174,42 @@ private actor FakeSynthesiser: SpeechSynthesizing {
     }
 }
 
+/// A clock a test can script deterministically: each call to `now()` returns
+/// the next of `values`, repeating the last one once exhausted -- the same
+/// convention `FakeLiveAudio.prepare(locale:)` uses elsewhere in this suite
+/// (see `SidecarServiceTests.swift`). Guarded by a lock rather than actor
+/// isolation: the coordinator's `now` parameter is deliberately synchronous
+/// (`@Sendable () -> UInt64`, not `async`), so an actor cannot stand in for
+/// it here.
+private final class ScriptedClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [UInt64]
+
+    init(_ values: [UInt64]) {
+        self.values = values
+    }
+
+    func now() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        guard values.count > 1 else { return values.first ?? 0 }
+        return values.removeFirst()
+    }
+}
+
 private func makeCoordinator(
     recogniser: FakeRecogniser,
     synthesiser: FakeSynthesiser,
-    collector: EventCollector
+    collector: EventCollector,
+    now: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
 ) -> LiveAudioCoordinator {
     LiveAudioCoordinator(
         sessionId: "session-1",
         captureOriginUptimeNanoseconds: 1_000_000_000,
         recogniser: recogniser,
         synthesiser: synthesiser,
-        eventSink: collector.sink
+        eventSink: collector.sink,
+        now: now
     )
 }
 
@@ -947,4 +972,120 @@ private actor CompletionFlag {
 
     let reasons = await collector.events.compactMap(\.reason)
     #expect(reasons == ["live_audio_failed"])
+}
+
+// MARK: - Task 4b: every speech event carries the clock time its phase
+// happened, on the same clock and conversion as transcript times.
+
+@Test func anUtteranceThatPlaysToCompletionCarriesTheClockTimeOfEachPhase() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    // Origin is 1_000_000_000ns; these read as 200ms and 950ms once
+    // converted.
+    let clock = ScriptedClock([1_200_000_000, 1_950_000_000])
+    let coordinator = makeCoordinator(
+        recogniser: FakeRecogniser(),
+        synthesiser: synthesiser,
+        collector: collector,
+        now: clock.now
+    )
+    try await coordinator.start()
+
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    await coordinator.drainForTesting()
+
+    let events = await collector.events.filter { $0.utteranceId == "A" }
+    #expect(events.map(\.phase) == [.started, .finished])
+    #expect(events.map(\.atMs) == [200, 950])
+}
+
+@Test func stopSpeakingCancelsTheInFlightUtteranceAtTheStopsTime() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    // 100ms for `started`, 600ms for the stop's own terminal cancel.
+    let clock = ScriptedClock([1_100_000_000, 1_600_000_000])
+    let coordinator = makeCoordinator(
+        recogniser: FakeRecogniser(),
+        synthesiser: synthesiser,
+        collector: collector,
+        now: clock.now
+    )
+    try await coordinator.start()
+    await synthesiser.setAutoCompletes(false)
+
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    await coordinator.stopSpeaking()
+    await coordinator.drainForTesting()
+
+    let events = await collector.events.filter { $0.utteranceId == "A" }
+    #expect(events.map(\.phase) == [.started, .cancelled])
+    #expect(events.map(\.atMs) == [100, 600])
+}
+
+@Test func stopSpeakingCancelsAStillQueuedUtteranceAtTheStopsTime() async throws {
+    let collector = EventCollector()
+    let synthesiser = FakeSynthesiser()
+    // A's own `started` claims the first tick; B is never dequeued, so
+    // its cancellation must carry the second -- the moment stopSpeaking()
+    // decided to cancel it, not whatever A's own resolution reads later.
+    let clock = ScriptedClock([1_100_000_000, 1_300_000_000])
+    let coordinator = makeCoordinator(
+        recogniser: FakeRecogniser(),
+        synthesiser: synthesiser,
+        collector: collector,
+        now: clock.now
+    )
+    try await coordinator.start()
+    await synthesiser.setAutoCompletes(false)
+
+    await coordinator.speak(utteranceId: "A", text: "Alpha")
+    await coordinator.speak(utteranceId: "B", text: "Bravo")
+    #expect(await waitUntil { await synthesiser.isSpeaking })
+
+    await coordinator.stopSpeaking()
+
+    let bEvents = await collector.events.filter { $0.utteranceId == "B" }
+    #expect(bEvents.map(\.phase) == [.cancelled])
+    #expect(bEvents.map(\.atMs) == [300])
+
+    await coordinator.drainForTesting()
+}
+
+@Test func anUtteranceRefusedWhilePausedCarriesThatMomentsTime() async throws {
+    let collector = EventCollector()
+    let clock = ScriptedClock([1_400_000_000])
+    let coordinator = makeCoordinator(
+        recogniser: FakeRecogniser(),
+        synthesiser: FakeSynthesiser(),
+        collector: collector,
+        now: clock.now
+    )
+    try await coordinator.start()
+    await coordinator.setPaused(true)
+
+    await coordinator.speak(utteranceId: "ignored", text: "should not play")
+
+    let events = await collector.events.filter { $0.utteranceId == "ignored" }
+    #expect(events.map(\.phase) == [.cancelled])
+    #expect(events.map(\.atMs) == [400])
+}
+
+@Test func aSpeechEventTimedBeforeTheCaptureOriginClampsToZero() async throws {
+    let collector = EventCollector()
+    let clock = ScriptedClock([500_000_000])
+    let coordinator = makeCoordinator(
+        recogniser: FakeRecogniser(),
+        synthesiser: FakeSynthesiser(),
+        collector: collector,
+        now: clock.now
+    )
+    try await coordinator.start()
+    await coordinator.setPaused(true)
+
+    await coordinator.speak(utteranceId: "ignored", text: "should not play")
+
+    let events = await collector.events.filter { $0.utteranceId == "ignored" }
+    #expect(events.map(\.atMs) == [0])
 }

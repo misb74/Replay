@@ -127,6 +127,8 @@ public protocol LiveAudioProviding: AnyObject, Sendable {
 
 /// Owns the speech queue, the pause gate, and the conversion from host uptime
 /// to capture-relative milliseconds. It knows nothing about audio hardware.
+/// Every speech event it sends carries that conversion's result as `atMs`,
+/// read at the moment its phase was decided.
 ///
 /// Guaranteed under actor reentrancy, and — where noted — under a
 /// scheduling race that reentrancy alone cannot rule out. Each point below
@@ -249,6 +251,10 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
     private let recogniser: SpeechRecognizing
     private let synthesiser: SpeechSynthesizing
     private let eventSink: @Sendable (SidecarLiveEventEnvelope) async -> Void
+    /// Host uptime in nanoseconds, the same clock as
+    /// `captureOriginUptimeNanoseconds` and `RecognisedSegment`. Injectable
+    /// so tests can script it; defaults to the real clock.
+    private let now: @Sendable () -> UInt64
     private var queue: [QueuedUtterance] = []
     private var drain: Task<Void, Never>?
     private var paused = false
@@ -276,13 +282,15 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
         captureOriginUptimeNanoseconds: UInt64,
         recogniser: SpeechRecognizing,
         synthesiser: SpeechSynthesizing,
-        eventSink: @escaping @Sendable (SidecarLiveEventEnvelope) async -> Void
+        eventSink: @escaping @Sendable (SidecarLiveEventEnvelope) async -> Void,
+        now: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     ) {
         self.sessionId = sessionId
         self.captureOriginUptimeNanoseconds = captureOriginUptimeNanoseconds
         self.recogniser = recogniser
         self.synthesiser = synthesiser
         self.eventSink = eventSink
+        self.now = now
     }
 
     public func start() async throws {
@@ -343,7 +351,7 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
 
     public func speak(utteranceId: String, text: String) async {
         guard !stopped, !paused else {
-            await emit(speechEvent(utteranceId, .cancelled))
+            await emit(speechEvent(utteranceId, .cancelled, atMs: nowMs()))
             return
         }
         queue.append(.init(id: utteranceId, text: text))
@@ -365,6 +373,13 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
         let targetId = inFlightUtteranceId
         let pending = queue
         queue.removeAll()
+        // Read now, in the same await-free stretch as clearing the queue,
+        // not after the synthesiser call below: that call can suspend for a
+        // while, and reading the clock after it would stamp `pending`'s
+        // cancellations later than the moment this stop actually decided
+        // them. Nil when there is nothing queued, so a stop that only
+        // targets an in-flight utterance never reads the clock for this.
+        let pendingCancelledAtMs: Double? = pending.isEmpty ? nil : nowMs()
         // Told first, before the cancellation emits below (which can each
         // suspend on the event sink for a while): still worth doing even
         // though correctness no longer depends on it — it shortens how
@@ -373,8 +388,10 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
         if let targetId {
             await synthesiser.stopSpeaking(utteranceId: targetId)
         }
-        for utterance in pending {
-            await emit(speechEvent(utterance.id, .cancelled))
+        if let pendingCancelledAtMs {
+            for utterance in pending {
+                await emit(speechEvent(utterance.id, .cancelled, atMs: pendingCancelledAtMs))
+            }
         }
     }
 
@@ -466,32 +483,45 @@ public actor LiveAudioCoordinator: LiveAudioControlling {
         while !queue.isEmpty, !stopped {
             let utterance = queue.removeFirst()
             let generationAtDequeue = generation
-            await emit(speechEvent(utterance.id, .started))
+            // Read just before the synthesiser is asked to speak: this is
+            // the coordinator's decision to move on to this utterance next,
+            // before any await, and so before the emit below.
+            await emit(speechEvent(utterance.id, .started, atMs: nowMs()))
             // A stop/pause landed while the emit above was suspended: it
             // bumped `generation` but, since this utterance had already
             // left `queue`, had nothing there left to cancel. Catch it here
             // instead of ever handing the utterance to the synthesiser.
             guard generation == generationAtDequeue else {
-                await emit(speechEvent(utterance.id, .cancelled))
+                await emit(speechEvent(utterance.id, .cancelled, atMs: nowMs()))
                 continue
             }
             inFlightUtteranceId = utterance.id
             let completed = await synthesiser.speak(utterance.text, utteranceId: utterance.id)
+            // Read just after the synthesiser's call returns, whichever way
+            // it resolved.
+            let terminalAtMs = nowMs()
             inFlightUtteranceId = nil
-            await emit(speechEvent(utterance.id, completed ? .finished : .cancelled))
+            await emit(speechEvent(utterance.id, completed ? .finished : .cancelled, atMs: terminalAtMs))
         }
     }
 
     private func speechEvent(
         _ utteranceId: String,
-        _ phase: SidecarLiveSpeechPhase
+        _ phase: SidecarLiveSpeechPhase,
+        atMs: Double
     ) -> SidecarLiveEventEnvelope {
-        .init(event: .speech, sessionId: sessionId, utteranceId: utteranceId, phase: phase)
+        .init(event: .speech, sessionId: sessionId, utteranceId: utteranceId, phase: phase, atMs: atMs)
     }
 
     private func milliseconds(since uptimeNanoseconds: UInt64) -> Double {
         guard uptimeNanoseconds > captureOriginUptimeNanoseconds else { return 0 }
         return Double(uptimeNanoseconds - captureOriginUptimeNanoseconds) / 1_000_000
+    }
+
+    /// The current moment, on the same clock and conversion as
+    /// `milliseconds(since:)`.
+    private func nowMs() -> Double {
+        milliseconds(since: now())
     }
 
     private func reason(for error: Error) -> String {

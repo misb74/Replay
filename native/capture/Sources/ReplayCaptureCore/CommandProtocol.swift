@@ -702,6 +702,10 @@ public struct SidecarLiveEventEnvelope: Codable, Equatable, Sendable {
     public var phase: SidecarLiveSpeechPhase?
     public var state: SidecarLiveState?
     public var reason: String?
+    /// For a `speech` event, the capture-relative milliseconds at which its
+    /// `phase` happened, on the same clock and conversion as `startMs`/
+    /// `endMs`. Nil for transcript and state events.
+    public var atMs: Double?
 
     public init(
         protocolVersion: Int = replayCaptureProtocolVersion,
@@ -715,7 +719,8 @@ public struct SidecarLiveEventEnvelope: Codable, Equatable, Sendable {
         utteranceId: String? = nil,
         phase: SidecarLiveSpeechPhase? = nil,
         state: SidecarLiveState? = nil,
-        reason: String? = nil
+        reason: String? = nil,
+        atMs: Double? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.event = event
@@ -729,6 +734,7 @@ public struct SidecarLiveEventEnvelope: Codable, Equatable, Sendable {
         self.phase = phase
         self.state = state
         self.reason = reason
+        self.atMs = atMs
     }
 }
 
