@@ -55,14 +55,31 @@ export interface LiveAssistOptions {
   requestTimeoutMs?: number;
   /** Replaces any of `LIVE_PROACTIVE_DEFAULTS`, which decide when the tutor may ask a question of its own. */
   proactive?: Partial<LiveProactiveTimings>;
+  /**
+   * Whether the user may talk over the tutor. False by default, which is half
+   * duplex: while the tutor speaks, and for `echoTailMs` after, whatever the
+   * microphone hears is ignored, so that an echo canceller that lets the
+   * tutor's voice through cannot make it hear itself. The user interrupts
+   * with Pause instead.
+   */
+  fullDuplex?: boolean;
+  /** In half duplex, how long the microphone stays ignored once the tutor falls silent. Defaults to `LIVE_ECHO_TAIL_MS`. */
+  echoTailMs?: number;
 }
+
+/**
+ * In half duplex, how long the microphone stays ignored after the sidecar
+ * reports the tutor's last sentence finished or cancelled, so that the room's
+ * echo of its last syllables is not transcribed as the user.
+ */
+export const LIVE_ECHO_TAIL_MS = 800;
 
 /**
  * The silences that must all have passed before the tutor checks whether to
  * ask a question of its own (spec §5.5).
  */
 export interface LiveProactiveTimings {
-  /** Since the user was last heard: any transcript event, partial or final. */
+  /** Since the user was last heard: any transcript event not ignored, partial or final. */
   quietMs: number;
   /**
    * Since the tutor last spoke, whatever it said. It has not spoken when the
@@ -238,10 +255,15 @@ interface Utterance {
 
 /**
  * Assembles turns from streamed speech, sends one request per turn, speaks
- * the reply sentence by sentence, and yields to the user the moment they
- * speak again. After a committed action, once the user and the tutor have
+ * the reply sentence by sentence, and yields to the user the moment they are
+ * heard again. After a committed action, once the user and the tutor have
  * both been quiet long enough, it checks whether to ask a question of its
  * own (spec §5.5).
+ *
+ * Unless told to run full duplex, it ignores the microphone while the tutor
+ * may be heard in the room, so that it cannot hear itself if echo
+ * cancellation lets the tutor's voice through; the user interrupts with
+ * Pause. In full duplex the user can also talk over the tutor.
  *
  * Event handlers and control calls run while a reply is suspended at any of
  * its awaits (the event log read, the screenshot, the next streamed chunk,
@@ -308,10 +330,23 @@ interface Utterance {
  *    condition still holds once the read is back, in the synchronous step in
  *    which the check takes the floor. Until then the poll holds nothing, so
  *    nothing waits for it.
+ * 9. In half duplex, nothing the microphone hears while the tutor may be
+ *    heard in the room reaches the conversation. That is while any sentence
+ *    is outstanding, from the synchronous step in which `#speak` hands it to
+ *    the sidecar, and for `echoTailMs` after the sidecar last reports a
+ *    sentence it still waits on finished or cancelled, by `now()`. Until then
+ *    `#onTranscript` drops each event before it changes anything: not the
+ *    words heard, the turn or its timer, the reply, the speech, or when the
+ *    user was last heard. Only reports about outstanding sentences count, so
+ *    a sentence a stop has already forgotten (invariant 2) starts no echo
+ *    tail when it is reported late, and a pause ends any echo tail, so
+ *    listening resumes without one. In full duplex nothing is dropped.
  */
 export class LiveAssistService {
   readonly #options: LiveAssistOptions &
-    Required<Pick<LiveAssistOptions, "now" | "turnSilenceMs" | "requestTimeoutMs" | "removeImage">>;
+    Required<
+      Pick<LiveAssistOptions, "now" | "turnSilenceMs" | "requestTimeoutMs" | "removeImage" | "fullDuplex" | "echoTailMs">
+    >;
   #started = false;
   #paused = false;
   #ended = false;
@@ -326,6 +361,12 @@ export class LiveAssistService {
   #reply: Reply | undefined;
   /** Utterances handed to the sidecar that have neither finished nor been stopped, by id. */
   readonly #utterances = new Map<string, Utterance>();
+  /**
+   * When the sidecar last reported an outstanding utterance finished or
+   * cancelled, by `now()`. In half duplex the room may still echo it for
+   * `echoTailMs` after. A pause resets it.
+   */
+  #fellSilentAt = Number.NEGATIVE_INFINITY;
   /** Every reply still running, current or superseded. */
   readonly #running = new Set<Promise<void>>();
   #starting: Promise<void> | undefined;
@@ -370,6 +411,8 @@ export class LiveAssistService {
       turnSilenceMs: 700,
       requestTimeoutMs: 20_000,
       removeImage: (path) => unlink(path),
+      fullDuplex: false,
+      echoTailMs: LIVE_ECHO_TAIL_MS,
       ...options,
     };
     this.#proactive = { ...LIVE_PROACTIVE_DEFAULTS, ...options.proactive };
@@ -425,6 +468,9 @@ export class LiveAssistService {
     // later, such as a resume or the next reply's speech, can overtake them.
     const stopping = this.#stopSpeaking();
     const pausing = this.#options.sidecar.setPaused(paused);
+    // The stop silences the tutor, and nothing is heard until listening
+    // resumes, so no echo tail outlives a pause.
+    this.#fellSilentAt = Number.NEGATIVE_INFINITY;
     if (!paused) this.#listenAgain();
     this.#publish();
     await Promise.all([stopping, pausing]);
@@ -475,6 +521,8 @@ export class LiveAssistService {
 
   #onTranscript(event: LiveTranscriptSignal): void {
     if (this.#paused || this.#ended || this.#failed) return;
+    // Dropped before it changes anything, and never kept for later.
+    if (this.#mayHearTutor()) return;
     this.#lastHeardAt = this.#options.now();
     this.#heard = { text: event.text, final: event.isFinal };
     this.#yieldToUser();
@@ -483,7 +531,18 @@ export class LiveAssistService {
     this.#publish();
   }
 
-  /** Whatever the tutor is doing, the user speaking takes precedence. */
+  /**
+   * Whether, in half duplex, what the microphone hears now may be the tutor
+   * itself: while any utterance is outstanding, and for `echoTailMs` after
+   * the sidecar last reported one finished or cancelled. Never in full
+   * duplex, where the user may talk over the tutor.
+   */
+  #mayHearTutor(): boolean {
+    if (this.#options.fullDuplex) return false;
+    return this.#utterances.size > 0 || this.#options.now() - this.#fellSilentAt < this.#options.echoTailMs;
+  }
+
+  /** Whatever the tutor is doing, the user being heard takes precedence. */
   #yieldToUser(): void {
     const reply = this.#supersedeReply();
     if (reply?.kind === "answer" && !reply.spoke) {
@@ -828,13 +887,16 @@ export class LiveAssistService {
   #onSpeech(event: LiveSpeechSignal): void {
     if (event.phase === "started") return;
     const utterance = this.#utterances.get(event.utteranceId);
-    // Only speech the service is still waiting on affects its state or its
-    // history; a late report about an utterance it has already stopped
-    // changes nothing.
+    // Only speech the service is still waiting on affects its state, its
+    // history, or when it listens again; a late report about an utterance it
+    // has already stopped changes nothing.
     if (utterance === undefined) return;
     this.#utterances.delete(event.utteranceId);
+    const now = this.#options.now();
     // Silence is measured from the end of what the tutor said, not its start.
-    this.#lastSpokeAt = this.#options.now();
+    this.#lastSpokeAt = now;
+    // In half duplex, the room may echo it for a moment longer.
+    this.#fellSilentAt = now;
     // The history holds what the user heard, so a sentence joins it only once
     // it has been spoken to the end.
     if (event.phase === "finished") {
