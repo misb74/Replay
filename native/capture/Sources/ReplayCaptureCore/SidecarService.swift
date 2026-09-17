@@ -39,6 +39,7 @@ public protocol InputMonitoring: AnyObject, Sendable {
     func start(
         sessionId: String,
         startedAtUptimeNanoseconds: UInt64,
+        excludeProcessIds: [Int32],
         handler: @escaping InputEventHandler
     ) async throws
     func stop() async
@@ -68,6 +69,21 @@ public protocol SafetyMonitoring: AnyObject, Sendable {
         handler: @escaping SafetyEventHandler
     ) async throws
     func stop() async
+}
+
+public extension InputMonitoring {
+    func start(
+        sessionId: String,
+        startedAtUptimeNanoseconds: UInt64,
+        handler: @escaping InputEventHandler
+    ) async throws {
+        try await start(
+            sessionId: sessionId,
+            startedAtUptimeNanoseconds: startedAtUptimeNanoseconds,
+            excludeProcessIds: [],
+            handler: handler
+        )
+    }
 }
 
 public extension ActionPerforming {
@@ -369,7 +385,8 @@ public actor SidecarService {
             ))
             try await inputMonitor.start(
                 sessionId: command.sessionId,
-                startedAtUptimeNanoseconds: timing.captureOriginUptimeNanoseconds
+                startedAtUptimeNanoseconds: timing.captureOriginUptimeNanoseconds,
+                excludeProcessIds: command.excludeProcessIds
             ) { raw, target in
                 await runtime.ingest(raw, target: target)
             }

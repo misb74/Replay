@@ -272,6 +272,38 @@ import Testing
     ))
 }
 
+@Test func recordForwardsExcludedProcessIdsToTheInputMonitor() async throws {
+    let monitor = FakeInputMonitor()
+    let service = SidecarService(
+        recorder: FakeRecorder(),
+        inputMonitor: monitor,
+        permissions: FakePermissions(),
+        actions: FakeActions()
+    )
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ReplayCaptureTests-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let start = await service.handle(.init(
+        requestId: "start-exclusions",
+        command: .record(.init(
+            sessionId: "session-exclusions",
+            sessionDirectory: directory.path,
+            includeAudio: false,
+            display: .init(width: 100, height: 50, scale: 1),
+            excludeProcessIds: [4321]
+        ))
+    ))
+
+    #expect(start.ok)
+    #expect(monitor.receivedExcludedProcessIds() == [4321])
+
+    _ = await service.handle(.init(
+        requestId: "stop-exclusions",
+        command: .stop(.init(sessionId: "session-exclusions"))
+    ))
+}
+
 @Test func heartbeatAndStopExposeARecorderThatFailedAfterStartup() async throws {
     let recorder = FakeRecorder()
     let service = SidecarService(
@@ -547,6 +579,7 @@ private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
     private let startError: SidecarOperationError?
     private var handler: InputEventHandler?
     private var timeOrigin: UInt64?
+    private var excludedProcessIds: [Int32] = []
 
     init(startError: SidecarOperationError? = nil) {
         self.startError = startError
@@ -555,6 +588,7 @@ private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
     func start(
         sessionId: String,
         startedAtUptimeNanoseconds: UInt64,
+        excludeProcessIds: [Int32],
         handler: @escaping InputEventHandler
     ) async throws {
         if let startError {
@@ -563,6 +597,7 @@ private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
         lock.withLock {
             self.handler = handler
             timeOrigin = startedAtUptimeNanoseconds
+            excludedProcessIds = excludeProcessIds
         }
     }
 
@@ -575,6 +610,10 @@ private final class FakeInputMonitor: InputMonitoring, @unchecked Sendable {
 
     func receivedTimeOrigin() -> UInt64? {
         lock.withLock { timeOrigin }
+    }
+
+    func receivedExcludedProcessIds() -> [Int32] {
+        lock.withLock { excludedProcessIds }
     }
 }
 

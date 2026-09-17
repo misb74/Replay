@@ -23,12 +23,14 @@ public final class MacInputMonitor: InputMonitoring, @unchecked Sendable {
     private var gesture: MouseGesture?
     private var lastBundleId: String?
     private var lastWindowTitle: String?
+    private var excludedProcessIds: Set<Int32> = []
 
     public init() {}
 
     public func start(
         sessionId: String,
         startedAtUptimeNanoseconds: UInt64,
+        excludeProcessIds: [Int32],
         handler: @escaping InputEventHandler
     ) async throws {
         let alreadyRunning = lock.replayWithLock {
@@ -36,6 +38,7 @@ public final class MacInputMonitor: InputMonitoring, @unchecked Sendable {
             if !running {
                 self.sessionId = sessionId
                 self.startedAtNanos = startedAtUptimeNanoseconds
+                self.excludedProcessIds = Set(excludeProcessIds)
                 self.handler = handler
             }
             return running
@@ -152,12 +155,29 @@ public final class MacInputMonitor: InputMonitoring, @unchecked Sendable {
         if event.getIntegerValueField(.eventSourceUserData) == replaySyntheticEventMarker {
             return
         }
-        let state: (String, UInt64, Bool) = lock.replayWithLock {
-            (self.sessionId, self.startedAtNanos, self.handler != nil)
+        let state: (String, UInt64, Bool, Set<Int32>) = lock.replayWithLock {
+            (self.sessionId, self.startedAtNanos, self.handler != nil, self.excludedProcessIds)
         }
         let sessionId = state.0
         let startedAtNanos = state.1
         guard state.2 else { return }
+        let excludedProcessIds = state.3
+
+        // Key events are delivered to the frontmost application; every other
+        // event tracked here carries its own target process id. Either is
+        // read before the accessibility snapshot below, so an excluded
+        // process's UI (Replay's own live-tutor panel, say) is never
+        // inspected at all.
+        let targetProcessId: Int32
+        switch type {
+        case .keyDown:
+            targetProcessId = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+        default:
+            targetProcessId = Int32(event.getIntegerValueField(.eventTargetUnixProcessID))
+        }
+        guard shouldRecordInput(targetProcessId: targetProcessId, excluded: excludedProcessIds) else {
+            return
+        }
 
         let eventNanos = event.timestamp
         let timestampMs = Double(eventNanos >= startedAtNanos ? eventNanos - startedAtNanos : 0) / 1_000_000
@@ -268,22 +288,46 @@ public final class MacInputMonitor: InputMonitoring, @unchecked Sendable {
     }
 
     private func applicationActivated(_ notification: Notification) {
-        let state: (String, UInt64, Bool) = lock.replayWithLock {
-            (self.sessionId, self.startedAtNanos, self.handler != nil)
-        }
-        guard state.2 else { return }
-        let now = DispatchTime.now().uptimeNanoseconds
-        let timestampMs = Double(now >= state.1 ? now - state.1 : 0) / 1_000_000
         let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
             as? NSRunningApplication
+        let activatedProcessId = application?.processIdentifier ?? 0
+
+        let state: (String, UInt64, Bool, Set<Int32>) = lock.replayWithLock {
+            (self.sessionId, self.startedAtNanos, self.handler != nil, self.excludedProcessIds)
+        }
+        guard state.2 else { return }
+        guard shouldRecordInput(targetProcessId: activatedProcessId, excluded: state.3) else {
+            // Excluded: no accessibility snapshot of Replay's own UI, and the
+            // last-recorded context is left exactly as it was.
+            return
+        }
+        // Captured before the accessibility snapshot below, which can take a
+        // little while, so the timestamp still reflects the activation
+        // itself rather than how long that lookup took.
+        let now = DispatchTime.now().uptimeNanoseconds
+        let timestampMs = Double(now >= state.1 ? now - state.1 : 0) / 1_000_000
+
         var target = MacAccessibility.snapshot(at: nil) ?? AccessibilityTarget()
         if let bundleId = application?.bundleIdentifier {
             target.bundleId = bundleId
         }
-        lock.replayWithLock {
-            lastBundleId = target.bundleId
-            lastWindowTitle = target.windowTitle
+
+        let recorded: Bool = lock.replayWithLock {
+            let shouldRecord = shouldRecordAppSwitch(
+                activatedProcessId: activatedProcessId,
+                activatedBundleId: target.bundleId,
+                activatedWindowTitle: target.windowTitle,
+                lastRecorded: (bundleId: lastBundleId, windowTitle: lastWindowTitle),
+                excluded: state.3
+            )
+            if shouldRecord {
+                lastBundleId = target.bundleId
+                lastWindowTitle = target.windowTitle
+            }
+            return shouldRecord
         }
+        guard recorded else { return }
+
         schedule(.appSwitch(
             id: UUID().uuidString,
             sessionId: state.0,
@@ -353,6 +397,39 @@ public final class MacInputMonitor: InputMonitoring, @unchecked Sendable {
             gesture = nil
             lastBundleId = nil
             lastWindowTitle = nil
+            excludedProcessIds = []
         }
     }
+}
+
+/// Whether an input event aimed at `targetProcessId` belongs in the
+/// recording. Matching is by process id only: in development every Electron
+/// app — Replay included — reports the same bundle id, so filtering on
+/// bundle id would also drop the user's real input in other Electron apps
+/// such as Slack or VS Code.
+func shouldRecordInput(targetProcessId: Int32, excluded: Set<Int32>) -> Bool {
+    !excluded.contains(targetProcessId)
+}
+
+/// Whether an application activation should be recorded as an `app_switch`.
+/// An activation aimed at an excluded process is always dropped. Otherwise,
+/// an activation that lands back on the bundle id and window title already
+/// recorded as current is not a genuine switch: without this check, the
+/// user's return from an excluded activation (Replay's own live-tutor
+/// panel, say) to the application already being recorded would be
+/// misreported as a fresh switch, because the excluded activation never
+/// updated the last-recorded context in the first place. The same check is
+/// correct when nothing is excluded at all.
+func shouldRecordAppSwitch(
+    activatedProcessId: Int32,
+    activatedBundleId: String?,
+    activatedWindowTitle: String?,
+    lastRecorded: (bundleId: String?, windowTitle: String?),
+    excluded: Set<Int32>
+) -> Bool {
+    guard shouldRecordInput(targetProcessId: activatedProcessId, excluded: excluded) else {
+        return false
+    }
+    return activatedBundleId != lastRecorded.bundleId
+        || activatedWindowTitle != lastRecorded.windowTitle
 }
